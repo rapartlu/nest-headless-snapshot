@@ -44,9 +44,9 @@ const connectionState = () => ({
   pc: window.__pc ? window.__pc.connectionState : 'none',
 });
 
-// Wait for real decoded frames (requestVideoFrameCallback fires only when a
-// frame has actually been decoded and composited; padding-only RTP never
-// fires it), skip warmup frames, then draw to canvas and return a JPEG.
+// Wait for real decoded frames (requestVideoFrameCallback fires only once a
+// frame has actually been decoded and composited), skip warmup frames, then
+// draw to canvas and return a JPEG.
 const waitAndCapture = async ({ warmupFrames = 3, quality = 0.85, timeoutMs = 20000, crop = null }) => {
   const stream = await Promise.race([
     window.__trackReady,
@@ -58,10 +58,10 @@ const waitAndCapture = async ({ warmupFrames = 3, quality = 0.85, timeoutMs = 20
   document.body.appendChild(v);
   await v.play().catch(() => {});
   let frames = 0;
-  // Google starts the session at 640x360 and switches to 1920x1080 once
-  // Chrome's TWCC-driven bandwidth estimate has ramped (a few seconds; the
-  // ramp is time-based, not frame-based). Prefer the first HD frame; fall
-  // back to whatever resolution we have if HD hasn't arrived in time.
+  // Google starts the session at 640x360 and switches to 1920x1080 a few
+  // seconds in, once the sender has ramped up (the ramp is time-based, not
+  // frame-based). Prefer the first HD frame; fall back to whatever resolution
+  // we have if HD hasn't arrived in time.
   const hdMinWidth = 1280;
   // Ramp to HD typically lands in 2-3s; cap the wait so captures stay fast:
   // the cat deterrent needs reaction time more than it needs guaranteed 1080p.

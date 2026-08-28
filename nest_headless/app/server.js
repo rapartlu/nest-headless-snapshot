@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 // nest_headless: server-side Nest camera stills via headless Chromium.
 //
-// Why Chromium: every library WebRTC client (go2rtc 1.9.2/1.9.14, aiortc)
-// receives only 0-byte bandwidth-probe padding from Google's Nest sender,
-// while Chrome, which implements transport-wide congestion control,
-// receives real media on the same camera, network and account. This add-on
-// runs the proven client headlessly and turns one decoded frame into a JPEG.
+// Home Assistant relays WebRTC-only Nest cameras' live stream to the browser
+// but never terminates the media itself, so camera.snapshot has no frame to
+// return and hands back a placeholder. This add-on runs a real browser
+// (headless Chromium) that opens the stream the same way the dashboard does,
+// waits for it to ramp to full resolution, and turns a decoded frame into a
+// JPEG.
 //
 // HTTP API (mirrors the nest_snapshot add-on so automations keep their shape):
 //   GET /snapshot/<camera>          capture now (or cached if younger than

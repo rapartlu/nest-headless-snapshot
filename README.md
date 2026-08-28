@@ -10,24 +10,24 @@ though Google only offers them over WebRTC.
 - Your Nest cameras live-stream fine in the Home Assistant dashboard.
 - But `camera.snapshot` gives you a black image. So do notification
   thumbnails and AI integrations that read the camera entity.
-- You tried go2rtc, Frigate or aiortc. They connect, but no video ever
-  arrives.
+- The go2rtc, Frigate and aiortc workarounds never gave you a working
+  snapshot either.
 
 If that sounds familiar, you have a WebRTC-only Nest camera. That covers the
-battery models and most newer ones. There is no RTSP or HLS for these, and
-Home Assistant only passes the WebRTC handshake through. It never sees the
-video itself, so anything that needs a frame gets a black placeholder.
+battery models and most newer ones. There is no RTSP or HLS for these.
 
-## Why the usual tools can't fix it
+## Why the snapshot is black
 
-Google's servers will not send real video until the receiving client sends a
-specific kind of feedback (transport-wide congestion control, or TWCC).
-Browsers send it, which is why the stream works in Chrome. go2rtc and aiortc
-don't, so Google sends them empty padding packets forever. The connection
-looks healthy and no frame ever comes.
+Home Assistant streams these cameras to your browser live, but it never grabs
+a frame itself. For WebRTC-only Nest cameras, `camera.snapshot` just returns a
+hardcoded placeholder image, which is the black frame you see. Home Assistant
+relays the WebRTC handshake but does not terminate the media on the server, so
+there is no frame for the snapshot to capture.
 
-If you want to see this for yourself, the [probe](probe/) in this repo
-demonstrates it against your own camera in about two minutes.
+The frame is not impossible to capture. Server-side tools can pull one from
+these cameras. Home Assistant simply does not wire snapshots through them for
+these models yet, so anything that needs a still gets the placeholder. This
+add-on fills that gap.
 
 ## What this add-on does
 
@@ -140,7 +140,6 @@ plenty of headroom. Just don't poll in a tight loop.
 | Path | What |
 |---|---|
 | `nest_headless/` | The add-on (Node plus headless Chromium) |
-| `probe/` | A small Go program that proves the TWCC issue on your own camera |
 | `tools/train_door_model.py` | Trainer for the optional per-camera state classifiers |
 | `examples/` | Ready-to-adapt automations and hard-won prompting advice |
 
