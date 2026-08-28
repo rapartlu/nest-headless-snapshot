@@ -1,81 +1,90 @@
 # Nest Headless Snapshot
 
-Captures real still images from WebRTC-only Google Nest cameras by running
-the exact client Google's sender cooperates with — Chromium — headlessly on
-your Home Assistant host. See the repository README for the full background.
+Gets real still images from WebRTC-only Google Nest cameras by running a
+headless browser on your Home Assistant machine. The repository README has
+the full story.
 
 ## Quick start
 
-1. **Start** the add-on and check the log for
+1. Start the add-on and check the log for
    `receiver video codecs: ... video/H264 ...`
-2. Test with any camera that live-streams in your dashboard, using its
+2. Test it with any camera that live-streams in your dashboard. Use the
    entity id without the `camera.` prefix:
    `curl "http://homeassistant.local:8098/snapshot/<your_camera>?fresh=1" -o still.jpg`
-3. Wire it into automations with a `rest_command` — see the repository's
-   `examples/` directory. Each fresh capture costs one Google SDM command
-   (quota: 100/hour/camera).
+3. Wire it into automations with a `rest_command`. See the repository's
+   `examples` folder. Each fresh capture uses one Google SDM command
+   (the quota is 100 per hour per camera).
 
-No per-camera configuration is needed; the defaults below are sensible.
+No per-camera configuration is needed. The defaults below are sensible.
 
 ## Options
 
-| Option | Default | Meaning |
+| Option | Default | What it does |
 |---|---|---|
-| `min_interval_seconds` | `10` | Serve the cached frame to `/snapshot/<camera>` requests younger than this (quota guard). `?fresh=1` always captures. |
-| `jpeg_quality` | `85` | JPEG quality, 30–100. |
-| `capture_timeout_seconds` | `25` | Overall per-capture timeout (answer wait, decode wait). |
-| `warmup_frames` | `3` | Decoded frames to skip before capturing. The add-on additionally waits (up to 5 s) for the stream to ramp to HD — Nest sessions start at 640×360 and switch to 1920×1080 once Chrome's bandwidth estimate has grown. |
-| `out_dir` | `/config/www/nest` | Where JPEGs are written (atomically, tmp + rename). |
-| `crops` | – | Space-separated fixed regions of interest: `camera_name:x:y:w:h` with fractions of the frame, e.g. `hallway_cam:0.35:0.0:0.28:0.55`. Each capture also writes `<camera>_crop.jpg`. |
-| `samples_dir` | – | If set (e.g. `/homeassistant/www/nest/samples`), every capture's crop is archived as `<samples_dir>/<camera>/<timestamp>.jpg`, capped at 2000 files per camera. Training data for the classifiers. |
+| `min_interval_seconds` | `10` | Requests within this window get the cached frame instead of a new capture. Add `?fresh=1` to force a capture. |
+| `jpeg_quality` | `85` | JPEG quality, 30 to 100. |
+| `capture_timeout_seconds` | `25` | How long one capture may take before giving up. |
+| `warmup_frames` | `3` | Frames to skip before taking the picture. The add-on also waits up to 5 seconds for the stream to reach 1080p, since Nest streams start at 640x360. |
+| `out_dir` | `/config/www/nest` | Where JPEGs are saved. |
+| `crops` | (empty) | Fixed regions of interest, written as an extra `<camera>_crop.jpg` next to each frame. Format: `camera_name:x:y:w:h` with values as fractions of the frame, for example `hallway_cam:0.35:0.0:0.28:0.55`. Separate multiple cameras with spaces. |
+| `samples_dir` | (empty) | If set (for example `/homeassistant/www/nest/samples`), every capture's crop is also saved with a timestamp, up to 2000 per camera. Useful as training data for the classifiers below. |
 
 ## HTTP API (port 8098)
 
 ```
-GET /snapshot/<camera>                 capture now; cached if younger than min_interval_seconds
+GET /snapshot/<camera>                 capture now, or cached if recent
 GET /snapshot/<camera>?fresh=1         always capture (one SDM command)
-GET /snapshot/<camera>?fresh=1&format=json   capture, return metadata JSON
-GET /latest/<camera>.jpg               last capture from disk, 404 if none
+GET /snapshot/<camera>?fresh=1&format=json   capture, return details as JSON
+GET /latest/<camera>.jpg               last saved frame, 404 if none yet
 GET /                                  status JSON
-GET /health                            liveness
+GET /health                            liveness check
 ```
 
-`<camera>` is the entity id without the `camera.` prefix. The JSON metadata
-includes `meanLuma` (the black-placeholder failure this add-on exists to
-eliminate measures ~6; real frames measure far higher — guard your
-automations with `meanLuma > 3`), and, when a model is deployed for the
-camera, `classifier: {label, score, positive}`.
+`<camera>` is the entity id without the `camera.` prefix. The JSON includes
+`meanLuma`, a brightness number you can use to skip black frames (a black
+placeholder measures about 6, real frames measure far higher, so checking
+`meanLuma > 3` is a good guard). If you have trained a classifier for the
+camera, the JSON also includes its verdict as
+`classifier: {label, score, positive}`.
 
-## Per-camera classifiers
+## Per-camera classifiers (optional)
 
-Drop a trained weights file at `/config/nest_models/<camera>.json` and every
-capture with a crop is scored in-process (microseconds, pure JS). Train with
-`tools/train_door_model.py` from the repository: collect crops of the two
-states via `samples_dir`, sort them into two directories, run the script,
-copy the JSON over — it hot-reloads on file change, no restart needed.
+For simple fixed-scene questions like "is that cupboard door open", a tiny
+local model beats asking an AI service every time. It runs on every capture
+in well under a millisecond, costs nothing, and can't be talked out of what
+it sees.
 
-Practical training notes from real use:
+Put a trained weights file at `/config/nest_models/<camera>.json` and the
+add-on picks it up automatically, no restart needed. Train one with
+`tools/train_door_model.py` from the repository:
 
-- Start with a handful of frames per state; fold in every miss as a new
-  labelled sample and retrain — two minutes end to end.
-- Collect across lighting (day, dusk, night/IR) before trusting it at night.
-- Mind confusers: another door/object entering the crop can mimic your
-  target. Add such frames as hard negatives; the residual-vs-reference
-  features separate states by *where* change happens, which handles this
-  well.
-- Set `threshold` (in the JSON) around 0.9 when false positives are worse
-  than false negatives, and double-confirm in the automation (re-capture
-  after 30–60 s) for persistent states like "door left open".
+1. Set the `crops` option to frame the thing you care about, and set
+   `samples_dir` so captures build up a library of crops.
+2. Sort some crops into two folders, one per state.
+3. Run the script and copy the JSON it produces to `/config/nest_models/`.
+
+Tips from real use:
+
+- Start with a handful of images per state. When the model gets one wrong,
+  add that image to the right folder and retrain. It takes about two
+  minutes.
+- Collect samples across the day and night before trusting it after dark.
+- Watch out for lookalikes. Another door or object entering the crop can
+  imitate the thing you're detecting. Add those frames as examples of the
+  "no" state and retrain.
+- If a false alarm is worse than a missed one, set `threshold` in the JSON
+  to 0.9, and have the automation confirm with a second capture 30 to 60
+  seconds later before acting.
 
 ## Broken supervised installs
 
-Two workarounds are built in for supervised installs with an unhealthy
-Supervisor:
+Some Supervised installs have an unhealthy Supervisor. Two workarounds are
+built in:
 
-- **No `SUPERVISOR_TOKEN` injected** (seen with "Docker misconfigured"
-  repairs): put a long-lived HA access token in
-  `<config>/.nest_headless_token`; the add-on then connects directly to
-  `ws://homeassistant:8123/api/websocket`.
-- **No journal gateway** (empty add-on Log tab): create the empty marker file
-  `<config>/nest_headless_log_to_file` and the add-on logs to
-  `<config>/nest_headless_boot.log` instead.
+- **The add-on starts then dies, and its log shows no SUPERVISOR_TOKEN.**
+  Create a long-lived access token in HA and save it to a file named
+  `.nest_headless_token` in your config folder. The add-on will use it to
+  talk to HA directly.
+- **The Log tab is always empty.** Create an empty file named
+  `nest_headless_log_to_file` in your config folder, and the add-on will
+  write its log to `nest_headless_boot.log` there instead.

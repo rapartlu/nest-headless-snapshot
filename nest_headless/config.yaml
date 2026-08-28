@@ -3,7 +3,7 @@ version: "1.1.0"
 slug: nest_headless
 description: >-
   Real still images from WebRTC-only Google Nest cameras via headless
-  Chromium — the only server-side WebRTC client proven to receive video from
+  Chromium, the only server-side WebRTC client proven to receive video from
   these cameras (it implements the transport-wide congestion control feedback
   Google's sender requires before it will send real media).
 url: "https://github.com/rapartlu/nest-headless-snapshot"

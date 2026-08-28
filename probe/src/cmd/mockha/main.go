@@ -1,4 +1,4 @@
-// mockha — a fake Home Assistant websocket endpoint backed by a pion peer
+// mockha: a fake Home Assistant websocket endpoint backed by a pion peer
 // that answers camera/webrtc/offer and streams a real H.264 file. Used to
 // end-to-end test nest-twcc-probe without a camera: auth flow, offer/answer,
 // Google-style EMPTY ICE FOUNDATIONS in the answer (simulated), ICE/DTLS,

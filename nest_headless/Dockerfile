@@ -1,6 +1,6 @@
 # As a Home Assistant add-on the Supervisor passes BUILD_FROM from build.yaml
 # (HA base images). Built standalone (`docker build`), it defaults to plain
-# Alpine so the same Dockerfile serves Container/Core installs — see
+# Alpine so the same Dockerfile serves Container/Core installs. See
 # docker-compose.yml at the repository root.
 ARG BUILD_FROM=alpine:3.21
 FROM $BUILD_FROM

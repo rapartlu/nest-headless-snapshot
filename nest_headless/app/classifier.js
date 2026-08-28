@@ -8,7 +8,7 @@
 //     "mean": [...], "std": [...], "weights": [...], "bias": -1.23,
 //     "threshold": 0.5, "trained": "2026-08-28", "samples": {"pos": 40, "neg": 200} }
 //
-// Inference cost: one 64x96 dot product — microseconds, no native deps.
+// Inference cost: one 64x96 dot product. Microseconds, no native deps.
 
 'use strict';
 
@@ -78,7 +78,7 @@ function classify(camera, jpegBuf) {
     const img = jpeg.decode(jpegBuf, { useTArray: true, maxMemoryUsageInMB: 64 });
     const g = toGray(img, model.width, model.height, model.subcrop);
     // Optional residual features: per-image standardization (lighting
-    // robustness) then subtraction of the stored reference closed scene —
+    // robustness) then subtraction of the stored reference closed scene.
     // must mirror the trainer exactly.
     if (model.per_image_norm) {
       let s = 0; for (let i = 0; i < g.length; i++) s += g[i];

@@ -20,14 +20,14 @@ automation:
   - alias: "Kitchen cat deterrent (Nest still)"
     id: cat_kitchen_deterrent_image_v2
     mode: single          # a second motion event during capture is dropped,
-                          # not queued — protects the SDM quota
+                          # not queued, which protects the SDM quota
     trigger:
       - platform: state
         entity_id: event.kitchen_camera_motion
     action:
       # Synchronous capture: this step returns only after the JPEG is written.
       # Reaching the next step therefore guarantees freshness; on capture
-      # failure this errors and the chain stops — a stale frame is never
+      # failure this errors and the chain stops, so a stale frame is never
       # analysed as current.
       - service: rest_command.nest_capture_kitchen
         response_variable: capture

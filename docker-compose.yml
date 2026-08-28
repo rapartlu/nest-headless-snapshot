@@ -20,7 +20,7 @@ services:
     environment:
       # Where your Home Assistant lives (use wss:// behind TLS)
       HA_WS_URL: "ws://homeassistant.local:8123/api/websocket"
-      # Long-lived access token — set in your shell or an .env file,
+      # Long-lived access token. Set it in your shell or an .env file,
       # never commit it anywhere
       HA_TOKEN: "${HA_TOKEN}"
       # Write frames here (mapped below). Omit to keep them container-local

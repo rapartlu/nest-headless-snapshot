@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-// nest_headless — server-side Nest camera stills via headless Chromium.
+// nest_headless: server-side Nest camera stills via headless Chromium.
 //
 // Why Chromium: every library WebRTC client (go2rtc 1.9.2/1.9.14, aiortc)
 // receives only 0-byte bandwidth-probe padding from Google's Nest sender,
-// while Chrome — which implements transport-wide congestion control —
+// while Chrome, which implements transport-wide congestion control,
 // receives real media on the same camera, network and account. This add-on
 // runs the proven client headlessly and turns one decoded frame into a JPEG.
 //
@@ -49,11 +49,11 @@ const cfg = {
   haToken: process.env.SUPERVISOR_TOKEN || process.env.HA_TOKEN || '',
   // Fixed regions of interest, e.g. "downstairs_hallway_camera:0.22:0.0:0.30:0.62"
   // (space-separated entries; x:y:w:h as fractions of the frame). Each capture
-  // also writes <camera>_crop.jpg for that region — a stable close-up that
+  // also writes <camera>_crop.jpg for that region, a stable close-up that
   // makes small state changes trivial for vision models.
   crops: parseCrops(process.env.CROPS || ''),
   // When set, every capture also archives its crop as
-  // <samplesDir>/<camera>/<timestamp>.jpg (capped) — training data for the
+  // <samplesDir>/<camera>/<timestamp>.jpg (capped): training data for the
   // tiny door-state classifier, gathered across lighting conditions.
   samplesDir: process.env.SAMPLES_DIR || '',
   samplesMax: intEnv('SAMPLES_MAX', 2000),
@@ -93,14 +93,14 @@ console.log('[nest_headless] config:', JSON.stringify({ ...cfg, haToken: '<set>'
 
 // ------------------------------------------------------------ Google SDP quirk
 // Google's answer emits "a=candidate: " with an EMPTY foundation (6/6
-// candidates on these cameras). Chrome tolerates it, but patch anyway —
+// candidates on these cameras). Chrome tolerates it, but patch anyway:
 // proven form from the working browser control.
 const patchFoundation = (sdp) => sdp.replace(/a=candidate: /g, 'a=candidate:0 ');
 const patchCandidate = (c) => (typeof c === 'string' ? c.replace(/^candidate: /, 'candidate:0 ') : c);
 
 // ------------------------------------------------------------ HA websocket
 function haOfferSession(entityId, offerSdp, { onAnswer, onCandidate, onError }) {
-  // Returns { close } — closing the socket ends the HA-side session.
+  // Returns { close }. Closing the socket ends the HA-side session.
   const ws = new WebSocket(cfg.haWsUrl);
   let msgId = 0;
   let subId = null;
@@ -150,12 +150,12 @@ async function getBrowser() {
       ],
     }).then(async (b) => {
       b.on('disconnected', () => { browserPromise = null; });
-      // log codec support once — H.264 must be present for Nest
+      // log codec support once; H.264 must be present for Nest
       const p = await b.newPage();
       const codecs = await p.evaluate(fns.videoCodecs);
       console.log('[nest_headless] receiver video codecs:', codecs.join(', '));
       if (!codecs.some((c) => /h264/i.test(c))) {
-        console.error('[nest_headless] WARNING: this Chromium build lacks H.264 — Nest video will not decode');
+        console.error('[nest_headless] WARNING: this Chromium build lacks H.264, Nest video will not decode');
       }
       await p.close();
       return b;

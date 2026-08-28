@@ -45,7 +45,7 @@ const connectionState = () => ({
 });
 
 // Wait for real decoded frames (requestVideoFrameCallback fires only when a
-// frame has actually been decoded and composited — padding-only RTP never
+// frame has actually been decoded and composited; padding-only RTP never
 // fires it), skip warmup frames, then draw to canvas and return a JPEG.
 const waitAndCapture = async ({ warmupFrames = 3, quality = 0.85, timeoutMs = 20000, crop = null }) => {
   const stream = await Promise.race([
@@ -59,11 +59,11 @@ const waitAndCapture = async ({ warmupFrames = 3, quality = 0.85, timeoutMs = 20
   await v.play().catch(() => {});
   let frames = 0;
   // Google starts the session at 640x360 and switches to 1920x1080 once
-  // Chrome's TWCC-driven bandwidth estimate has ramped (a few seconds — the
+  // Chrome's TWCC-driven bandwidth estimate has ramped (a few seconds; the
   // ramp is time-based, not frame-based). Prefer the first HD frame; fall
   // back to whatever resolution we have if HD hasn't arrived in time.
   const hdMinWidth = 1280;
-  // Ramp to HD typically lands in 2-3s; cap the wait so captures stay fast —
+  // Ramp to HD typically lands in 2-3s; cap the wait so captures stay fast:
   // the cat deterrent needs reaction time more than it needs guaranteed 1080p.
   const hdWaitMs = Math.min(5000, timeoutMs * 0.6);
   const t0 = Date.now();
@@ -93,7 +93,7 @@ const waitAndCapture = async ({ warmupFrames = 3, quality = 0.85, timeoutMs = 20
   const meanLuma = sum / (d.length / 40);
   const dataUrl = c.toDataURL('image/jpeg', quality);
   // Optional fixed region of interest (fractions of frame: {x,y,w,h} in 0..1)
-  // written alongside the full frame — a close-up makes small state changes
+  // written alongside the full frame; a close-up makes small state changes
   // (a door ajar) trivial for a vision model where the full frame is marginal.
   let cropDataUrl = null;
   if (crop && crop.w > 0 && crop.h > 0) {

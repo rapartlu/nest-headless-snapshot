@@ -12,7 +12,7 @@ if [ -f /homeassistant/nest_headless_log_to_file ] || [ -f /config/nest_headless
 fi
 
 # Workaround for supervised installs whose Supervisor fails to inject env
-# vars into add-on containers (no SUPERVISOR_TOKEN — seen on installs flagged
+# vars into add-on containers (no SUPERVISOR_TOKEN, seen on installs flagged
 # "Docker misconfigured"): put a long-lived HA access token in
 #   <config>/.nest_headless_token
 # and the add-on talks to HA core directly instead of the supervisor proxy.

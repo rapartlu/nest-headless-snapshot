@@ -119,7 +119,7 @@ func dialHA(haURL, token string, insecure bool) (*haClient, error) {
 		return nil, fmt.Errorf("read auth reply: %w", err)
 	}
 	if m["type"] != "auth_ok" {
-		return nil, fmt.Errorf("authentication failed: %v — check the long-lived access token", m)
+		return nil, fmt.Errorf("authentication failed: %v; check the long-lived access token", m)
 	}
 	logf("authenticated to Home Assistant (version %v)", m["ha_version"])
 	return &haClient{conn: conn, nextID: 1}, nil
@@ -197,7 +197,7 @@ func run(haURL, token, entity string, duration time.Duration, outDir string, ins
 	api := webrtc.NewAPI(webrtc.WithMediaEngine(mediaEngine), webrtc.WithInterceptorRegistry(registry))
 
 	// Chrome's working control used `new RTCPeerConnection()` with no ICE
-	// servers — Google's media host is directly reachable. Match it.
+	// servers; Google's media host is directly reachable. Match it.
 	pc, err := api.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		return err
@@ -288,7 +288,7 @@ func run(haURL, token, entity string, duration time.Duration, outDir string, ins
 					videoPayloadPkts.Add(1)
 					videoPayloadBytes.Add(int64(len(pkt.Payload)))
 					if firstPayloadOnce.CompareAndSwap(false, true) {
-						logf(">>> FIRST VIDEO PAYLOAD: seq=%d %d bytes — Google is sending real media",
+						logf(">>> FIRST VIDEO PAYLOAD: seq=%d %d bytes; Google is sending real media",
 							pkt.SequenceNumber, len(pkt.Payload))
 					}
 					sb.Push(pkt)

@@ -1,14 +1,16 @@
 # nest-twcc-probe
 
-The minimal hypothesis test for the "server-side clients get only zero-byte
-padding from Nest WebRTC cameras" problem. A single static Go binary using
-pion/webrtc v4 with its default interceptor chain, which — unlike aiortc and
-go2rtc — **generates TWCC receiver feedback**, negotiates the `transport-cc`
-RTCP feedback attribute and the transport-wide-cc header extension, and
-additionally sends periodic PLI and a REMB advertisement.
+A small Go program that shows why server-side tools get no video from Nest
+WebRTC cameras, using your own camera as the test.
 
-One run costs **one** SDM command against the 100/hour/camera quota and takes
-about two minutes:
+The short version: Google's sender waits for congestion-control feedback
+(TWCC) before it sends real video. Browsers send that feedback. go2rtc and
+aiortc don't, so they receive empty padding packets forever. This probe uses
+pion/webrtc, which does send TWCC feedback, so it receives real video where
+those tools receive nothing.
+
+One run takes about two minutes and uses one command from your camera's SDM
+quota (100 per hour).
 
 ```
 cd src && go build -o nest-twcc-probe .
@@ -21,26 +23,24 @@ cd src && go build -o nest-twcc-probe .
 
 What to look for, in order:
 
-- `offer includes transport-cc feedback: true` — the probe is offering what
-  aiortc/go2rtc could not.
-- `answer accepted; answer offers transport-cc: ...` — the key diagnostic.
-  If Google's answer does not echo transport-cc, the feedback loop never
-  engaged and a padding-only result is inconclusive about the mechanism.
-- `>>> FIRST VIDEO PAYLOAD` — hypothesis confirmed in one line.
-- The `RESULT` block with full packet accounting.
+- `offer includes transport-cc feedback: true` means the probe is offering
+  what go2rtc and aiortc could not.
+- `answer accepted; answer offers transport-cc: ...` is the key line. If
+  Google's answer does not echo transport-cc, the feedback loop never
+  started and a padding-only result proves nothing either way.
+- `>>> FIRST VIDEO PAYLOAD` means the theory holds on your camera.
+- The `RESULT` block gives the full packet counts.
 
-On success it writes an annex-B H.264 bitstream; convert a still with:
+On success it saves the raw H.264 video. Get a still out of it with:
 
 ```
 ffmpeg -i /tmp/nest/probe_camera_your_camera.h264 -frames:v 1 -q:v 2 still.jpg
 ```
 
-In our measured run: 2867/2867 video packets with payload (3.15 MB in 20 s),
-with the stream switching from 640×360 to 1920×1080 after 3 frames — against
-the identical camera/account where go2rtc and aiortc received 1707/1707
-empty-payload packets.
+For reference, our measured run received 2867 video packets, every one with
+payload (3.15 MB in 20 seconds), and the stream jumped from 640x360 to
+1920x1080 after 3 frames. The same camera and account gave go2rtc and aiortc
+1707 packets with zero payload.
 
-`src/cmd/mockha` is a fake HA websocket endpoint backed by a pion sender used
-to test the probe end-to-end (auth flow, offer/answer, simulated
-empty-foundation candidates, ICE/DTLS, RTP receive, H.264 reassembly) without
-touching Google or spending quota.
+`src/cmd/mockha` is a fake Home Assistant endpoint used to test the probe
+end to end without touching Google or spending quota.

@@ -1,6 +1,6 @@
 // Loopback test: exercises the production page functions (initPeer,
 // setRemoteAnswer, waitAndCapture) against an in-page WebRTC sender fed by
-// an animated canvas — including a simulated Google answer with EMPTY ICE
+// an animated canvas, including a simulated Google answer with EMPTY ICE
 // FOUNDATIONS. Validates everything except the Google leg itself.
 'use strict';
 const fs = require('fs');
@@ -83,10 +83,10 @@ const blankFoundation = (sdp) => sdp.replace(/a=candidate:\S+ /g, 'a=candidate: 
       `meanLuma ${shot.meanLuma.toFixed(1)}, ${buf.length} bytes -> ${out}`);
 
     // WebRTC senders start low-res and ramp as congestion control gains
-    // confidence — by 25 frames the loopback should be at source resolution.
+    // confidence; by 25 frames the loopback should be at source resolution.
     if (shot.width < 320) throw new Error('resolution did not ramp: ' + shot.width);
     if (shot.frames < 25) throw new Error('too few decoded frames');
-    if (shot.meanLuma < 10) throw new Error('frame is black — capture path broken');
+    if (shot.meanLuma < 10) throw new Error('frame is black, capture path broken');
     console.log('\nLOOPBACK TEST PASSED');
   } finally {
     await browser.close();

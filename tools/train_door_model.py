@@ -6,10 +6,10 @@ samples_dir option):
     --pos  crops with the cupboard door OPEN/ajar
     --neg  crops with it CLOSED
 
-Model: logistic regression over a 64x96 grayscale resize — a learned template
+Model: logistic regression over a 64x96 grayscale resize, in effect a learned template
 matcher. Trained with augmentation (brightness/contrast/gamma/noise/shift) so
 it tolerates lighting drift; retrain any time with more samples (night/IR
-frames especially) by re-running this script — the add-on hot-reloads the
+frames especially) by re-running this script; the add-on hot-reloads the
 JSON on mtime change, no rebuild needed.
 
 Output: nest_models/<camera>.json to copy to /config/nest_models/ on the NAS.
@@ -34,8 +34,8 @@ except ImportError:
 W, H = 80, 120
 RNG = np.random.default_rng(42)
 # Model's view within the archived crop (relative x0,y0,x1,y1): biased away
-# from the kitchen doorway at the left of the crop, whose own door — when
-# half-closed — otherwise mimics the cupboard's ajar edge (the 12:40/12:50Z
+# from the kitchen doorway at the left of the crop, whose own door, when
+# half-closed, otherwise mimics the cupboard's ajar edge (the 12:40/12:50Z
 # false positives on 2026-08-28).
 SUBCROP = (0.0, 0.0, 1.0, 0.90)
 
