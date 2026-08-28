@@ -1,108 +1,126 @@
-# Nest Headless Snapshot
+# Nest Headless Snapshot — real stills from WebRTC-only Nest cameras
 
-**Real still images from WebRTC-only Google Nest cameras, server-side, inside
-Home Assistant** — plus the diagnostic story of *why* every ordinary
-server-side WebRTC client fails against these cameras, and a probe you can run
-to see it yourself.
+[![Open your Home Assistant instance and show the add add-on repository dialog with this repository URL pre-filled.](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Frapartlu%2Fnest-headless-snapshot)
 
-## The problem
+## Is this your problem?
 
-Newer Google Nest cameras are WebRTC-only (no RTSP, no HLS through the SDM
-API). Home Assistant's Nest integration relays WebRTC signalling but never
-touches media, so `camera.snapshot` on these cameras returns a black
-placeholder frame. Pointing standard server-side WebRTC clients at them —
-go2rtc, aiortc, and friends — gets a completed ICE + DTLS handshake and then
-**video RTP packets with zero-byte payloads, forever** (bandwidth-probe
-padding). Audio flows fine. Meanwhile Chrome on the same LAN and account
-receives hundreds of frames within seconds.
+- Your Google Nest cameras **live-stream fine in the Home Assistant
+  dashboard**, but…
+- `camera.snapshot` (and camera-proxy images, notification thumbnails,
+  `image_entity` in AI/LLM integrations) returns a **black image** — often
+  the same tiny file every time.
+- You tried restreaming through **go2rtc / Frigate / aiortc** and got a
+  connection but **no video** — audio maybe, video never.
 
-## The diagnosis
+Then you have a **WebRTC-only Nest camera** (battery cams and most newer
+models — no RTSP, no HLS via the SDM API). Home Assistant only relays WebRTC
+signalling; it never decodes media, so anything that needs an actual frame
+gets a placeholder.
 
-Google's sender will not ramp past bandwidth probing unless the receiver
-sends **transport-wide congestion control (TWCC) feedback** it trusts. Chrome
-implements TWCC; aiortc and go2rtc (as of 1.9.x) do not generate TWCC
-receiver feedback. PLI forcing and REMB spoofing alone change nothing.
+**Why restreamers fail (the interesting part):** Google's media sender will
+not send real video until the receiver returns **transport-wide congestion
+control (TWCC) feedback**. Browsers implement TWCC, so Chrome gets video.
+go2rtc and aiortc don't generate TWCC receiver feedback, so Google sends
+them zero-byte bandwidth-probe padding forever — ICE and DTLS complete, the
+session looks healthy, and no frame ever arrives. This repo includes a
+[go probe](probe/) that demonstrates the mechanism in two minutes if you
+want proof on your own camera.
 
-`probe/` contains a single-binary Go client (pion/webrtc v4, whose default
-interceptor chain *does* generate TWCC feedback) that demonstrates this in
-about two minutes: with `transport-cc` negotiated and feedback flowing,
-Google sends real H.264 immediately — in our measured runs the stream
-switches from 640×360 to 1920×1080 within a few frames. Two additional
-empirical requirements are baked into both the probe and the add-on:
+**What this add-on does:** runs the client class that Google demonstrably
+cooperates with — Chromium — headlessly on your HA machine. On request it
+performs the browser WebRTC handshake against HA's own websocket API, waits
+for the stream to ramp to 1080p (a few seconds), renders a frame, and gives
+you a real JPEG — over HTTP and as a file your automations can use.
 
-1. **SDP m-line order must be audio, video, application** (data channel).
-2. Google's SDP answer contains ICE candidates with an **empty foundation**
-   (`a=candidate: ...`) which strict parsers reject — they must be patched
-   before use.
+No credentials, no cloud, no extra Google setup: it authenticates only to
+Home Assistant and uses your existing Nest integration. If a camera
+live-streams in your dashboard, it works here.
 
-## The add-on
+## Install (standard add-on steps)
 
-`nest_headless/` is a Home Assistant local add-on that runs headless Chromium
-(the client class proven to work), performs the browser handshake against
-HA's own `camera/webrtc/offer` websocket API, waits for the stream to ramp to
-HD, renders a frame, and serves/writes it as a JPEG:
+1. Click the blue button above — or go to **Settings → Add-ons → Add-on
+   Store → ⋮ (top right) → Repositories** and add:
+   `https://github.com/rapartlu/nest-headless-snapshot`
+2. Find **Nest Headless Snapshot** in the store (refresh if needed) and
+   click **Install**. The image builds on your machine — expect ~5 minutes.
+3. Click **Start**, then check the **Log** for a line like
+   `receiver video codecs: ... video/H264 ...`
 
+> Requires a Supervisor-based install (Home Assistant OS or Supervised).
+> amd64 and aarch64.
+
+## Use it
+
+There is **no camera configuration** — address any WebRTC camera by its
+entity id (without the `camera.` prefix):
+
+```bash
+curl "http://homeassistant.local:8098/snapshot/front_door?fresh=1" -o still.jpg
 ```
-GET /snapshot/<camera>              capture now (or cached if recent), JPEG
-GET /snapshot/<camera>?fresh=1      always capture (one SDM command)
-GET /snapshot/<camera>?fresh=1&format=json    capture, return metadata JSON
-GET /latest/<camera>.jpg            last capture from disk
-GET /            status JSON        GET /health   liveness
+
+If that returns a real photo, you're done. The frame is also written to
+`/config/www/nest/front_door.jpg` for anything that reads files.
+
+Typical automation wiring — a `rest_command` that returns only after a fresh
+frame is on disk, so whatever follows always sees a current image:
+
+```yaml
+rest_command:
+  capture_front_door:
+    url: "http://homeassistant.local:8098/snapshot/front_door?fresh=1&format=json"
+    method: get
+    timeout: 45
 ```
 
-Files land atomically in `/config/www/nest/<camera>.jpg`, ready for
-`llmvision.image_analyzer`'s `image_file`, notifications, or anything else.
-Response headers and the JSON carry `meanLuma` (black-frame guard), size and
-capture age. Concurrent requests for the same camera coalesce into a single
-capture, so a burst of automations costs one SDM command.
+```yaml
+# in an automation
+- action: rest_command.capture_front_door
+  response_variable: capture
+- condition: template   # never analyse a black frame
+  value_template: "{{ (capture.content.meanLuma | default(255)) | float > 3 }}"
+- action: llmvision.image_analyzer   # or notify with the image, etc.
+  data:
+    image_file: /config/www/nest/front_door.jpg
+    ...
+```
 
-Extras that grew out of real use:
+See [`examples/`](examples/) for complete, battle-tested patterns
+(AI cat-on-the-worktop deterrent with rotating sounds, door-left-open alerts
+with a tiny on-device classifier instead of an LLM) and
+[`nest_headless/DOCS.md`](nest_headless/DOCS.md) for every option and
+endpoint.
 
-- **Fixed-region crops** (`crops` option): per-camera regions of interest
-  written as `<camera>_crop.jpg` alongside each frame — a stable close-up
-  makes small state changes (a cupboard door ajar) far easier for any
-  downstream model than the full fisheye frame.
-- **Sample archiving** (`samples_dir` option): every capture's crop is also
-  archived with a timestamp — effortless labelled-ish training data across
-  lighting conditions.
-- **Tiny on-device classifiers** (`app/classifier.js` + `tools/train_door_model.py`):
-  logistic regression over a downscaled residual-vs-reference grayscale crop,
-  trained offline in seconds, shipped as a JSON weights file in
-  `/config/nest_models/<camera>.json`, hot-reloaded on change, evaluated in
-  microseconds of pure JavaScript per capture. The verdict rides in the
-  capture JSON (`classifier: {label, score, positive}`) so automations can
-  react to a physical state (door open/closed) with **no LLM, no cloud, no
-  extra latency**. We use it for an understairs-cupboard-door alert after
-  demonstrating that small vision-language models answer this kind of subtle
-  static question from prompt prior rather than perception.
+## Mind the quota
 
-## Install
+Every fresh capture is one WebRTC session = **one command** against Google's
+SDM quota of **100 commands/hour/camera**. The `min_interval_seconds` option
+(default 10 s) serves cached frames to rapid repeat requests, and concurrent
+requests for the same camera coalesce into one capture. A 5-minute periodic
+automation costs 12/hour — plenty of headroom; just don't poll in a tight
+loop.
 
-1. Copy `nest_headless/` into `/addons/` on your HA host (or add this
-   repository in the add-on store: ⋮ → Repositories).
-2. Add-on store → ⋮ → Check for updates → install **Nest Headless Snapshot**
-   (image build takes a few minutes) → Start.
-3. Check the log for `receiver video codecs: ... video/H264 ...`.
-4. Test: `curl "http://<ha-host>:8098/snapshot/<your_camera>?fresh=1" -o test.jpg`
+## Troubleshooting
 
-See `nest_headless/DOCS.md` for all options and `examples/` for rest_command
-and automation wiring.
+- **Add-on log is empty** or the add-on can't reach HA on a *supervised*
+  install: see "Broken supervised installs" in
+  [`nest_headless/DOCS.md`](nest_headless/DOCS.md) — both have built-in
+  workarounds.
+- **`no answer from HA within timeout`**: check the camera live-streams in
+  the HA dashboard first; this add-on can only capture what HA can stream.
+- **Frames are 640×360**: the stream ramps to 1080p within a few seconds and
+  the add-on waits up to 5 s for it; on very slow hardware raise
+  `capture_timeout_seconds`.
+- **Snapshot is dark/black with `meanLuma` < 3**: that's the guard working —
+  the camera sent a black frame (privacy mode, off, or startup).
 
-## Quota
+## What's in the repo
 
-Every fresh capture opens and closes one WebRTC session = **one SDM command**
-against Google's **100 commands/hour/camera** quota. `min_interval_seconds`
-serves cached frames to close-together requests; keep periodic automations at
-a sensible cadence.
-
-## Verified
-
-The capture path is exercised end-to-end in CI-able form: a mock HA websocket
-speaking the real protocol (auth, `camera/webrtc/offer`, session/answer
-events, simulated empty-foundation candidates) backed by a real pion sender,
-against the production page functions (`test/loopback.js`). The one thing
-that cannot be tested without a Google account and camera is Google itself —
-that's what `probe/` is for.
+| Path | What |
+|---|---|
+| `nest_headless/` | The add-on (Node + headless Chromium, ~small) |
+| `probe/` | Single-binary Go probe that proves the TWCC mechanism against your own camera |
+| `tools/train_door_model.py` | Trainer for the optional tiny per-camera state classifiers |
+| `examples/` | rest_command + automation patterns, VLM prompting lessons |
 
 ## License
 

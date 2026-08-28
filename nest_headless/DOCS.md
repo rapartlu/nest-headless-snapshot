@@ -4,6 +4,19 @@ Captures real still images from WebRTC-only Google Nest cameras by running
 the exact client Google's sender cooperates with — Chromium — headlessly on
 your Home Assistant host. See the repository README for the full background.
 
+## Quick start
+
+1. **Start** the add-on and check the log for
+   `receiver video codecs: ... video/H264 ...`
+2. Test with any camera that live-streams in your dashboard, using its
+   entity id without the `camera.` prefix:
+   `curl "http://homeassistant.local:8098/snapshot/<your_camera>?fresh=1" -o still.jpg`
+3. Wire it into automations with a `rest_command` — see the repository's
+   `examples/` directory. Each fresh capture costs one Google SDM command
+   (quota: 100/hour/camera).
+
+No per-camera configuration is needed; the defaults below are sensible.
+
 ## Options
 
 | Option | Default | Meaning |
