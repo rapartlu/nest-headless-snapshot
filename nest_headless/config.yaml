@@ -1,0 +1,37 @@
+name: Nest Headless Snapshot
+version: "1.1.0"
+slug: nest_headless
+description: >-
+  Real still images from WebRTC-only Google Nest cameras via headless
+  Chromium — the only server-side WebRTC client proven to receive video from
+  these cameras (it implements the transport-wide congestion control feedback
+  Google's sender requires before it will send real media).
+url: "https://github.com/rapartlu/nest-headless-snapshot"
+arch:
+  - amd64
+  - aarch64
+init: false
+startup: services
+homeassistant_api: true
+ports:
+  8098/tcp: 8098
+ports_description:
+  8098/tcp: Snapshot HTTP API (/snapshot/<camera>, /latest/<camera>.jpg)
+map:
+  - homeassistant_config:rw
+options:
+  min_interval_seconds: 10
+  jpeg_quality: 85
+  capture_timeout_seconds: 25
+  warmup_frames: 3
+  out_dir: ""
+  crops: ""
+  samples_dir: ""
+schema:
+  min_interval_seconds: int(1,3600)
+  jpeg_quality: int(30,100)
+  capture_timeout_seconds: int(5,120)
+  warmup_frames: int(1,30)
+  out_dir: str?
+  crops: str?
+  samples_dir: str?

@@ -1,0 +1,57 @@
+# Reference wiring for the nest_headless add-on.
+# Split into your configuration as appropriate (rest_command: in
+# configuration.yaml, automations in automations.yaml).
+#
+# Host: from Home Assistant Core on a supervised install, the add-on is
+# reachable by slug hostname (local-nest-headless) or by the NAS LAN IP.
+# Verify with:  curl http://<host>:8098/health
+
+rest_command:
+  nest_capture_kitchen:
+    url: "http://local-nest-headless:8098/snapshot/kitchen_camera?fresh=1&format=json"
+    method: get
+    timeout: 45
+  nest_capture_downstairs_hallway:
+    url: "http://local-nest-headless:8098/snapshot/downstairs_hallway_camera?fresh=1&format=json"
+    method: get
+    timeout: 45
+
+automation:
+  - alias: "Kitchen cat deterrent (Nest still)"
+    id: cat_kitchen_deterrent_image_v2
+    mode: single          # a second motion event during capture is dropped,
+                          # not queued — protects the SDM quota
+    trigger:
+      - platform: state
+        entity_id: event.kitchen_camera_motion
+    action:
+      # Synchronous capture: this step returns only after the JPEG is written.
+      # Reaching the next step therefore guarantees freshness; on capture
+      # failure this errors and the chain stops — a stale frame is never
+      # analysed as current.
+      - service: rest_command.nest_capture_kitchen
+        response_variable: capture
+      # Refuse near-black frames (the placeholder that started all this had
+      # mean luma 6.0; real night-vision frames measure far higher).
+      - condition: template
+        value_template: "{{ (capture.content.meanLuma | default(255)) | float > 3 }}"
+      - service: llmvision.image_analyzer
+        data:
+          image_file: /config/www/nest/kitchen_camera.jpg
+          # ... existing provider/model/prompt settings unchanged ...
+
+  - alias: "Understairs cupboard door open alert (Nest still)"
+    id: understairs_cupboard_door_open_alert_v2
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: event.downstairs_hallway_camera_motion
+    action:
+      - service: rest_command.nest_capture_downstairs_hallway
+        response_variable: capture
+      - condition: template
+        value_template: "{{ (capture.content.meanLuma | default(255)) | float > 3 }}"
+      - service: llmvision.image_analyzer
+        data:
+          image_file: /config/www/nest/downstairs_hallway_camera.jpg
+          # ... existing provider/model/prompt settings unchanged ...
