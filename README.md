@@ -46,8 +46,9 @@ live-streams in your dashboard, it works here.
 3. Click **Start**, then check the **Log** for a line like
    `receiver video codecs: ... video/H264 ...`
 
-> Requires a Supervisor-based install (Home Assistant OS or Supervised).
-> amd64 and aarch64.
+> The add-on route requires a Supervisor-based install (Home Assistant OS or
+> Supervised), amd64 or aarch64. **Running HA Container or Core?** See
+> [No Supervisor? Plain Docker works too](#no-supervisor-plain-docker-works-too).
 
 ## Use it
 
@@ -89,6 +90,30 @@ See [`examples/`](examples/) for complete, battle-tested patterns
 with a tiny on-device classifier instead of an LLM) and
 [`nest_headless/DOCS.md`](nest_headless/DOCS.md) for every option and
 endpoint.
+
+## No Supervisor? Plain Docker works too
+
+On Home Assistant **Container** or **Core** there are no add-ons, but this
+is just a Docker container that talks to HA's websocket API with a token —
+nothing about it needs the Supervisor:
+
+1. Clone this repository on the machine that runs Docker.
+2. In HA, create a long-lived access token (profile → **Security** →
+   long-lived access tokens).
+3. Edit [`docker-compose.yml`](docker-compose.yml): set `HA_WS_URL` to your
+   HA instance and the output volume to your HA config's `www/nest`
+   directory, then:
+
+   ```bash
+   export HA_TOKEN='<your long-lived token>'
+   docker compose up -d --build
+   curl "http://localhost:8098/snapshot/<your_camera>?fresh=1" -o still.jpg
+   ```
+
+All add-on options exist as environment variables (`MIN_INTERVAL_SECONDS`,
+`JPEG_QUALITY`, `CAPTURE_TIMEOUT_SECONDS`, `WARMUP_FRAMES`, `OUT_DIR`,
+`CROPS`, `SAMPLES_DIR`) — the compose file shows them all. Everything else in
+this README applies unchanged.
 
 ## Mind the quota
 

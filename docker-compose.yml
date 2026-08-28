@@ -1,0 +1,43 @@
+# Standalone deployment for Home Assistant Container / Core installs
+# (no Supervisor, no add-ons). The same image the add-on builds, configured
+# by environment variables instead of add-on options.
+#
+#   1. Create a long-lived access token in HA (profile -> Security).
+#   2. export HA_TOKEN=eyJ...   (or use an .env file)
+#   3. docker compose up -d --build
+#   4. curl "http://localhost:8098/snapshot/<your_camera>?fresh=1" -o still.jpg
+#
+# To have JPEGs land inside your HA config (for image_file automations),
+# point the volume at your HA config directory as shown below.
+
+services:
+  nest-headless:
+    build:
+      context: ./nest_headless
+    container_name: nest-headless-snapshot
+    ports:
+      - "8098:8098"
+    environment:
+      # Where your Home Assistant lives (use wss:// behind TLS)
+      HA_WS_URL: "ws://homeassistant.local:8123/api/websocket"
+      # Long-lived access token — set in your shell or an .env file,
+      # never commit it anywhere
+      HA_TOKEN: "${HA_TOKEN}"
+      # Write frames here (mapped below). Omit to keep them container-local
+      # and use only the HTTP API.
+      OUT_DIR: /out
+      # Optional tuning (defaults shown)
+      # MIN_INTERVAL_SECONDS: "10"
+      # JPEG_QUALITY: "85"
+      # CAPTURE_TIMEOUT_SECONDS: "25"
+      # WARMUP_FRAMES: "3"
+      # Optional: fixed crop regions and sample archiving (see DOCS.md)
+      # CROPS: "hallway_cam:0.35:0.0:0.28:0.55"
+      # SAMPLES_DIR: /out/samples
+    volumes:
+      # Map to your HA config's www dir so automations can use
+      # image_file: /config/www/nest/<camera>.jpg
+      - /path/to/homeassistant/config/www/nest:/out
+      # Optional: per-camera classifier models (see DOCS.md)
+      # - /path/to/homeassistant/config/nest_models:/config/nest_models:ro
+    restart: unless-stopped
