@@ -8,7 +8,7 @@
 //     "mean": [...], "std": [...], "weights": [...], "bias": -1.23,
 //     "threshold": 0.5, "trained": "2026-08-28", "samples": {"pos": 40, "neg": 200} }
 //
-// Inference cost: one 64x96 dot product. Microseconds, no native deps.
+// Inference cost: one 64x96 dot product — microseconds, no native deps.
 
 'use strict';
 
@@ -78,7 +78,7 @@ function classify(camera, jpegBuf) {
     const img = jpeg.decode(jpegBuf, { useTArray: true, maxMemoryUsageInMB: 64 });
     const g = toGray(img, model.width, model.height, model.subcrop);
     // Optional residual features: per-image standardization (lighting
-    // robustness) then subtraction of the stored reference closed scene.
+    // robustness) then subtraction of the stored reference closed scene —
     // must mirror the trainer exactly.
     if (model.per_image_norm) {
       let s = 0; for (let i = 0; i < g.length; i++) s += g[i];
@@ -86,6 +86,25 @@ function classify(camera, jpegBuf) {
       let v = 0; for (let i = 0; i < g.length; i++) v += (g[i] - m) * (g[i] - m);
       const sd = Math.sqrt(v / g.length) + 1e-6;
       for (let i = 0; i < g.length; i++) g[i] = (g[i] - m) / sd;
+    }
+    // Registration tripwire: correlate the standardized frame with the
+    // reference over the right 38% of the crop (the stairs - unaffected by
+    // the door state). Correct framing scores >=0.6 whether the door is open
+    // or closed; a zoomed/shifted feed (Google silently changed the stream
+    // crop on 2026-08-29 and the classifier false-alarmed) scores <=0.32.
+    // Automations should trust `positive` only when framingOk is true.
+    let refCorr = null;
+    if (model.reference && model.per_image_norm) {
+      const rx = Math.floor(model.width * 0.62);
+      let sa = 0, sb = 0, sab = 0;
+      for (let y = 0; y < model.height; y++) {
+        for (let x = rx; x < model.width; x++) {
+          const i = y * model.width + x;
+          const a = g[i], b = model.reference[i];
+          sa += a * a; sb += b * b; sab += a * b;
+        }
+      }
+      refCorr = sab / (Math.sqrt(sa * sb) + 1e-9);
     }
     if (model.reference) {
       for (let i = 0; i < g.length; i++) g[i] -= model.reference[i];
@@ -96,7 +115,12 @@ function classify(camera, jpegBuf) {
       z += v * model.weights[i];
     }
     const score = 1 / (1 + Math.exp(-z));
-    return { label: model.label, score: Math.round(score * 1000) / 1000, positive: score >= (model.threshold || 0.5) };
+    const out = { label: model.label, score: Math.round(score * 1000) / 1000, positive: score >= (model.threshold || 0.5) };
+    if (refCorr !== null) {
+      out.refCorr = Math.round(refCorr * 1000) / 1000;
+      out.framingOk = refCorr >= 0.45;
+    }
+    return out;
   } catch (e) {
     console.warn(`[nest_headless] classify ${camera} failed: ${e.message}`);
     return null;

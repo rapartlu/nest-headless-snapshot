@@ -4,6 +4,17 @@ Gets real still images from WebRTC-only Google Nest cameras by running a
 headless browser on your Home Assistant machine. The repository README has
 the full story.
 
+## Camera framing tripwire
+
+If a classifier model has reference features, each capture also reports
+`classifier.refCorr` (how well the frame registers against the model's
+reference scene, measured on the right side of the crop) and
+`classifier.framingOk` (true when refCorr >= 0.45). If the camera view ever
+changes - a knock, a zoom setting, or the vendor silently changing the
+stream crop - framingOk goes false. Have your automations trust `positive`
+only when `framingOk` is true, and notify instead: verdicts from a shifted
+view are meaningless, and the model needs a quick retrain on the new view.
+
 ## Quick start
 
 1. Start the add-on and check the log for

@@ -6,10 +6,10 @@ samples_dir option):
     --pos  crops with the cupboard door OPEN/ajar
     --neg  crops with it CLOSED
 
-Model: logistic regression over a 64x96 grayscale resize, in effect a learned template
+Model: logistic regression over a 64x96 grayscale resize — a learned template
 matcher. Trained with augmentation (brightness/contrast/gamma/noise/shift) so
 it tolerates lighting drift; retrain any time with more samples (night/IR
-frames especially) by re-running this script; the add-on hot-reloads the
+frames especially) by re-running this script — the add-on hot-reloads the
 JSON on mtime change, no rebuild needed.
 
 Output: nest_models/<camera>.json to copy to /config/nest_models/ on the NAS.
@@ -34,8 +34,8 @@ except ImportError:
 W, H = 80, 120
 RNG = np.random.default_rng(42)
 # Model's view within the archived crop (relative x0,y0,x1,y1): biased away
-# from the kitchen doorway at the left of the crop, whose own door, when
-# half-closed, otherwise mimics the cupboard's ajar edge (the 12:40/12:50Z
+# from the kitchen doorway at the left of the crop, whose own door — when
+# half-closed — otherwise mimics the cupboard's ajar edge (the 12:40/12:50Z
 # false positives on 2026-08-28).
 SUBCROP = (0.0, 0.0, 1.0, 0.90)
 
@@ -54,8 +54,27 @@ def augment(img, n):
     out = []
     for _ in range(n):
         a = img.copy()
-        # small shift (register tolerance) via roll + edge clamp
-        dx, dy = RNG.integers(-1, 2), RNG.integers(-1, 2)
+        # modest registration tolerance (+-2px, 3% scale). Bigger invariance
+        # was tried on 2026-08-29 after the camera got nudged and it wrecked
+        # the linear template (open min fell to 0.0): this model is pinned to
+        # one camera position by design - a real bump needs fresh samples and
+        # a retrain, not augmentation.
+        sc = RNG.uniform(0.97, 1.03)
+        if abs(sc - 1.0) > 0.005:
+            from PIL import Image as _I
+            hh, ww = a.shape
+            im = _I.fromarray((a * 255).astype("uint8"))
+            nw, nh = max(2, int(ww * sc)), max(2, int(hh * sc))
+            im = im.resize((nw, nh), _I.BILINEAR)
+            if sc >= 1.0:
+                l, t = (nw - ww) // 2, (nh - hh) // 2
+                im = im.crop((l, t, l + ww, t + hh))
+            else:
+                canvas = _I.new("L", (ww, hh), int(a.mean() * 255))
+                canvas.paste(im, ((ww - nw) // 2, (hh - nh) // 2))
+                im = canvas
+            a = np.asarray(im, dtype=np.float64) / 255.0
+        dx, dy = RNG.integers(-2, 3), RNG.integers(-2, 3)
         a = np.roll(a, (dy, dx), axis=(0, 1))
         # brightness / contrast / gamma
         a = np.clip((a - 0.5) * RNG.uniform(0.7, 1.3) + 0.5 + RNG.uniform(-0.15, 0.15), 0, 1)
@@ -94,10 +113,18 @@ def main():
     ap.add_argument("--aug", type=int, default=400, help="augmented set size per class")
     ap.add_argument("--epochs", type=int, default=300)
     ap.add_argument("--l2", type=float, default=1e-3)
+    ap.add_argument("--ref-dir", default=None,
+                    help="dir whose median forms the closed-scene reference "
+                         "(default: --neg). Pin this to ONE lighting regime - "
+                         "mixing day+evening frames into the median shifts the "
+                         "reference and broke real-frame accuracy on 2026-08-29.")
     args = ap.parse_args()
 
-    neg_files = sorted(Path(args.neg).glob("*.jpg")) + sorted(Path(args.neg).glob("*.jpeg"))
-    refz = np.median(np.stack([standardize(load_gray(f)) for f in neg_files]), axis=0)
+    ref_dir = args.ref_dir or args.neg
+    ref_files = sorted(Path(ref_dir).glob("*.jpg")) + sorted(Path(ref_dir).glob("*.jpeg"))
+    if not ref_files:
+        sys.exit(f"no jpegs in ref dir {ref_dir}")
+    refz = np.median(np.stack([standardize(load_gray(f)) for f in ref_files]), axis=0)
     Xp, npos = build_set(args.pos, args.aug, refz)
     Xn, nneg = build_set(args.neg, args.aug, refz)
     X = np.vstack([Xp, Xn])
