@@ -446,6 +446,7 @@ async function watchHit(entityId, payload) {
   const frameBuf = Buffer.from(payload.dataUrl.split(',')[1], 'base64');
   const { cat, dets } = await catOnSurface(entityId, frameBuf);
   let verdict = cat; // true / false / null(detector down)
+  if ((dets || []).some((d) => d.cls === 0)) mgr.lastPersonMs = now;
   if (cat === false) {
     // The detector has a proven blind spot: a climbing, motion-blurred,
     // lamp-occluded cat on the far worktop looks like nothing to COCO
@@ -453,8 +454,13 @@ async function watchHit(entityId, payload) {
     // Heuristic: surface motion with NO person anywhere in frame = cat.
     // People trip the diff constantly but always detect strongly.
     const personNear = (dets || []).some((d) => d.cls === 0);
-    if (!personNear) {
+    // A person LEAVING between two samples reads as motion-with-nobody-there
+    // (fired a false deterrent at 22:25 on day one) - so "suspected" also
+    // requires that no person has been seen for a while.
+    const personRecently = now - (mgr.lastPersonMs || 0) < 45000;
+    if (!personNear && !personRecently) {
       const people = await infer.detect(frameBuf, { classes: [0], conf: 0.3 }).catch(() => null);
+      if (people && people.length) mgr.lastPersonMs = now;
       if (people && people.length === 0) {
         verdict = 'suspected';
         saveCatSnapshot(entityId, frameBuf, dets || []);

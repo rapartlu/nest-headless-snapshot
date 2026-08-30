@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.3
+
+- Suspected-cat now also requires that no person has been detected for 45
+  seconds: someone walking out of frame between two samples reads as
+  motion-with-nobody-present and fired a false deterrent within minutes of
+  the heuristic shipping.
+
 ## 1.4.2
 
 - Suspected-cat heuristic: pretrained COCO detectors have a real blind spot

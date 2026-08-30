@@ -1,5 +1,5 @@
 name: Nest Headless Snapshot
-version: "1.4.2"
+version: "1.4.3"
 slug: nest_headless
 description: >-
   Real still images from WebRTC-only Google Nest cameras via headless
