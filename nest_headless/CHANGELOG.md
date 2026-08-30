@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.4.2
+
+- Suspected-cat heuristic: pretrained COCO detectors have a real blind spot
+  for climbing, motion-blurred, partly occluded animals on distant surfaces
+  (a plainly visible worktop raid went undetected at 10% confidence). When a
+  surface region shows motion and NO person is detected anywhere in the
+  frame, the event now fires with `cat: "suspected"` and the annotated
+  evidence frame is archived. People trip the motion diff constantly but
+  detect very reliably, so daytime cooking stays silent.
+
 ## 1.4.1
 
 - Fixed: the surface-motion watch loop never actually fired. Functions passed

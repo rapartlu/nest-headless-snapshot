@@ -445,14 +445,30 @@ async function watchHit(entityId, payload) {
   // People trigger the same pixel diff constantly; they are logged, not fired.
   const frameBuf = Buffer.from(payload.dataUrl.split(',')[1], 'base64');
   const { cat, dets } = await catOnSurface(entityId, frameBuf);
-  console.log(`[nest_headless] watch hit ${entityId} roi=${payload.roi} changed=${payload.changedPct}% cat=${cat} dets=${dets ? dets.map((x) => x.name + ':' + x.conf).join(',') : 'n/a'}`);
-  if (cat === false) return;
+  let verdict = cat; // true / false / null(detector down)
+  if (cat === false) {
+    // The detector has a proven blind spot: a climbing, motion-blurred,
+    // lamp-occluded cat on the far worktop looks like nothing to COCO
+    // (missed at conf 0.10 on 2026-08-30 22:12 with the cat in plain view).
+    // Heuristic: surface motion with NO person anywhere in frame = cat.
+    // People trip the diff constantly but always detect strongly.
+    const personNear = (dets || []).some((d) => d.cls === 0);
+    if (!personNear) {
+      const people = await infer.detect(frameBuf, { classes: [0], conf: 0.3 }).catch(() => null);
+      if (people && people.length === 0) {
+        verdict = 'suspected';
+        saveCatSnapshot(entityId, frameBuf, dets || []);
+      }
+    }
+  }
+  console.log(`[nest_headless] watch hit ${entityId} roi=${payload.roi} changed=${payload.changedPct}% cat=${verdict} dets=${dets ? dets.map((x) => x.name + ':' + x.conf).join(',') : 'n/a'}`);
+  if (verdict === false) return;
   await postHaEvent('nest_headless_surface_activity', {
     entity_id: entityId,
     camera: entityId.replace(/^camera\./, ''),
     roi: payload.roi,
     changed_pct: payload.changedPct,
-    cat,
+    cat: verdict,
     detections: dets ? dets.slice(0, 5) : null,
   });
 }
