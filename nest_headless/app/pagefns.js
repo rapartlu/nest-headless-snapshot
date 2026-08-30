@@ -197,6 +197,7 @@ const startWatchLoop = ({ intervalMs = 4000, rois = [], diffPct = 4, quality = 0
       window.__watchTicks++;
       if (prev) {
         let best = null;
+        window.__watchMaxPct = window.__watchMaxPct || 0;
         for (const r of rois) {
           const x0 = Math.floor(r.x * W), y0 = Math.floor(r.y * H);
           const x1 = Math.min(W, Math.ceil((r.x + r.w) * W)), y1 = Math.min(H, Math.ceil((r.y + r.h) * H));
@@ -207,10 +208,16 @@ const startWatchLoop = ({ intervalMs = 4000, rois = [], diffPct = 4, quality = 0
             if (Math.abs(g[i] - prev[i]) > 22) changed++;
           }
           const pct = total ? (changed / total) * 100 : 0;
+          if (pct > window.__watchMaxPct) window.__watchMaxPct = Math.round(pct * 10) / 10;
           if (pct >= diffPct && (!best || pct > best.pct)) best = { roi: r.name || 'roi', pct: Math.round(pct * 10) / 10 };
         }
         if (best) {
-          const shot = grabFrame({ quality });
+          // page.evaluate serializes this function WITHOUT its module scope:
+          // grabFrame must be pre-installed on window by the server (it was
+          // not, and every hit threw ReferenceError into the catch below -
+          // silently, for the watch feature's entire life until 2026-08-30).
+          const shot = (window.__grabFrame || grabFrame)({ quality });
+          window.__watchHits = (window.__watchHits || 0) + 1;
           window.__watchHitNode({ roi: best.roi, changedPct: best.pct, ...shot });
         }
       }
@@ -222,6 +229,8 @@ const startWatchLoop = ({ intervalMs = 4000, rois = [], diffPct = 4, quality = 0
 
 const watchState = () => ({
   ticks: window.__watchTicks || 0,
+  hits: window.__watchHits || 0,
+  maxPct: window.__watchMaxPct || 0,
   width: window.__watchVideo ? window.__watchVideo.videoWidth : 0,
   height: window.__watchVideo ? window.__watchVideo.videoHeight : 0,
   ice: window.__pc ? window.__pc.iceConnectionState : 'none',

@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.4.1
+
+- Fixed: the surface-motion watch loop never actually fired. Functions passed
+  to page.evaluate lose their module scope, so the hit path's frame-grab call
+  threw ReferenceError into a silent catch on every trigger since the feature
+  shipped. The helper is now installed into the page's global scope first.
+  Also adds `GET /watchstate/<camera>` (loop ticks, hits, max diff seen) so a
+  silent watch can never masquerade as a quiet room again.
+
 ## 1.4.0
 
 - Capture timeline: every archived frame is indexed in

@@ -540,6 +540,9 @@ async function runWatch(entityId, intervalSec) {
         timeoutMs: cfg.captureTimeoutSeconds * 1000, warmupFrames: cfg.warmupFrames,
       });
       if (rois.length) {
+        // install grabFrame into the page's global scope first - evaluated
+        // functions lose their module closures (see note in pagefns)
+        await page.evaluate((src) => { window.__grabFrame = eval('(' + src + ')'); }, fns.grabFrame.toString());
         await page.evaluate(fns.startWatchLoop, {
           intervalMs: intervalSec * 1000, rois, diffPct: cfg.watchDiffPct, quality: cfg.jpegQuality,
         });
@@ -634,6 +637,15 @@ const server = http.createServer(async (req, res) => {
     }
     if (parts[0] === 'latest' && parts[1]) {
       serveFile(res, cameraEntity(parts[1].replace(/\.jpg$/, '')));
+      return;
+    }
+    if (parts[0] === 'watchstate' && parts[1]) {
+      const entityId = cameraEntity(parts[1]);
+      const mgr = watchMgr[entityId];
+      let pageState = null;
+      if (mgr && mgr.page) { try { pageState = await mgr.page.evaluate(fns.watchState); } catch (e) { pageState = { err: e.message }; } }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ mgr: mgr ? { ready: mgr.ready, hits: mgr.hits, lastError: mgr.lastError } : null, page: pageState }));
       return;
     }
     if (parts[0] === 'detect' && parts[1]) {
