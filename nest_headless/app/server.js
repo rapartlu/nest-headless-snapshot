@@ -433,6 +433,10 @@ async function watchHit(entityId, payload) {
   const mgr = watchMgr[entityId];
   if (!mgr) return;
   const now = Date.now();
+  // Stream-settle grace: a freshly (re)connected stream shifts exposure and
+  // resolution for its first seconds, which diffs like motion (fired a
+  // phantom deterrent 6s after a restart). Ignore hits until it settles.
+  if (now - (mgr.readySinceMs || 0) < 45000) return;
   if (now - mgr.lastHitMs < cfg.watchCooldownSeconds * 1000) return;
   mgr.lastHitMs = now;
   mgr.hits = (mgr.hits || 0) + 1;
@@ -570,6 +574,8 @@ async function runWatch(entityId, intervalSec) {
         });
       }
       mgr.page = page; mgr.ready = true; mgr.startedAt = new Date().toISOString(); mgr.lastError = null;
+      mgr.readySinceMs = Date.now();
+      mgr.lastPersonMs = Date.now(); // cold start: assume people were just about
       console.log(`[nest_headless] watch ${entityId} live at ${dims.width}x${dims.height}, ${rois.length} ROIs, sampling every ${intervalSec}s`);
       // Classifier tick: local, free, and fast - a trained model (e.g. the
       // cupboard door) now sees the live stream instead of 5-minute polls.

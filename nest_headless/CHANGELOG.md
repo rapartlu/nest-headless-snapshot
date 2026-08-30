@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.4
+
+- Cold-start hardening: watch hits are ignored for 45 s after a stream
+  (re)connects - a settling stream (exposure/resolution ramp) diffs like
+  motion and fired a phantom deterrent seconds after a restart. The
+  person-recently memory is also seeded at connect instead of starting
+  empty.
+
 ## 1.4.3
 
 - Suspected-cat now also requires that no person has been detected for 45
