@@ -33,6 +33,7 @@ const WebSocket = require('ws');
 const puppeteer = require('puppeteer-core');
 const fns = require('./pagefns');
 const { classify } = require('./classifier');
+const infer = require('./infer');
 
 // ------------------------------------------------------------ configuration
 const cfg = {
@@ -73,6 +74,11 @@ const cfg = {
   // every N seconds and fire nest_headless_classifier_positive on a positive
   // verdict (with framing gate respected). 0 disables.
   watchClassifySeconds: intEnv('WATCH_CLASSIFY_SECONDS', 15),
+  // A "left open" state is persistent; hallway traffic and lighting flips are
+  // not. Require this many consecutive tick-window samples with >=85%
+  // positives (and the last 3 all positive) before the event fires.
+  // 16 ticks at 15 s = a solid 4 minutes of evidence. 0 or 1 = fire at once.
+  watchClassifyPersistTicks: intEnv('WATCH_CLASSIFY_PERSIST_TICKS', 16),
 };
 
 function parseWatches(spec) {
@@ -267,7 +273,7 @@ async function capture(entityId) {
 }
 
 // Write the frame (and crop) to disk, run the classifier, build capture meta.
-function persistShot(entityId, shot) {
+async function persistShot(entityId, shot) {
   const buf = Buffer.from(shot.dataUrl.split(',')[1], 'base64');
     const file = cameraFile(entityId);
     const tmp = file + '.tmp';
@@ -281,7 +287,22 @@ function persistShot(entityId, shot) {
       fs.writeFileSync(cropFile + '.tmp', cbuf);
       fs.renameSync(cropFile + '.tmp', cropFile);
       if (cfg.samplesDir) archiveSample(entityId, cbuf);
-      verdict = classify(entityId, cbuf); // null when no model is trained yet
+      verdict = classify(entityId, cbuf); // linear model: verdict + framing gate
+      // The fine-tuned CNN (hot-loaded onnx) outranks the linear verdict when
+      // present; the linear model's framing gate still applies on top.
+      if (infer.hasDoorModel(entityId)) {
+        const cnn = await infer.classifyDoor(entityId, cbuf).catch((e) => {
+          console.warn(`[nest_headless] onnx classify ${entityId} failed: ${e.message}`); return null;
+        });
+        if (cnn) {
+          const framingOk = verdict ? verdict.framingOk : undefined;
+          verdict = {
+            ...cnn,
+            ...(verdict && verdict.refCorr !== undefined ? { refCorr: verdict.refCorr, framingOk } : {}),
+            positive: cnn.positive && framingOk !== false,
+          };
+        }
+      }
     }
     const meta = {
       file, cropFile, bytes: buf.length, width: shot.width, height: shot.height,
@@ -372,16 +393,65 @@ async function watchHit(entityId, payload) {
   mgr.lastHitMs = now;
   mgr.hits = (mgr.hits || 0) + 1;
   if (payload.meanLuma < 3) return; // black frame, nothing to see
-  persistShot(entityId, payload);
+  await persistShot(entityId, payload);
   const st = state[entityId] || (state[entityId] = { lastCaptureMs: 0, inflight: null, lastMeta: null });
   st.lastCaptureMs = now;
-  console.log(`[nest_headless] watch hit ${entityId} roi=${payload.roi} changed=${payload.changedPct}%`);
+  // Local detector decides whether this is worth anyone's attention: the
+  // event only fires when a cat (or dog) is actually ON a watched surface.
+  // People trigger the same pixel diff constantly; they are logged, not fired.
+  const frameBuf = Buffer.from(payload.dataUrl.split(',')[1], 'base64');
+  const { cat, dets } = await catOnSurface(entityId, frameBuf);
+  console.log(`[nest_headless] watch hit ${entityId} roi=${payload.roi} changed=${payload.changedPct}% cat=${cat} dets=${dets ? dets.map((x) => x.name + ':' + x.conf).join(',') : 'n/a'}`);
+  if (cat === false) return;
   await postHaEvent('nest_headless_surface_activity', {
     entity_id: entityId,
     camera: entityId.replace(/^camera\./, ''),
     roi: payload.roi,
     changed_pct: payload.changedPct,
+    cat,
+    detections: dets ? dets.slice(0, 5) : null,
   });
+}
+
+// Is a cat (or dog) standing on one of this camera's watched surfaces?
+// Uses the box's bottom-centre - the animal's feet - for ROI membership.
+// Returns { cat: true/false/null, dets } - null when the detector is
+// unavailable (callers should treat that as "unknown", not "no").
+async function catOnSurface(entityId, frameBuf) {
+  try {
+    const rois = cfg.watchRois[entityId] || [];
+    if (!rois.length) return { cat: null, dets: null };
+    const dets = [];
+    let ran = false;
+    let cat = false;
+    for (const r of rois) {
+      // Detect inside a ZOOMED view of each surface: distant animals vanish
+      // at full-frame scale (a far cat is ~13px - proven blind spot), but at
+      // ROI zoom the same cat detects at 0.8 conf. The ROI marks where feet
+      // land; the body rises above it, so pad upward and sideways.
+      const region = {
+        x: Math.max(0, r.x - 0.08), y: Math.max(0, r.y - 0.22),
+        w: Math.min(1, r.w + 0.16), h: Math.min(1, r.h + 0.28),
+      };
+      const d = await infer.detect(frameBuf, { classes: [0, 15, 16], conf: 0.4, region });
+      if (d === null) continue;
+      ran = true;
+      for (const x of d) {
+        dets.push({ ...x, roi: r.name });
+        if (x.cls === 15 || x.cls === 16) {
+          // placement: the animal's feet (box bottom-centre, full-frame
+          // coords) must be on the surface itself, not the floor behind it
+          const fx = x.box.x + x.box.w / 2, fy = x.box.y + x.box.h;
+          if (fx >= r.x && fx <= r.x + r.w && fy >= r.y - 0.02 && fy <= r.y + r.h + 0.04) cat = true;
+        }
+      }
+    }
+    if (!ran) return { cat: null, dets: null };
+    return { cat, dets };
+  } catch (e) {
+    console.warn(`[nest_headless] detect ${entityId} failed: ${e.message}`);
+    return { cat: null, dets: null };
+  }
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -417,14 +487,26 @@ async function runWatch(entityId, intervalSec) {
           try {
             const r = await watchGrab(entityId);
             const v = r && r.meta && r.meta.classifier;
-            if (v && v.positive && v.framingOk !== false) {
+            if (!v) return;
+            const tick = v.positive && v.framingOk !== false ? 1 : 0;
+            const N = Math.max(1, cfg.watchClassifyPersistTicks);
+            mgr.verdicts = mgr.verdicts || [];
+            mgr.verdicts.push(tick);
+            if (mgr.verdicts.length > N) mgr.verdicts.shift();
+            const sum = mgr.verdicts.reduce((a, b) => a + b, 0);
+            const sustained = N <= 1 ? tick === 1 :
+              (mgr.verdicts.length >= N && sum >= Math.ceil(N * 0.85) &&
+               mgr.verdicts.slice(-3).every((x) => x === 1));
+            if (!sustained && sum <= N / 2) mgr.sustainedOpen = false; // rearm
+            if (sustained && !mgr.sustainedOpen) {
+              mgr.sustainedOpen = true;
               const now = Date.now();
               if (now - (mgr.lastClassifyEventMs || 0) >= cfg.watchCooldownSeconds * 1000) {
                 mgr.lastClassifyEventMs = now;
-                console.log(`[nest_headless] classifier positive ${entityId} (${v.label} ${v.score})`);
+                console.log(`[nest_headless] classifier SUSTAINED positive ${entityId} (${v.label} ${v.score}, ${sum}/${N} ticks)`);
                 await postHaEvent('nest_headless_classifier_positive', {
                   entity_id: entityId, camera: entityId.replace(/^camera\./, ''),
-                  label: v.label, score: v.score,
+                  label: v.label, score: v.score, sustained_ticks: sum,
                 });
               }
             }
@@ -479,12 +561,21 @@ const server = http.createServer(async (req, res) => {
         cameras: Object.fromEntries(Object.entries(state).map(([k, v]) => [k, v.lastMeta])),
         watches: Object.fromEntries(Object.entries(watchMgr).map(([k, m]) => [k, {
           ready: m.ready, hits: m.hits, startedAt: m.startedAt, lastError: m.lastError,
+          verdictWindow: (m.verdicts || []).join(''), sustainedOpen: !!m.sustainedOpen,
         }])),
       }, null, 2));
       return;
     }
     if (parts[0] === 'latest' && parts[1]) {
       serveFile(res, cameraEntity(parts[1].replace(/\.jpg$/, '')));
+      return;
+    }
+    if (parts[0] === 'detect' && parts[1]) {
+      const entityId = cameraEntity(parts[1]);
+      const { buf } = await captureCoalesced(entityId);
+      const { cat, dets } = await catOnSurface(entityId, buf);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ cat_on_surface: cat, detections: dets }));
       return;
     }
     if (parts[0] === 'snapshot' && parts[1]) {

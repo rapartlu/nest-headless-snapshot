@@ -40,6 +40,31 @@ What you get:
 The stream reconnects automatically if it drops. Watch health is visible in
 the `/` status JSON under `watches`.
 
+## Local vision models
+
+Two kinds of model run in-process (native onnxruntime, no cloud, no quota):
+
+1. **Cat/object detector** - export the pretrained COCO weights yourself
+   (they are AGPL-licensed, so not bundled here):
+
+       pip install ultralytics
+       yolo export model=yolo11n.pt format=onnx imgsz=640
+       cp yolo11n.onnx nest_headless/app/assets/models/
+
+   With the file in place, surface-motion hits and `GET /detect/<camera>`
+   run detection over each watched region and report `cat_on_surface`.
+
+2. **Per-camera state classifiers** - fine-tune a small classifier on your
+   own crops (two folders of labelled images):
+
+       yolo classify train model=yolo11n-cls.pt data=<dataset> epochs=40 imgsz=256
+       yolo export model=runs/classify/train/weights/best.pt format=onnx imgsz=256
+       cp best.onnx <config>/nest_models/<camera>.onnx
+
+   The `.onnx` outranks the linear `.json` verdict when both exist; the
+   linear model still provides the framing tripwire. Retraining is just
+   replacing the file - it hot-loads on change.
+
 ## Camera framing tripwire
 
 If a classifier model has reference features, each capture also reports

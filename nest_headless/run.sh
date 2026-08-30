@@ -42,6 +42,7 @@ if [ -f "$OPTS" ]; then
   export WATCH_DIFF_PCT="$(jq -r '.watch_diff_pct // 4' "$OPTS")"
   export WATCH_COOLDOWN_SECONDS="$(jq -r '.watch_cooldown_seconds // 60' "$OPTS")"
   export WATCH_CLASSIFY_SECONDS="$(jq -r '.watch_classify_seconds // 15' "$OPTS")"
+  export WATCH_CLASSIFY_PERSIST_TICKS="$(jq -r '.watch_classify_persist_ticks // 16' "$OPTS")"
 fi
 
 exec node /app/server.js

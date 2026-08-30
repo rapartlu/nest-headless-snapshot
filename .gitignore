@@ -2,3 +2,5 @@ node_modules/
 *.log
 .DS_Store
 nest-twcc-probe
+# Ultralytics model weights are AGPL-licensed - build them locally (see DOCS)
+nest_headless/app/assets/models/*.onnx

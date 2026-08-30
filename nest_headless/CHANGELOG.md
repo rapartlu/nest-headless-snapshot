@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.3.0
+
+- Base image moved from Alpine to Debian (bookworm) so native
+  onnxruntime-node loads - local vision models now run in-process,
+  multithreaded. First build after the switch is slow (new base plus a full
+  Debian Chromium); later rebuilds hit the Docker cache.
+- Local cat detection: a YOLO11n COCO model (place it at
+  `app/assets/models/yolo11n.onnx` before building - see DOCS, the weights
+  are AGPL so they are not shipped in this repo) checks every surface-motion
+  hit and the new `GET /detect/<camera>` endpoint. Detection zooms each
+  watched region (a distant cat is invisible at full-frame scale but detects
+  at high confidence when the region is zoomed) and requires the animal's
+  feet inside the region - so people leaning over the worktop and cats
+  walking the floor behind it stay silent. The surface-activity event now
+  fires only when a cat or dog is actually on a surface, and carries the
+  detections.
+- Per-camera CNN classifiers: drop a fine-tuned `<camera>.onnx` (ultralytics
+  classify export) next to the linear model in `nest_models/` and it takes
+  over the verdict - hot-loaded on change, with the linear model still
+  supplying the framing tripwire. A CNN trained across lighting regimes and
+  camera framings is dramatically more robust than the linear template.
+- Classifier persistence gate: `watch_classify_persist_ticks` (default 16)
+  requires ~85% positive ticks across the window plus three consecutive
+  positives before the classifier event fires. "Left open" is a persistent
+  state; hallway traffic and lighting flips are not.
+
 ## 1.2.1
 
 - Watch mode: hold a persistent WebRTC stream open per listed camera

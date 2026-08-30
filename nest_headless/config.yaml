@@ -1,5 +1,5 @@
 name: Nest Headless Snapshot
-version: "1.2.1"
+version: "1.3.0"
 slug: nest_headless
 description: >-
   Real still images from WebRTC-only Google Nest cameras via headless
@@ -32,6 +32,7 @@ options:
   watch_diff_pct: 4
   watch_cooldown_seconds: 60
   watch_classify_seconds: 15
+  watch_classify_persist_ticks: 16
 schema:
   min_interval_seconds: int(1,3600)
   jpeg_quality: int(30,100)
@@ -45,3 +46,4 @@ schema:
   watch_diff_pct: int(1,50)?
   watch_cooldown_seconds: int(5,3600)?
   watch_classify_seconds: int(0,3600)?
+  watch_classify_persist_ticks: int(0,240)?

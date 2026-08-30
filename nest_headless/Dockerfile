@@ -1,12 +1,13 @@
-# As a Home Assistant add-on the Supervisor passes BUILD_FROM from build.yaml
-# (HA base images). Built standalone (`docker build`), it defaults to plain
-# Alpine so the same Dockerfile serves Container/Core installs. See
-# docker-compose.yml at the repository root.
-ARG BUILD_FROM=alpine:3.21
+ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base-debian:bookworm
 FROM $BUILD_FROM
 
-# Chromium from Alpine repos: built with system ffmpeg, includes H.264 decode.
-RUN apk add --no-cache chromium nodejs npm jq font-noto ttf-freefont ca-certificates tzdata
+# Debian base (swapped from Alpine 2026-08-30): glibc lets native
+# onnxruntime-node load, so the local vision models (cat detector + door
+# classifier) run in-process, multithreaded, instead of WASM in the page.
+# Chromium from Debian repos includes H.264 decode.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      chromium nodejs npm jq fonts-noto-core \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY app/package.json /app/
@@ -16,5 +17,5 @@ COPY app/ /app/
 COPY run.sh /
 RUN chmod +x /run.sh
 
-ENV CHROMIUM_PATH=/usr/bin/chromium-browser
+ENV CHROMIUM_PATH=/usr/bin/chromium
 CMD ["/run.sh"]
