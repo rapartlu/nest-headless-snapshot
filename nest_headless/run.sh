@@ -34,6 +34,14 @@ if [ -f "$OPTS" ]; then
   [ -n "$CROPS_OPT" ] && export CROPS="$CROPS_OPT"
   SAMPLES_OPT="$(jq -r '.samples_dir // ""' "$OPTS")"
   [ -n "$SAMPLES_OPT" ] && export SAMPLES_DIR="$SAMPLES_OPT"
+  # Persistent watch mode (see DOCS): cameras, surface regions, sensitivity
+  WATCHES_OPT="$(jq -r '.watch_cameras // ""' "$OPTS")"
+  [ -n "$WATCHES_OPT" ] && export WATCHES="$WATCHES_OPT"
+  WATCH_ROIS_OPT="$(jq -r '.watch_rois // ""' "$OPTS")"
+  [ -n "$WATCH_ROIS_OPT" ] && export WATCH_ROIS="$WATCH_ROIS_OPT"
+  export WATCH_DIFF_PCT="$(jq -r '.watch_diff_pct // 4' "$OPTS")"
+  export WATCH_COOLDOWN_SECONDS="$(jq -r '.watch_cooldown_seconds // 60' "$OPTS")"
+  export WATCH_CLASSIFY_SECONDS="$(jq -r '.watch_classify_seconds // 15' "$OPTS")"
 fi
 
 exec node /app/server.js

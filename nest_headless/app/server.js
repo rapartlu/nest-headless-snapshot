@@ -1,12 +1,13 @@
 #!/usr/bin/env node
-// nest_headless: server-side Nest camera stills via headless Chromium.
+// nest_headless — server-side Nest camera stills via headless Chromium.
 //
 // Home Assistant relays WebRTC-only Nest cameras' live stream to the browser
 // but never terminates the media itself, so camera.snapshot has no frame to
 // return and hands back a placeholder. This add-on runs a real browser
 // (headless Chromium) that opens the stream the same way the dashboard does,
 // waits for it to ramp to full resolution, and turns a decoded frame into a
-// JPEG.
+// JPEG. Watch mode holds the stream open for instant frames and local
+// on-surface motion / classifier checks.
 //
 // HTTP API (mirrors the nest_snapshot add-on so automations keep their shape):
 //   GET /snapshot/<camera>          capture now (or cached if younger than
@@ -50,15 +51,56 @@ const cfg = {
   haToken: process.env.SUPERVISOR_TOKEN || process.env.HA_TOKEN || '',
   // Fixed regions of interest, e.g. "downstairs_hallway_camera:0.22:0.0:0.30:0.62"
   // (space-separated entries; x:y:w:h as fractions of the frame). Each capture
-  // also writes <camera>_crop.jpg for that region, a stable close-up that
+  // also writes <camera>_crop.jpg for that region — a stable close-up that
   // makes small state changes trivial for vision models.
   crops: parseCrops(process.env.CROPS || ''),
   // When set, every capture also archives its crop as
-  // <samplesDir>/<camera>/<timestamp>.jpg (capped): training data for the
+  // <samplesDir>/<camera>/<timestamp>.jpg (capped) — training data for the
   // tiny door-state classifier, gathered across lighting conditions.
   samplesDir: process.env.SAMPLES_DIR || '',
   samplesMax: intEnv('SAMPLES_MAX', 2000),
+  // Persistent watch mode: hold one stream open per listed camera and sample
+  // it locally. "camera:interval_seconds" entries, space-separated.
+  // No per-check SDM command; HA keeps extending the Google session.
+  watches: parseWatches(process.env.WATCHES || ''),
+  // Surface regions to diff, per camera:
+  //   "kitchen_camera:table@0.26:0.55:0.62:0.43;island@0.30:0.32:0.22:0.12"
+  // (name@x:y:w:h as fractions, boxes ';'-separated, cameras space-separated)
+  watchRois: parseWatchRois(process.env.WATCH_ROIS || ''),
+  watchDiffPct: Number(process.env.WATCH_DIFF_PCT || 4),
+  watchCooldownSeconds: intEnv('WATCH_COOLDOWN_SECONDS', 60),
+  // For watched cameras with a crop + trained model: score the live stream
+  // every N seconds and fire nest_headless_classifier_positive on a positive
+  // verdict (with framing gate respected). 0 disables.
+  watchClassifySeconds: intEnv('WATCH_CLASSIFY_SECONDS', 15),
 };
+
+function parseWatches(spec) {
+  const out = {};
+  for (const entry of spec.split(/\s+/).filter(Boolean)) {
+    const i = entry.lastIndexOf(':');
+    if (i < 0) { out['camera.' + entry] = 4; continue; }
+    out['camera.' + entry.slice(0, i)] = Math.max(1, Number(entry.slice(i + 1)) || 4);
+  }
+  return out;
+}
+
+function parseWatchRois(spec) {
+  const out = {};
+  for (const entry of spec.split(/\s+/).filter(Boolean)) {
+    const ci = entry.indexOf(':');
+    if (ci < 0) continue;
+    const cam = 'camera.' + entry.slice(0, ci);
+    out[cam] = entry.slice(ci + 1).split(';').map((box, i) => {
+      let name = 'roi' + (i + 1), rest = box;
+      const at = box.indexOf('@');
+      if (at > 0) { name = box.slice(0, at); rest = box.slice(at + 1); }
+      const [x, y, w, h] = rest.split(':').map(Number);
+      return { name, x, y, w, h };
+    }).filter((r) => r.w > 0 && r.h > 0);
+  }
+  return out;
+}
 
 function parseCrops(spec) {
   const out = {};
@@ -94,14 +136,14 @@ console.log('[nest_headless] config:', JSON.stringify({ ...cfg, haToken: '<set>'
 
 // ------------------------------------------------------------ Google SDP quirk
 // Google's answer emits "a=candidate: " with an EMPTY foundation (6/6
-// candidates on these cameras). Chrome tolerates it, but patch anyway:
+// candidates on these cameras). Chrome tolerates it, but patch anyway —
 // proven form from the working browser control.
 const patchFoundation = (sdp) => sdp.replace(/a=candidate: /g, 'a=candidate:0 ');
 const patchCandidate = (c) => (typeof c === 'string' ? c.replace(/^candidate: /, 'candidate:0 ') : c);
 
 // ------------------------------------------------------------ HA websocket
 function haOfferSession(entityId, offerSdp, { onAnswer, onCandidate, onError }) {
-  // Returns { close }. Closing the socket ends the HA-side session.
+  // Returns { close } — closing the socket ends the HA-side session.
   const ws = new WebSocket(cfg.haWsUrl);
   let msgId = 0;
   let subId = null;
@@ -151,12 +193,12 @@ async function getBrowser() {
       ],
     }).then(async (b) => {
       b.on('disconnected', () => { browserPromise = null; });
-      // log codec support once; H.264 must be present for Nest
+      // log codec support once — H.264 must be present for Nest
       const p = await b.newPage();
       const codecs = await p.evaluate(fns.videoCodecs);
       console.log('[nest_headless] receiver video codecs:', codecs.join(', '));
       if (!codecs.some((c) => /h264/i.test(c))) {
-        console.error('[nest_headless] WARNING: this Chromium build lacks H.264, Nest video will not decode');
+        console.error('[nest_headless] WARNING: this Chromium build lacks H.264 — Nest video will not decode');
       }
       await p.close();
       return b;
@@ -175,6 +217,33 @@ function cameraFile(name) {
   return path.join(cfg.outDir, name.replace(/^camera\./, '') + '.jpg');
 }
 
+// Offer/answer/candidates over the HA websocket for one page. Shared by the
+// one-shot capture path and the persistent watch path.
+async function dialSession(entityId, page, timeoutMs) {
+  const offerSdp = await page.evaluate(fns.initPeer);
+  let session = null;
+  await new Promise((resolve, reject) => {
+    const to = setTimeout(() => reject(new Error('no answer from HA within timeout')), timeoutMs);
+    session = haOfferSession(entityId, offerSdp, {
+      onAnswer: async (sdp) => {
+        clearTimeout(to);
+        try {
+          await page.evaluate(fns.setRemoteAnswer, patchFoundation(sdp));
+          resolve();
+        } catch (e) { reject(e); }
+      },
+      onCandidate: async (cand) => {
+        const c = (cand && typeof cand === 'object')
+          ? { ...cand, candidate: patchCandidate(cand.candidate) }
+          : { candidate: patchCandidate(cand) };
+        try { await page.evaluate(fns.addRemoteCandidate, c); } catch (e) { /* page may be gone */ }
+      },
+      onError: (e) => { clearTimeout(to); reject(e); },
+    });
+  });
+  return session;
+}
+
 async function capture(entityId) {
   const browser = await getBrowser();
   const page = await browser.newPage();
@@ -182,28 +251,7 @@ async function capture(entityId) {
   const timeoutMs = cfg.captureTimeoutSeconds * 1000;
   try {
     await page.goto('about:blank');
-    const offerSdp = await page.evaluate(fns.initPeer);
-
-    const answered = new Promise((resolve, reject) => {
-      const to = setTimeout(() => reject(new Error('no answer from HA within timeout')), timeoutMs);
-      session = haOfferSession(entityId, offerSdp, {
-        onAnswer: async (sdp) => {
-          clearTimeout(to);
-          try {
-            await page.evaluate(fns.setRemoteAnswer, patchFoundation(sdp));
-            resolve();
-          } catch (e) { reject(e); }
-        },
-        onCandidate: async (cand) => {
-          const c = (cand && typeof cand === 'object')
-            ? { ...cand, candidate: patchCandidate(cand.candidate) }
-            : { candidate: patchCandidate(cand) };
-          try { await page.evaluate(fns.addRemoteCandidate, c); } catch (e) { /* page may be gone */ }
-        },
-        onError: (e) => { clearTimeout(to); reject(e); },
-      });
-    });
-    await answered;
+    session = await dialSession(entityId, page, timeoutMs);
 
     const shot = await page.evaluate(fns.waitAndCapture, {
       warmupFrames: cfg.warmupFrames,
@@ -211,8 +259,16 @@ async function capture(entityId) {
       timeoutMs,
       crop: cfg.crops[entityId] || null,
     });
+    return persistShot(entityId, shot);
+  } finally {
+    if (session) session.close(); // ends the HA/Google session -> frees quota slot
+    try { await page.close(); } catch (e) { /* ok */ }
+  }
+}
 
-    const buf = Buffer.from(shot.dataUrl.split(',')[1], 'base64');
+// Write the frame (and crop) to disk, run the classifier, build capture meta.
+function persistShot(entityId, shot) {
+  const buf = Buffer.from(shot.dataUrl.split(',')[1], 'base64');
     const file = cameraFile(entityId);
     const tmp = file + '.tmp';
     fs.writeFileSync(tmp, buf);
@@ -233,19 +289,20 @@ async function capture(entityId) {
       capturedAt: new Date().toISOString(),
       ...(verdict ? { classifier: verdict } : {}),
     };
-    console.log(`[nest_headless] captured ${entityId}:`, JSON.stringify(meta));
-    if (shot.meanLuma < 3) {
-      console.warn(`[nest_headless] WARNING: ${entityId} frame is near-black (meanLuma ${shot.meanLuma})`);
-    }
-    return { buf, meta };
-  } finally {
-    if (session) session.close(); // ends the HA/Google session -> frees quota slot
-    try { await page.close(); } catch (e) { /* ok */ }
+  console.log(`[nest_headless] captured ${entityId}:`, JSON.stringify(meta));
+  if (shot.meanLuma < 3) {
+    console.warn(`[nest_headless] WARNING: ${entityId} frame is near-black (meanLuma ${shot.meanLuma})`);
   }
+  return { buf, meta };
 }
 
+const lastArchiveMs = {};
 function archiveSample(entityId, buf) {
   try {
+    // keep the training archive at a sane cadence however often frames flow
+    const now = Date.now();
+    if (now - (lastArchiveMs[entityId] || 0) < 120000) return;
+    lastArchiveMs[entityId] = now;
     const dir = path.join(cfg.samplesDir, entityId.replace(/^camera\./, ''));
     fs.mkdirSync(dir, { recursive: true });
     const existing = fs.readdirSync(dir).filter((f) => f.endsWith('.jpg')).sort();
@@ -265,10 +322,130 @@ function archiveSample(entityId, buf) {
 async function captureCoalesced(entityId) {
   const s = state[entityId] || (state[entityId] = { lastCaptureMs: 0, inflight: null, lastMeta: null });
   if (s.inflight) return s.inflight; // coalesce concurrent requests: one Google command
-  s.inflight = capture(entityId)
+  s.inflight = (async () => {
+    // Fast path: a live watch stream serves frames instantly, no new dial,
+    // no SDM command. Falls back to a one-shot dial if the grab fails.
+    const w = await watchGrab(entityId).catch(() => null);
+    return w || capture(entityId);
+  })()
     .then((r) => { s.lastCaptureMs = Date.now(); s.lastMeta = r.meta; return r; })
     .finally(() => { s.inflight = null; });
   return s.inflight;
+}
+
+// ------------------------------------------------------------ watch mode
+const watchMgr = {}; // entityId -> { page, ready, hits, lastHitMs, startedAt, lastError }
+
+async function watchGrab(entityId) {
+  const mgr = watchMgr[entityId];
+  if (!mgr || !mgr.ready || !mgr.page) return null;
+  const shot = await mgr.page.evaluate(fns.grabFrame, {
+    quality: cfg.jpegQuality,
+    crop: cfg.crops[entityId] || null,
+  });
+  if (cfg.samplesDir && shot.cropDataUrl) {
+    // keep the training archive flowing on the fast path too
+  }
+  return persistShot(entityId, shot);
+}
+
+function postHaEvent(type, data) {
+  return new Promise((resolve) => {
+    try {
+      const u = new URL(cfg.haWsUrl.replace(/^ws/, 'http'));
+      const prefix = u.hostname === 'supervisor' ? '/core/api/events/' : '/api/events/';
+      const req = http.request({
+        host: u.hostname, port: u.port || 80, path: prefix + type, method: 'POST',
+        headers: { Authorization: 'Bearer ' + cfg.haToken, 'Content-Type': 'application/json' },
+      }, (r) => { r.resume(); resolve(r.statusCode); });
+      req.on('error', (e) => { console.warn('[nest_headless] HA event failed:', e.message); resolve(0); });
+      req.end(JSON.stringify(data));
+    } catch (e) { resolve(0); }
+  });
+}
+
+async function watchHit(entityId, payload) {
+  const mgr = watchMgr[entityId];
+  if (!mgr) return;
+  const now = Date.now();
+  if (now - mgr.lastHitMs < cfg.watchCooldownSeconds * 1000) return;
+  mgr.lastHitMs = now;
+  mgr.hits = (mgr.hits || 0) + 1;
+  if (payload.meanLuma < 3) return; // black frame, nothing to see
+  persistShot(entityId, payload);
+  const st = state[entityId] || (state[entityId] = { lastCaptureMs: 0, inflight: null, lastMeta: null });
+  st.lastCaptureMs = now;
+  console.log(`[nest_headless] watch hit ${entityId} roi=${payload.roi} changed=${payload.changedPct}%`);
+  await postHaEvent('nest_headless_surface_activity', {
+    entity_id: entityId,
+    camera: entityId.replace(/^camera\./, ''),
+    roi: payload.roi,
+    changed_pct: payload.changedPct,
+  });
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function runWatch(entityId, intervalSec) {
+  const mgr = watchMgr[entityId] = { ready: false, hits: 0, lastHitMs: 0, lastError: null, page: null };
+  const rois = cfg.watchRois[entityId] || [];
+  // No ROIs is fine: the stream still serves instant snapshots and classify
+  // ticks - there is just no surface-motion event source for this camera.
+  for (;;) {
+    let page = null, session = null, classifyTimer = null;
+    try {
+      const browser = await getBrowser();
+      page = await browser.newPage();
+      await page.goto('about:blank');
+      await page.exposeFunction('__watchHitNode', (payload) =>
+        watchHit(entityId, payload).catch((e) => console.warn('[nest_headless] watch hit failed:', e.message)));
+      session = await dialSession(entityId, page, cfg.captureTimeoutSeconds * 1000);
+      const dims = await page.evaluate(fns.startWatchVideo, {
+        timeoutMs: cfg.captureTimeoutSeconds * 1000, warmupFrames: cfg.warmupFrames,
+      });
+      if (rois.length) {
+        await page.evaluate(fns.startWatchLoop, {
+          intervalMs: intervalSec * 1000, rois, diffPct: cfg.watchDiffPct, quality: cfg.jpegQuality,
+        });
+      }
+      mgr.page = page; mgr.ready = true; mgr.startedAt = new Date().toISOString(); mgr.lastError = null;
+      console.log(`[nest_headless] watch ${entityId} live at ${dims.width}x${dims.height}, ${rois.length} ROIs, sampling every ${intervalSec}s`);
+      // Classifier tick: local, free, and fast - a trained model (e.g. the
+      // cupboard door) now sees the live stream instead of 5-minute polls.
+      if (cfg.watchClassifySeconds > 0 && cfg.crops[entityId]) {
+        classifyTimer = setInterval(async () => {
+          try {
+            const r = await watchGrab(entityId);
+            const v = r && r.meta && r.meta.classifier;
+            if (v && v.positive && v.framingOk !== false) {
+              const now = Date.now();
+              if (now - (mgr.lastClassifyEventMs || 0) >= cfg.watchCooldownSeconds * 1000) {
+                mgr.lastClassifyEventMs = now;
+                console.log(`[nest_headless] classifier positive ${entityId} (${v.label} ${v.score})`);
+                await postHaEvent('nest_headless_classifier_positive', {
+                  entity_id: entityId, camera: entityId.replace(/^camera\./, ''),
+                  label: v.label, score: v.score,
+                });
+              }
+            }
+          } catch (e) { /* stream hiccup; health loop handles it */ }
+        }, cfg.watchClassifySeconds * 1000);
+      }
+      for (;;) { // hold the stream; HA extends the Google session while we stay connected
+        await sleep(30000);
+        const st = await page.evaluate(fns.connectionState);
+        if (!['connected', 'completed'].includes(st.ice)) throw new Error('ice state ' + st.ice);
+      }
+    } catch (e) {
+      mgr.ready = false; mgr.page = null; mgr.lastError = e.message;
+      console.warn(`[nest_headless] watch ${entityId} down (${e.message}); retrying in 30s`);
+    } finally {
+      try { if (classifyTimer) clearInterval(classifyTimer); } catch (e) { /* ok */ }
+      try { if (session) session.close(); } catch (e) { /* ok */ }
+      try { if (page) await page.close(); } catch (e) { /* ok */ }
+    }
+    await sleep(30000);
+  }
 }
 
 // ------------------------------------------------------------ HTTP API
@@ -300,6 +477,9 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({
         addon: 'nest_headless', outDir: cfg.outDir,
         cameras: Object.fromEntries(Object.entries(state).map(([k, v]) => [k, v.lastMeta])),
+        watches: Object.fromEntries(Object.entries(watchMgr).map(([k, m]) => [k, {
+          ready: m.ready, hits: m.hits, startedAt: m.startedAt, lastError: m.lastError,
+        }])),
       }, null, 2));
       return;
     }
@@ -342,7 +522,12 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(cfg.port, () => console.log(`[nest_headless] listening on :${cfg.port}`));
+server.listen(cfg.port, () => {
+  console.log(`[nest_headless] listening on :${cfg.port}`);
+  for (const [entityId, interval] of Object.entries(cfg.watches)) {
+    runWatch(entityId, interval).catch((e) => console.error(`[nest_headless] watch ${entityId} crashed:`, e.message));
+  }
+});
 
 process.on('SIGTERM', async () => {
   try { const b = await browserPromise; if (b) await b.close(); } catch (e) { /* ok */ }

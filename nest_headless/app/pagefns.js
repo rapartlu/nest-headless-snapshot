@@ -44,9 +44,9 @@ const connectionState = () => ({
   pc: window.__pc ? window.__pc.connectionState : 'none',
 });
 
-// Wait for real decoded frames (requestVideoFrameCallback fires only once a
-// frame has actually been decoded and composited), skip warmup frames, then
-// draw to canvas and return a JPEG.
+// Wait for real decoded frames (requestVideoFrameCallback fires only when a
+// frame has actually been decoded and composited — padding-only RTP never
+// fires it), skip warmup frames, then draw to canvas and return a JPEG.
 const waitAndCapture = async ({ warmupFrames = 3, quality = 0.85, timeoutMs = 20000, crop = null }) => {
   const stream = await Promise.race([
     window.__trackReady,
@@ -63,7 +63,7 @@ const waitAndCapture = async ({ warmupFrames = 3, quality = 0.85, timeoutMs = 20
   // frame-based). Prefer the first HD frame; fall back to whatever resolution
   // we have if HD hasn't arrived in time.
   const hdMinWidth = 1280;
-  // Ramp to HD typically lands in 2-3s; cap the wait so captures stay fast:
+  // Ramp to HD typically lands in 2-3s; cap the wait so captures stay fast —
   // the cat deterrent needs reaction time more than it needs guaranteed 1080p.
   const hdWaitMs = Math.min(5000, timeoutMs * 0.6);
   const t0 = Date.now();
@@ -93,7 +93,7 @@ const waitAndCapture = async ({ warmupFrames = 3, quality = 0.85, timeoutMs = 20
   const meanLuma = sum / (d.length / 40);
   const dataUrl = c.toDataURL('image/jpeg', quality);
   // Optional fixed region of interest (fractions of frame: {x,y,w,h} in 0..1)
-  // written alongside the full frame; a close-up makes small state changes
+  // written alongside the full frame — a close-up makes small state changes
   // (a door ajar) trivial for a vision model where the full frame is marginal.
   let cropDataUrl = null;
   if (crop && crop.w > 0 && crop.h > 0) {
@@ -110,9 +110,126 @@ const waitAndCapture = async ({ warmupFrames = 3, quality = 0.85, timeoutMs = 20
   return { dataUrl, cropDataUrl, width: c.width, height: c.height, frames, meanLuma };
 };
 
+// ---- persistent watch mode -------------------------------------------------
+// One long-lived stream per watched camera. HA extends the Google session
+// server-side for as long as the peer connection stays open, so sampling
+// frames locally is free: no per-check SDM command, no dial latency.
+
+// Create the persistent <video> for this page's stream and wait for the HD
+// ramp (same logic as waitAndCapture, but the element is kept).
+const startWatchVideo = async ({ timeoutMs = 25000, warmupFrames = 3 }) => {
+  const stream = await Promise.race([
+    window.__trackReady,
+    new Promise((_, rej) => setTimeout(() => rej(new Error('no video track within timeout')), timeoutMs)),
+  ]);
+  const v = document.createElement('video');
+  v.muted = true; v.autoplay = true; v.playsInline = true;
+  v.srcObject = stream;
+  document.body.appendChild(v);
+  await v.play().catch(() => {});
+  let frames = 0;
+  const hdMinWidth = 1280;
+  const hdWaitMs = Math.min(6000, timeoutMs * 0.6);
+  const t0 = Date.now();
+  await new Promise((res, rej) => {
+    const to = setTimeout(() => rej(new Error(`no decoded frames within ${timeoutMs}ms`)), timeoutMs);
+    const cb = () => {
+      frames++;
+      const warm = frames >= warmupFrames && v.videoWidth > 0;
+      if (warm && (v.videoWidth >= hdMinWidth || Date.now() - t0 > hdWaitMs)) { clearTimeout(to); res(); }
+      else v.requestVideoFrameCallback(cb);
+    };
+    v.requestVideoFrameCallback(cb);
+  });
+  window.__watchVideo = v;
+  return { width: v.videoWidth, height: v.videoHeight, frames };
+};
+
+// Instant frame grab from the live watch video (no waiting, no dialing).
+const grabFrame = ({ quality = 0.85, crop = null }) => {
+  const v = window.__watchVideo;
+  if (!v || !v.videoWidth) throw new Error('watch video not ready');
+  const c = document.createElement('canvas');
+  c.width = v.videoWidth; c.height = v.videoHeight;
+  const ctx = c.getContext('2d');
+  ctx.drawImage(v, 0, 0);
+  const d = ctx.getImageData(0, 0, c.width, c.height).data;
+  let sum = 0;
+  for (let i = 0; i < d.length; i += 40) sum += 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+  const meanLuma = sum / (d.length / 40);
+  const dataUrl = c.toDataURL('image/jpeg', quality);
+  let cropDataUrl = null;
+  if (crop && crop.w > 0 && crop.h > 0) {
+    const sx = Math.round(crop.x * c.width), sy = Math.round(crop.y * c.height);
+    const sw = Math.min(Math.round(crop.w * c.width), c.width - sx);
+    const sh = Math.min(Math.round(crop.h * c.height), c.height - sy);
+    const cc = document.createElement('canvas');
+    cc.width = sw; cc.height = sh;
+    cc.getContext('2d').drawImage(c, sx, sy, sw, sh, 0, 0, sw, sh);
+    cropDataUrl = cc.toDataURL('image/jpeg', quality);
+  }
+  return { dataUrl, cropDataUrl, width: c.width, height: c.height, frames: -1, meanLuma };
+};
+
+// Sample the stream every intervalMs, diff grayscale inside the given ROIs
+// (fractions {x,y,w,h}), and report via window.__watchHitNode(payload) when
+// the changed-pixel fraction in any ROI exceeds diffPct percent. Node side
+// applies the cooldown; this loop just reports.
+const startWatchLoop = ({ intervalMs = 4000, rois = [], diffPct = 4, quality = 0.85 }) => {
+  const v = window.__watchVideo;
+  if (!v) throw new Error('watch video not ready');
+  const W = 320, H = 180;
+  const c = document.createElement('canvas');
+  c.width = W; c.height = H;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  let prev = null;
+  window.__watchTicks = 0;
+  window.__watchTimer = setInterval(() => {
+    try {
+      if (!v.videoWidth) return;
+      ctx.drawImage(v, 0, 0, W, H);
+      const d = ctx.getImageData(0, 0, W, H).data;
+      const g = new Float32Array(W * H);
+      for (let i = 0; i < W * H; i++) {
+        const j = i * 4;
+        g[i] = 0.299 * d[j] + 0.587 * d[j + 1] + 0.114 * d[j + 2];
+      }
+      window.__watchTicks++;
+      if (prev) {
+        let best = null;
+        for (const r of rois) {
+          const x0 = Math.floor(r.x * W), y0 = Math.floor(r.y * H);
+          const x1 = Math.min(W, Math.ceil((r.x + r.w) * W)), y1 = Math.min(H, Math.ceil((r.y + r.h) * H));
+          let changed = 0, total = 0;
+          for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
+            const i = y * W + x;
+            total++;
+            if (Math.abs(g[i] - prev[i]) > 22) changed++;
+          }
+          const pct = total ? (changed / total) * 100 : 0;
+          if (pct >= diffPct && (!best || pct > best.pct)) best = { roi: r.name || 'roi', pct: Math.round(pct * 10) / 10 };
+        }
+        if (best) {
+          const shot = grabFrame({ quality });
+          window.__watchHitNode({ roi: best.roi, changedPct: best.pct, ...shot });
+        }
+      }
+      prev = g;
+    } catch (e) { /* keep looping */ }
+  }, intervalMs);
+  return true;
+};
+
+const watchState = () => ({
+  ticks: window.__watchTicks || 0,
+  width: window.__watchVideo ? window.__watchVideo.videoWidth : 0,
+  height: window.__watchVideo ? window.__watchVideo.videoHeight : 0,
+  ice: window.__pc ? window.__pc.iceConnectionState : 'none',
+});
+
 const videoCodecs = () => {
   const caps = RTCRtpReceiver.getCapabilities('video');
   return caps ? caps.codecs.map((c) => c.mimeType) : [];
 };
 
-module.exports = { initPeer, setRemoteAnswer, addRemoteCandidate, connectionState, waitAndCapture, videoCodecs };
+module.exports = { initPeer, setRemoteAnswer, addRemoteCandidate, connectionState, waitAndCapture, videoCodecs, startWatchVideo, grabFrame, startWatchLoop, watchState };

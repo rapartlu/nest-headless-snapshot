@@ -4,6 +4,42 @@ Gets real still images from WebRTC-only Google Nest cameras by running a
 headless browser on your Home Assistant machine. The repository README has
 the full story.
 
+## Watch mode (persistent streams)
+
+By default every snapshot dials a fresh WebRTC session: one Google API
+command and 8-12 seconds each time. Watch mode instead holds one stream open
+per camera and samples it locally.
+
+Only watch cameras that are on mains power. A held stream is the most
+battery-hungry thing you can ask of a battery camera.
+
+Options:
+
+| Option | Example | What it does |
+|---|---|---|
+| `watch_cameras` | `kitchen_camera:4` | keep a stream open, sample every 4 s (space-separate multiple cameras) |
+| `watch_rois` | `kitchen_camera:table@0.26:0.55:0.62:0.43;island@0.30:0.32:0.22:0.12` | regions to diff for surface activity (fractions of the frame, `name@x:y:w:h`) |
+| `watch_diff_pct` | `4` | percent of a region's pixels that must change to count as a hit |
+| `watch_cooldown_seconds` | `60` | minimum gap between fired events per camera |
+| `watch_classify_seconds` | `15` | score the live stream with the camera's trained model every N seconds (0 disables) |
+
+What you get:
+
+- `/snapshot/<camera>` answers from the live stream in well under a second
+  (`frames: -1` in the JSON meta marks a live-stream frame).
+- A hit in any region fires the `nest_headless_surface_activity` event
+  ({camera, roi, changed_pct}) - trigger an automation on it to react within
+  seconds (confirm with a vision model before acting; a person leaning over
+  the worktop trips the same wire).
+- Cameras with a crop and a trained model also fire
+  `nest_headless_classifier_positive` ({camera, label, score}) when the model
+  says so - the framing check is applied first so a moved camera stays quiet.
+- A camera without regions is still worth watching: you get the instant
+  snapshots and classifier ticks with no event noise.
+
+The stream reconnects automatically if it drops. Watch health is visible in
+the `/` status JSON under `watches`.
+
 ## Camera framing tripwire
 
 If a classifier model has reference features, each capture also reports
