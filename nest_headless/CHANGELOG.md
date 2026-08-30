@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.3.1
+
+- Evidence never vanishes any more: cameras without a crop archive their full
+  frames to `samples_dir` (same two-minute throttle and rotation cap as the
+  crop archive), so any frame that led to a decision can be reviewed later.
+  Cat-positive events additionally archive their box-annotated snapshot
+  per-event with no throttle, and the alert notification image points at the
+  annotated copy - the alert itself shows where the animal was and how
+  confident the detector felt.
+
 ## 1.3.0
 
 - Base image moved from Alpine to Debian (bookworm) so native

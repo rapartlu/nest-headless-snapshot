@@ -304,6 +304,7 @@ async function persistShot(entityId, shot) {
         }
       }
     }
+    if (!cropFile && cfg.samplesDir) archiveSample(entityId, buf); // keep full frames for cameras without a crop - decisions must outlive the next overwrite
     const meta = {
       file, cropFile, bytes: buf.length, width: shot.width, height: shot.height,
       frames: shot.frames, meanLuma: Math.round(shot.meanLuma * 10) / 10,
@@ -413,6 +414,27 @@ async function watchHit(entityId, payload) {
   });
 }
 
+// Keep the evidence: raw + box-annotated copies of every frame that
+// confirmed a cat on a surface. The alert notification shows the annotated
+// one, so "where was it?" never needs forensics again.
+function saveCatSnapshot(entityId, frameBuf, dets) {
+  try {
+    const base = cameraFile(entityId).replace(/\.jpg$/, '');
+    fs.writeFileSync(base + '_cat_raw.jpg', frameBuf);
+    const boxed = infer.annotate(frameBuf, dets, cfg.watchRois[entityId] || []);
+    fs.writeFileSync(base + '_cat.jpg', boxed);
+    if (cfg.samplesDir) {
+      // every cat event archived, no throttle: these are the frames questions
+      // get asked about ("where was it? was that really a cat?")
+      const dir = path.join(cfg.samplesDir, entityId.replace(/^camera\./, '') + '_cats');
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, new Date().toISOString().replace(/[:.]/g, '-') + '.jpg'), boxed);
+    }
+  } catch (e) {
+    console.warn(`[nest_headless] cat snapshot ${entityId} failed: ${e.message}`);
+  }
+}
+
 // Is a cat (or dog) standing on one of this camera's watched surfaces?
 // Uses the box's bottom-centre - the animal's feet - for ROI membership.
 // Returns { cat: true/false/null, dets } - null when the detector is
@@ -447,6 +469,7 @@ async function catOnSurface(entityId, frameBuf) {
       }
     }
     if (!ran) return { cat: null, dets: null };
+    if (cat) saveCatSnapshot(entityId, frameBuf, dets);
     return { cat, dets };
   } catch (e) {
     console.warn(`[nest_headless] detect ${entityId} failed: ${e.message}`);

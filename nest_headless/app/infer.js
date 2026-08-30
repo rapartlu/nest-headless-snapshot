@@ -166,4 +166,30 @@ async function classifyDoor(camera, jpegBuf, { size = 256, threshold = 0.6, labe
   return { label, score, positive: score >= threshold, engine: 'onnx' };
 }
 
-module.exports = { detect, classifyDoor, hasDoorModel };
+// Burn detection boxes (and the watched regions) into a JPEG - pure JS via
+// jpeg-js, no canvas. Answers "where exactly was the cat?" in the alert
+// notification itself instead of leaving it to archaeology.
+function annotate(jpegBuf, dets, rois = [], { quality = 85 } = {}) {
+  const img = jpeg.decode(jpegBuf, { useTArray: true, maxMemoryUsageInMB: 96 });
+  const W = img.width, H = img.height, d = img.data;
+  const px = (x, y, r, g, b) => {
+    if (x < 0 || y < 0 || x >= W || y >= H) return;
+    const i = (y * W + x) * 4; d[i] = r; d[i + 1] = g; d[i + 2] = b;
+  };
+  const rect = (bx, by, bw, bh, r, g, b, t) => {
+    const x0 = Math.round(bx * W), y0 = Math.round(by * H);
+    const x1 = Math.round((bx + bw) * W), y1 = Math.round((by + bh) * H);
+    for (let k = 0; k < t; k++) {
+      for (let x = x0; x <= x1; x++) { px(x, y0 + k, r, g, b); px(x, y1 - k, r, g, b); }
+      for (let y = y0; y <= y1; y++) { px(x0 + k, y, r, g, b); px(x1 - k, y, r, g, b); }
+    }
+  };
+  for (const r of rois) rect(r.x, r.y, r.w, r.h, 255, 210, 0, 2);          // regions: yellow
+  for (const x of dets || []) {
+    const animal = x.cls === 15 || x.cls === 16;
+    rect(x.box.x, x.box.y, x.box.w, x.box.h, animal ? 255 : 90, animal ? 40 : 200, animal ? 60 : 255, animal ? 6 : 3);
+  }
+  return jpeg.encode({ data: d, width: W, height: H }, quality).data;
+}
+
+module.exports = { detect, classifyDoor, hasDoorModel, annotate };
