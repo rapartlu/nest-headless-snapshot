@@ -449,28 +449,10 @@ async function watchHit(entityId, payload) {
   // People trigger the same pixel diff constantly; they are logged, not fired.
   const frameBuf = Buffer.from(payload.dataUrl.split(',')[1], 'base64');
   const { cat, dets } = await catOnSurface(entityId, frameBuf);
-  let verdict = cat; // true / false / null(detector down)
-  if ((dets || []).some((d) => d.cls === 0)) mgr.lastPersonMs = now;
-  if (cat === false) {
-    // The detector has a proven blind spot: a climbing, motion-blurred,
-    // lamp-occluded cat on the far worktop looks like nothing to COCO
-    // (missed at conf 0.10 on 2026-08-30 22:12 with the cat in plain view).
-    // Heuristic: surface motion with NO person anywhere in frame = cat.
-    // People trip the diff constantly but always detect strongly.
-    const personNear = (dets || []).some((d) => d.cls === 0);
-    // A person LEAVING between two samples reads as motion-with-nobody-there
-    // (fired a false deterrent at 22:25 on day one) - so "suspected" also
-    // requires that no person has been seen for a while.
-    const personRecently = now - (mgr.lastPersonMs || 0) < 45000;
-    if (!personNear && !personRecently) {
-      const people = await infer.detect(frameBuf, { classes: [0], conf: 0.3 }).catch(() => null);
-      if (people && people.length) mgr.lastPersonMs = now;
-      if (people && people.length === 0) {
-        verdict = 'suspected';
-        saveCatSnapshot(entityId, frameBuf, dets || []);
-      }
-    }
-  }
+  // Verdict comes from the detector alone. The "suspected" motion heuristic
+  // shipped and was retired the same night: 3 firings, 0 cats (person-exit
+  // wake, stream settle, lamp shimmer). The house-trained model replaces it.
+  const verdict = cat;
   console.log(`[nest_headless] watch hit ${entityId} roi=${payload.roi} changed=${payload.changedPct}% cat=${verdict} dets=${dets ? dets.map((x) => x.name + ':' + x.conf).join(',') : 'n/a'}`);
   if (verdict === false) return;
   await postHaEvent('nest_headless_surface_activity', {
@@ -524,7 +506,7 @@ async function catOnSurface(entityId, frameBuf) {
         x: Math.max(0, r.x - 0.08), y: Math.max(0, r.y - 0.22),
         w: Math.min(1, r.w + 0.16), h: Math.min(1, r.h + 0.28),
       };
-      const d = await infer.detect(frameBuf, { classes: [0, 15, 16], conf: 0.4, region });
+      const d = await infer.detectCats(frameBuf, { conf: 0.4, region });
       if (d === null) continue;
       ran = true;
       for (const x of d) {

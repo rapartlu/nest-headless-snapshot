@@ -1,12 +1,11 @@
 name: Nest Headless Snapshot
-version: "1.4.4"
+version: "1.0.0"
 slug: nest_headless
 description: >-
-  Real still images from WebRTC-only Google Nest cameras via headless
-  Chromium. Home Assistant relays these cameras' live stream but never
-  captures a frame, so camera.snapshot returns a black placeholder. This
-  add-on captures a real frame on demand and serves it as a JPEG.
-url: "https://github.com/rapartlu/nest-headless-snapshot"
+  Server-side Nest camera stills via headless Chromium — the only WebRTC
+  client proven to receive video from these cameras (implements the
+  transport-cc congestion feedback Google's sender requires).
+url: "http://homeassistant.local:8098"
 arch:
   - amd64
   - aarch64

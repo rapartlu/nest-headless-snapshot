@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.5.0
+
+- House-trained cat detector: `detectCats()` now prefers a fine-tuned
+  single-class YOLO model at `/app/assets/models/cats.onnx` (960 px input)
+  and falls back to COCO cat/dog classes when the file is absent. A model
+  fine-tuned on ~30 labelled frames from the actual camera finds the raids
+  the pretrained detector was blind to (the missed worktop raid scores 0.93)
+  with zero false positives on people, empty rooms, and lamp reflections.
+  Training recipe in DOCS (weights are AGPL, build your own).
+- Fixed a decode bug in the single-class path: the class filter ran on the
+  raw class index before the remap, discarding every detection.
+- Removed the suspected-cat motion heuristic (1.4.2-1.4.4): three firings,
+  zero cats. Motion-plus-no-person cannot distinguish an animal from a
+  settling stream, a person leaving frame, or a lamp reflection. The verdict
+  now comes from the detector alone - if the pretrained one misses your cat,
+  fine-tune (see DOCS).
+
 ## 1.4.4
 
 - Cold-start hardening: watch hits are ignored for 45 s after a stream

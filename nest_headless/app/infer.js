@@ -19,10 +19,25 @@ const jpeg = require('jpeg-js');
 const ort = require('onnxruntime-node');
 
 const DET_PATH = '/app/assets/models/yolo11n.onnx';
+// House-trained single-class cat detector (fine-tuned on this kitchen's own
+// cats - the pretrained COCO model is nearly blind to them). When the file
+// exists it owns cat detection; the COCO model still serves person checks.
+const CAT_PATH = '/app/assets/models/cats.onnx';
+const CAT_SIZE = 960;
 const DET_SIZE = 640;
 const CONF_DEFAULT = 0.35;
 const COCO = { 0: 'person', 15: 'cat', 16: 'dog' };
 const MODELS_DIRS = ['/homeassistant/nest_models', '/config/nest_models'];
+
+let catSession = null;
+async function getCatDetector() {
+  if (catSession === null && fs.existsSync(CAT_PATH)) {
+    catSession = ort.InferenceSession.create(CAT_PATH, { executionProviders: ['cpu'] })
+      .then((s) => { console.log('[nest_headless] house cat detector loaded'); return s; })
+      .catch((e) => { console.warn('[nest_headless] cat detector load failed:', e.message); return null; });
+  }
+  return catSession;
+}
 
 let detSession = null;
 async function getDetector() {
@@ -91,21 +106,22 @@ function iou(a, b) {
 // `region` ({x,y,w,h} fractions) restricts detection to a zoomed sub-view -
 // essential for small/distant animals that vanish at full-frame scale.
 // Returned boxes are always in FULL-frame fractions regardless of region.
-async function detect(jpegBuf, { conf = CONF_DEFAULT, classes = null, region = null } = {}) {
-  const session = await getDetector();
+async function detect(jpegBuf, { conf = CONF_DEFAULT, classes = null, region = null, session = null, size = null, clsMap = null } = {}) {
+  session = session || await getDetector();
   if (!session) return null;
+  const DS = size || DET_SIZE;
   const img = jpeg.decode(jpegBuf, { useTArray: true, maxMemoryUsageInMB: 96 });
   const rx = region ? Math.max(0, region.x) * img.width : 0;
   const ry = region ? Math.max(0, region.y) * img.height : 0;
   const rw = region ? Math.min(1 - Math.max(0, region.x), region.w) * img.width : img.width;
   const rh = region ? Math.min(1 - Math.max(0, region.y), region.h) * img.height : img.height;
   // letterbox: scale the (sub)view to fit DET_SIZE, pad with 0.5 gray
-  const scale = Math.min(DET_SIZE / rw, DET_SIZE / rh);
+  const scale = Math.min(DS / rw, DS / rh);
   const dw = Math.round(rw * scale), dh = Math.round(rh * scale);
-  const px = Math.floor((DET_SIZE - dw) / 2), py = Math.floor((DET_SIZE - dh) / 2);
-  const data = new Float32Array(3 * DET_SIZE * DET_SIZE).fill(0.5);
-  resampleInto(img, data, DET_SIZE, DET_SIZE, px, py, dw, dh, rx, ry, rw, rh);
-  const out = await session.run({ images: new ort.Tensor('float32', data, [1, 3, DET_SIZE, DET_SIZE]) });
+  const px = Math.floor((DS - dw) / 2), py = Math.floor((DS - dh) / 2);
+  const data = new Float32Array(3 * DS * DS).fill(0.5);
+  resampleInto(img, data, DS, DS, px, py, dw, dh, rx, ry, rw, rh);
+  const out = await session.run({ images: new ort.Tensor('float32', data, [1, 3, DS, DS]) });
   const t = out[Object.keys(out)[0]]; // [1, 84, N]
   const [, C, N] = t.dims;
   const d = t.data;
@@ -119,8 +135,9 @@ async function detect(jpegBuf, { conf = CONF_DEFAULT, classes = null, region = n
     if (best < conf) continue;
     if (classes && !classes.includes(bc)) continue;
     const cx = d[i], cy = d[N + i], w = d[2 * N + i], h = d[3 * N + i];
+    const mc = clsMap ? clsMap(bc) : bc;
     cand.push({
-      cls: bc, name: COCO[bc] || 'cls' + bc, conf: Math.round(best * 1000) / 1000,
+      cls: mc, name: COCO[mc] || 'cls' + mc, conf: Math.round(best * 1000) / 1000,
       box: {
         x: (rx + (cx - w / 2 - px) / scale) / img.width,
         y: (ry + (cy - h / 2 - py) / scale) / img.height,
@@ -192,4 +209,13 @@ function annotate(jpegBuf, dets, rois = [], { quality = 85 } = {}) {
   return jpeg.encode({ data: d, width: W, height: H }, quality).data;
 }
 
-module.exports = { detect, classifyDoor, hasDoorModel, annotate };
+// Cat detection via the house-trained model when available, COCO otherwise.
+async function detectCats(jpegBuf, opts = {}) {
+  const house = await getCatDetector();
+  // note: no classes filter here - the house model is single-class (cat=0)
+  // and the filter would run on the RAW index before clsMap renames it
+  if (house) return detect(jpegBuf, { ...opts, session: house, size: CAT_SIZE, classes: null, clsMap: () => 15 });
+  return detect(jpegBuf, { ...opts, classes: [15, 16] });
+}
+
+module.exports = { detect, detectCats, classifyDoor, hasDoorModel, annotate };

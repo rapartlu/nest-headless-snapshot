@@ -54,6 +54,22 @@ Two kinds of model run in-process (native onnxruntime, no cloud, no quota):
    With the file in place, surface-motion hits and `GET /detect/<camera>`
    run detection over each watched region and report `cat_on_surface`.
 
+   **If the pretrained detector misses your animal, fine-tune it.** COCO
+   weights have a real blind spot for climbing, motion-blurred, partly
+   occluded pets at night - a plainly visible worktop raid can score under
+   0.10. A single-class model trained on a few dozen frames from your own
+   camera fixes this decisively (~0.93 on the same frame). Collect hit
+   frames from `samples/`, draw boxes (any YOLO-format labeller), then:
+
+       yolo detect train model=yolo11n.pt data=<dataset.yaml> epochs=60 imgsz=960
+       yolo export model=runs/detect/train/weights/best.pt format=onnx imgsz=960
+       cp best.onnx nest_headless/app/assets/models/cats.onnx
+
+   When `cats.onnx` exists it is preferred over the COCO model for all cat
+   checks; detections still report class `cat`. Include negatives (people
+   cooking, empty room, lamp reflections) as background images so the model
+   learns what NOT to fire on.
+
 2. **Per-camera state classifiers** - fine-tune a small classifier on your
    own crops (two folders of labelled images):
 
