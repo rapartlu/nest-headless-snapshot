@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.4.0
+
+- Capture timeline: every archived frame is indexed in
+  `samples/<camera>/timeline.json` (rolling 300 entries) with its verdicts,
+  detections, confidences and luma. Full-frame cameras get a box-annotated
+  copy (`*_a.jpg`) alongside each archived frame. Because the samples dir
+  lives under `www/`, a dashboard card can render the whole history -
+  `examples/capture-timeline-card.js` ships a ready-made Lovelace card:
+  thumbnails, chips for each detection/verdict, click to expand.
+
 ## 1.3.1
 
 - Evidence never vanishes any more: cameras without a crop archive their full

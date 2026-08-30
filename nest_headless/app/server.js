@@ -286,7 +286,6 @@ async function persistShot(entityId, shot) {
       const cbuf = Buffer.from(shot.cropDataUrl.split(',')[1], 'base64');
       fs.writeFileSync(cropFile + '.tmp', cbuf);
       fs.renameSync(cropFile + '.tmp', cropFile);
-      if (cfg.samplesDir) archiveSample(entityId, cbuf);
       verdict = classify(entityId, cbuf); // linear model: verdict + framing gate
       // The fine-tuned CNN (hot-loaded onnx) outranks the linear verdict when
       // present; the linear model's framing gate still applies on top.
@@ -304,7 +303,6 @@ async function persistShot(entityId, shot) {
         }
       }
     }
-    if (!cropFile && cfg.samplesDir) archiveSample(entityId, buf); // keep full frames for cameras without a crop - decisions must outlive the next overwrite
     const meta = {
       file, cropFile, bytes: buf.length, width: shot.width, height: shot.height,
       frames: shot.frames, meanLuma: Math.round(shot.meanLuma * 10) / 10,
@@ -315,6 +313,26 @@ async function persistShot(entityId, shot) {
   if (shot.meanLuma < 3) {
     console.warn(`[nest_headless] WARNING: ${entityId} frame is near-black (meanLuma ${shot.meanLuma})`);
   }
+  if (cfg.samplesDir) {
+    const stamped = archiveSample(entityId, cropFile ? Buffer.from(shot.cropDataUrl.split(',')[1], 'base64') : buf);
+    if (stamped) {
+      const entry = { t: new Date().toISOString(), img: stamped, luma: meta.meanLuma };
+      if (verdict) entry.classifier = verdict;
+      if (!cropFile) {
+        // full-frame camera: enrich the timeline with detections + boxes
+        try {
+          const { cat, dets } = await catOnSurface(entityId, buf);
+          entry.cat = cat;
+          entry.dets = (dets || []).map((d) => ({ name: d.name, conf: d.conf, roi: d.roi }));
+          const boxed = infer.annotate(buf, dets || [], cfg.watchRois[entityId] || []);
+          const aname = stamped.replace(/\.jpg$/, '_a.jpg');
+          fs.writeFileSync(path.join(cfg.samplesDir, entityId.replace(/^camera\./, ''), aname), boxed);
+          entry.aimg = aname;
+        } catch (e) { /* timeline entry stays un-annotated */ }
+      }
+      appendTimeline(entityId, entry);
+    }
+  }
   return { buf, meta };
 }
 
@@ -323,7 +341,7 @@ function archiveSample(entityId, buf) {
   try {
     // keep the training archive at a sane cadence however often frames flow
     const now = Date.now();
-    if (now - (lastArchiveMs[entityId] || 0) < 120000) return;
+    if (now - (lastArchiveMs[entityId] || 0) < 120000) return null;
     lastArchiveMs[entityId] = now;
     const dir = path.join(cfg.samplesDir, entityId.replace(/^camera\./, ''));
     fs.mkdirSync(dir, { recursive: true });
@@ -336,8 +354,33 @@ function archiveSample(entityId, buf) {
     }
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     fs.writeFileSync(path.join(dir, stamp + '.jpg'), buf);
+    return stamp + '.jpg';
   } catch (e) {
     console.warn('[nest_headless] sample archive failed:', e.message);
+    return null;
+  }
+}
+
+// Rolling per-camera capture timeline: samples/<camera>/timeline.json holds
+// the newest 300 archived captures with their verdicts/detections, and the
+// dashboard card renders it. Served by HA from /local (the samples dir lives
+// under www/).
+const timelineCache = {};
+function appendTimeline(entityId, entry) {
+  try {
+    const cam = entityId.replace(/^camera\./, '');
+    const dir = path.join(cfg.samplesDir, cam);
+    fs.mkdirSync(dir, { recursive: true });
+    const f = path.join(dir, 'timeline.json');
+    let arr = timelineCache[cam];
+    if (!arr) { try { arr = JSON.parse(fs.readFileSync(f, 'utf8')); } catch (e) { arr = []; } }
+    arr.unshift(entry);
+    if (arr.length > 300) arr = arr.slice(0, 300);
+    timelineCache[cam] = arr;
+    fs.writeFileSync(f + '.tmp', JSON.stringify(arr));
+    fs.renameSync(f + '.tmp', f);
+  } catch (e) {
+    console.warn('[nest_headless] timeline append failed:', e.message);
   }
 }
 
