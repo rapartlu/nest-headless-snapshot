@@ -521,7 +521,7 @@ async function catOnSurface(entityId, frameBuf) {
         x: Math.max(0, r.x - 0.08), y: Math.max(0, r.y - 0.22),
         w: Math.min(1, r.w + 0.16), h: Math.min(1, r.h + 0.28),
       };
-      const d = await infer.detectCats(frameBuf, { conf: 0.4, region });
+      const d = await infer.detectCats(frameBuf, { conf: 0.5, region });
       if (d === null) continue;
       ran = true;
       for (const x of d) {

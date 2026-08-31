@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.5.3
+
+- Cat detection confidence threshold raised 0.40 -> 0.50: a person's head at
+  cat-scale in a zoomed surface region scored 0.418 and fired the deterrent;
+  every genuine surface cat has scored 0.85+, so the margin is safe.
+- Cat detector v4: that head is now a trained hard negative, plus one more
+  verified hallway cat the archives were hiding.
+
 ## 1.5.2
 
 - Cat detector v3: trained on the first overnight haul from both cameras -
