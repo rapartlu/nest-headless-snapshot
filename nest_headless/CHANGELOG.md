@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.5.4
+
+- The framing tripwire no longer vetoes CNN classifier verdicts. A wide-open
+  door occludes the reference region and pins refCorr near zero - the gate
+  muted an hour of score-1.00 "door open" verdicts, which is precisely the
+  state the classifier exists to catch. CNNs trained across framings need no
+  alignment gate; refCorr stays in the capture meta as a camera-moved
+  telltale. The linear engine keeps the veto.
+
 ## 1.5.3
 
 - Cat detection confidence threshold raised 0.40 -> 0.50: a person's head at

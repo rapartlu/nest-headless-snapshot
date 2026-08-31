@@ -303,7 +303,13 @@ async function persistShot(entityId, shot) {
           verdict = {
             ...cnn,
             ...(verdict && verdict.refCorr !== undefined ? { refCorr: verdict.refCorr, framingOk } : {}),
-            positive: cnn.positive && framingOk !== false,
+            // The CNN's verdict stands on its own: a WIDE-open door occludes
+            // the reference region and tanks refCorr, so the framing veto
+            // muted the exact state this classifier exists to catch (score
+            // 1.00 suppressed for over an hour on 2026-08-31). refCorr stays
+            // in the meta as a camera-moved telltale for humans; only the
+            // linear engine still needs the gate.
+            positive: cnn.positive,
           };
         }
       }
@@ -582,7 +588,7 @@ async function runWatch(entityId, intervalSec) {
             const r = await watchGrab(entityId);
             const v = r && r.meta && r.meta.classifier;
             if (!v) return;
-            const tick = v.positive && v.framingOk !== false ? 1 : 0;
+            const tick = v.positive && (v.engine === 'onnx' || v.framingOk !== false) ? 1 : 0;
             const N = Math.max(1, cfg.watchClassifyPersistTicks);
             mgr.verdicts = mgr.verdicts || [];
             mgr.verdicts.push(tick);
