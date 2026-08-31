@@ -316,6 +316,16 @@ async function persistShot(entityId, shot) {
   if (cfg.samplesDir) {
     const stamped = archiveSample(entityId, cropFile ? Buffer.from(shot.cropDataUrl.split(',')[1], 'base64') : buf);
     if (stamped) {
+      if (cropFile) {
+        // cropped camera: the crop is the timeline image, but keep the full
+        // frame too (as *_f.jpg) - crops cover only the door, so floor-level
+        // animals were never being archived and the detector had no hallway
+        // training data at all
+        try {
+          fs.writeFileSync(path.join(cfg.samplesDir, entityId.replace(/^camera\./, ''),
+            stamped.replace(/\.jpg$/, '_f.jpg')), buf);
+        } catch (e) { /* crop archive still stands */ }
+      }
       const entry = { t: new Date().toISOString(), img: stamped, luma: meta.meanLuma };
       if (verdict) entry.classifier = verdict;
       if (!cropFile) {

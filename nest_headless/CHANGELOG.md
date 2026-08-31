@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.5.1
+
+- Cat detector v2, trained on every frame in the archive: both day and
+  night, all poses (including curled-up eating - a raid pose v1's val split
+  had never taught it), with human-verified labels. A v1 label turned out to
+  be a NIGHT REFLECTION on the patio glass mislabelled as a cat (identical
+  pixels for 3+ hours of frames proved it) - v2 trains against it as a hard
+  negative. Acid suite: 14/14, cats 0.92-0.96, all confusers silent.
+- Annotated evidence frames (burned-in ROI rectangles) are excluded from
+  training data - a detector taught on annotations learns the rectangles.
+- Cropped cameras now archive the full frame too (*_f.jpg alongside the
+  crop): a camera whose samples are all door crops contributes no
+  floor-level animal training data at all.
+
 ## 1.5.0
 
 - House-trained cat detector: `detectCats()` now prefers a fine-tuned
