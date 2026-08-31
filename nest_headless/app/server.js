@@ -60,6 +60,11 @@ const cfg = {
   // tiny door-state classifier, gathered across lighting conditions.
   samplesDir: process.env.SAMPLES_DIR || '',
   samplesMax: intEnv('SAMPLES_MAX', 2000),
+  // Archive cadence: at most one frame per this many seconds reaches the
+  // samples dir / timeline, and watched cameras also heartbeat-archive at
+  // this rate even with zero motion (frames come off the live stream, so a
+  // denser cadence costs disk, not Google API quota).
+  sampleArchiveSeconds: intEnv('SAMPLE_ARCHIVE_SECONDS', 120),
   // Persistent watch mode: hold one stream open per listed camera and sample
   // it locally. "camera:interval_seconds" entries, space-separated.
   // No per-check SDM command; HA keeps extending the Google session.
@@ -351,7 +356,7 @@ function archiveSample(entityId, buf) {
   try {
     // keep the training archive at a sane cadence however often frames flow
     const now = Date.now();
-    if (now - (lastArchiveMs[entityId] || 0) < 120000) return null;
+    if (now - (lastArchiveMs[entityId] || 0) < cfg.sampleArchiveSeconds * 1000 - 2000) return null;
     lastArchiveMs[entityId] = now;
     const dir = path.join(cfg.samplesDir, entityId.replace(/^camera\./, ''));
     fs.mkdirSync(dir, { recursive: true });
@@ -546,7 +551,7 @@ async function runWatch(entityId, intervalSec) {
   // No ROIs is fine: the stream still serves instant snapshots and classify
   // ticks - there is just no surface-motion event source for this camera.
   for (;;) {
-    let page = null, session = null, classifyTimer = null;
+    let page = null, session = null, classifyTimer = null, heartbeatTimer = null;
     try {
       const browser = await getBrowser();
       page = await browser.newPage();
@@ -602,6 +607,14 @@ async function runWatch(entityId, intervalSec) {
           } catch (e) { /* stream hiccup; health loop handles it */ }
         }, cfg.watchClassifySeconds * 1000);
       }
+      if (cfg.samplesDir && cfg.sampleArchiveSeconds > 0) {
+        // heartbeat: keep the timeline flowing at a steady cadence even when
+        // nothing moves - motion-driven archives reset the clock via the
+        // shared throttle, so busy periods don't double up
+        heartbeatTimer = setInterval(() => {
+          watchGrab(entityId).catch(() => { /* stream hiccup */ });
+        }, cfg.sampleArchiveSeconds * 1000);
+      }
       for (;;) { // hold the stream; HA extends the Google session while we stay connected
         await sleep(30000);
         const st = await page.evaluate(fns.connectionState);
@@ -612,6 +625,7 @@ async function runWatch(entityId, intervalSec) {
       console.warn(`[nest_headless] watch ${entityId} down (${e.message}); retrying in 30s`);
     } finally {
       try { if (classifyTimer) clearInterval(classifyTimer); } catch (e) { /* ok */ }
+      try { if (heartbeatTimer) clearInterval(heartbeatTimer); } catch (e) { /* ok */ }
       try { if (session) session.close(); } catch (e) { /* ok */ }
       try { if (page) await page.close(); } catch (e) { /* ok */ }
     }

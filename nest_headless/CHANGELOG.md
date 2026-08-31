@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.5.2
+
+- Cat detector v3: trained on the first overnight haul from both cameras -
+  hallway scene (ginger and a black cat on the hall floor), IR night frames,
+  and fresh confusers (boots on the stairs that pattern-match a sleeping
+  cat, cookware on the worktop). 20/20 acid cases.
+- `sample_archive_seconds` option (default 120): the archive/timeline
+  throttle is now configurable, and watched cameras heartbeat-archive at
+  that cadence even when nothing moves - a uniform timeline instead of
+  motion-dependent gaps. Frames come off the held stream, so a denser
+  cadence costs disk, not API quota.
+
 ## 1.5.1
 
 - Cat detector v2, trained on every frame in the archive: both day and
