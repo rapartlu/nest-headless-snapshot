@@ -157,10 +157,13 @@ async function detect(jpegBuf, { conf = CONF_DEFAULT, classes = null, region = n
 
 // Classify a door-zone crop JPEG with the camera's fine-tuned model.
 // Returns { label, score, positive } or null when no model / failure.
-// Threshold 0.6: measured on the full curated set (2026-08-30) the CNN gives
-// closed <= 0.25 and open >= 0.70, so 0.6 splits the gap with margin both
+// Threshold 0.30: the v11 laser-slice CNN scores closed at 0.00-0.03 and
+// settled opens 0.98+, but in-between door ANGLES (live test 2026-09-01,
+// Paul: "i opened it to see if you'd catch it") sit at 0.5-0.8 and flapped
+// across the old 0.6 line - the persistence gate then never fired. 0.30
+// keeps 10x margin over closed while making every open angle a solid tick
 // ways - and catches barely-ajar states a 0.9 threshold would miss.
-async function classifyDoor(camera, jpegBuf, { size = 256, threshold = 0.6, label = 'door_open' } = {}) {
+async function classifyDoor(camera, jpegBuf, { size = 256, threshold = 0.30, label = 'door_open' } = {}) {
   const session = await getCls(camera);
   if (!session) return null;
   const img = jpeg.decode(jpegBuf, { useTArray: true, maxMemoryUsageInMB: 64 });
@@ -210,12 +213,40 @@ function annotate(jpegBuf, dets, rois = [], { quality = 85 } = {}) {
 }
 
 // Cat detection via the house-trained model when available, COCO otherwise.
+// COCO classes that small household objects on surfaces get detected as.
+// Used to veto house-model cat calls: the fine-tuned single-class model is
+// sharp on THIS house's cats but treats any novel compact object as
+// cat-until-proven-otherwise (wipes tub 0.71, saucepan 0.20, a head 0.42).
+// Stock COCO knows what those objects ARE - so if it sees a container-ish
+// object in the same spot and no cat, the default knowledge wins.
+const OBJECT_CLASSES = [39, 40, 41, 45, 58, 75]; // bottle, wine glass, cup, bowl, potted plant, vase
+
 async function detectCats(jpegBuf, opts = {}) {
   const house = await getCatDetector();
   // note: no classes filter here - the house model is single-class (cat=0)
   // and the filter would run on the RAW index before clsMap renames it
-  if (house) return detect(jpegBuf, { ...opts, session: house, size: CAT_SIZE, classes: null, clsMap: () => 15 });
-  return detect(jpegBuf, { ...opts, classes: [15, 16] });
+  if (!house) return detect(jpegBuf, { ...opts, classes: [15, 16] });
+  const dets = await detect(jpegBuf, { ...opts, session: house, size: CAT_SIZE, classes: null, clsMap: () => 15 });
+  if (!dets || !dets.length) return dets;
+  // Cross-examine each house call with the stock COCO model on the same view
+  const ref = await detect(jpegBuf, { ...opts, conf: 0.25, classes: [15, 16, ...OBJECT_CLASSES] });
+  if (ref === null) return dets;
+  const iou = (a, b) => {
+    const x1 = Math.max(a.box.x, b.box.x), y1 = Math.max(a.box.y, b.box.y);
+    const x2 = Math.min(a.box.x + a.box.w, b.box.x + b.box.w);
+    const y2 = Math.min(a.box.y + a.box.h, b.box.y + b.box.h);
+    const i = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+    return i / (a.box.w * a.box.h + b.box.w * b.box.h - i + 1e-9);
+  };
+  return dets.filter((d) => {
+    const obj = ref.find((r) => OBJECT_CLASSES.includes(r.cls) && iou(d, r) > 0.3);
+    const cocoCat = ref.find((r) => (r.cls === 15 || r.cls === 16) && iou(d, r) > 0.3);
+    if (obj && !cocoCat) {
+      console.log(`[nest_headless] veto: house cat:${d.conf} is a ${obj.name}:${obj.conf} per COCO`);
+      return false;
+    }
+    return true;
+  });
 }
 
 module.exports = { detect, detectCats, classifyDoor, hasDoorModel, annotate };

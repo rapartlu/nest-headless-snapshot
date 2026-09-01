@@ -470,6 +470,11 @@ async function watchHit(entityId, payload) {
   // People trigger the same pixel diff constantly; they are logged, not fired.
   const frameBuf = Buffer.from(payload.dataUrl.split(',')[1], 'base64');
   const { cat, dets } = await catOnSurface(entityId, frameBuf);
+  // Evidence for EVERY hit, verdict or not: "a cat was just there, did you
+  // catch it?" has now been asked three times and each time the frames the
+  // detector judged were already gone (only heartbeats and cat-positives
+  // were kept). Own throttle (10s) + rotation, separate from the archive.
+  saveHitSnapshot(entityId, frameBuf, dets, payload.roi);
   // Verdict comes from the detector alone. The "suspected" motion heuristic
   // shipped and was retired the same night: 3 firings, 0 cats (person-exit
   // wake, stream settle, lamp shimmer). The house-trained model replaces it.
@@ -484,6 +489,27 @@ async function watchHit(entityId, payload) {
     cat: verdict,
     detections: dets ? dets.slice(0, 5) : null,
   });
+}
+
+const lastHitSnapMs = {};
+function saveHitSnapshot(entityId, frameBuf, dets, roi) {
+  try {
+    if (!cfg.samplesDir) return;
+    const now = Date.now();
+    if (now - (lastHitSnapMs[entityId] || 0) < 10000) return;
+    lastHitSnapMs[entityId] = now;
+    const dir = path.join(cfg.samplesDir, entityId.replace(/^camera\./, '') + '_hits');
+    fs.mkdirSync(dir, { recursive: true });
+    const existing = fs.readdirSync(dir).filter((f) => f.endsWith('.jpg')).sort();
+    if (existing.length >= 600) {
+      for (const f of existing.slice(0, 60)) {
+        try { fs.unlinkSync(path.join(dir, f)); } catch (e) { /* ok */ }
+      }
+    }
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const boxed = infer.annotate(frameBuf, dets || [], cfg.watchRois[entityId] || []);
+    fs.writeFileSync(path.join(dir, `${stamp}_${roi}.jpg`), boxed);
+  } catch (e) { /* evidence is best-effort */ }
 }
 
 // Keep the evidence: raw + box-annotated copies of every frame that
@@ -515,32 +541,25 @@ async function catOnSurface(entityId, frameBuf) {
   try {
     const rois = cfg.watchRois[entityId] || [];
     if (!rois.length) return { cat: null, dets: null };
+    // ONE full-frame pass. The region-zoom era (1.3.0-1.5.5) fed the
+    // house model crops ~3x larger than anything it trained on - a proven
+    // train/serve scale mismatch: the canonical raid frame scores 0.904
+    // full-frame and NOTHING zoomed. Zoom existed for COCO's small-cat
+    // blindness; the house model trained on these full frames and needs
+    // the frame served the same way. (This both missed a real daylight cat
+    // and let a wipes tub fire at zoom scale - full-frame fixes both.)
+    const d = await infer.detectCats(frameBuf, { conf: 0.5 });
+    if (d === null) return { cat: null, dets: null };
     const dets = [];
-    let ran = false;
     let cat = false;
-    for (const r of rois) {
-      // Detect inside a ZOOMED view of each surface: distant animals vanish
-      // at full-frame scale (a far cat is ~13px - proven blind spot), but at
-      // ROI zoom the same cat detects at 0.8 conf. The ROI marks where feet
-      // land; the body rises above it, so pad upward and sideways.
-      const region = {
-        x: Math.max(0, r.x - 0.08), y: Math.max(0, r.y - 0.22),
-        w: Math.min(1, r.w + 0.16), h: Math.min(1, r.h + 0.28),
-      };
-      const d = await infer.detectCats(frameBuf, { conf: 0.5, region });
-      if (d === null) continue;
-      ran = true;
-      for (const x of d) {
-        dets.push({ ...x, roi: r.name });
-        if (x.cls === 15 || x.cls === 16) {
-          // placement: the animal's feet (box bottom-centre, full-frame
-          // coords) must be on the surface itself, not the floor behind it
-          const fx = x.box.x + x.box.w / 2, fy = x.box.y + x.box.h;
-          if (fx >= r.x && fx <= r.x + r.w && fy >= r.y - 0.02 && fy <= r.y + r.h + 0.04) cat = true;
-        }
-      }
+    for (const x of d) {
+      // placement: the animal's feet (box bottom-centre) must be on a
+      // watched surface, not the floor behind it
+      const fx = x.box.x + x.box.w / 2, fy = x.box.y + x.box.h;
+      const r = rois.find((r) => fx >= r.x && fx <= r.x + r.w && fy >= r.y - 0.02 && fy <= r.y + r.h + 0.04);
+      dets.push({ ...x, roi: r ? r.name : null });
+      if (r && (x.cls === 15 || x.cls === 16)) cat = true;
     }
-    if (!ran) return { cat: null, dets: null };
     if (cat) saveCatSnapshot(entityId, frameBuf, dets);
     return { cat, dets };
   } catch (e) {

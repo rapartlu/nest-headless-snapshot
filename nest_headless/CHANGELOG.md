@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.5.7
+
+- Cat detection runs FULL-FRAME, the way the house model was trained. The
+  region-zoom path (1.3.0-1.5.6) fed the fine-tuned model crops ~3x larger
+  than its training distribution - a train/serve scale mismatch that both
+  missed a real cat in daylight and let a wipes tub fire at zoom scale.
+  (Zoom remains for the COCO fallback, which needs it for small cats.)
+- COCO cross-examination: when the house model claims a cat, the stock COCO
+  model checks the same box - if it identifies a bottle/cup/vase/bowl there
+  and sees no cat itself, default knowledge vetoes the call. Fine-tuning on
+  a small set trades away COCO's broad "what things are"; this buys it back.
+- Cat detector v6: night-lighting wipes-tub hard negative.
+
+## 1.5.6 / 1.5.5
+
+- Every surface-motion hit now archives a box-annotated evidence frame to
+  samples/<camera>_hits/ (10s throttle, rolling 600) whatever the verdict -
+  "a cat was just there, did you catch it?" is now answerable with frames
+  instead of forensics. Heartbeat archive default stays configurable.
+- Door classifier: threshold 0.30 (laser-slice CNN margins: closed 0.00-0.03,
+  settled opens 0.98+; in-between door angles sat at 0.5-0.8 and flapped
+  across the old 0.6 line so the persistence gate never fired).
+
 ## 1.5.4
 
 - The framing tripwire no longer vetoes CNN classifier verdicts. A wide-open
