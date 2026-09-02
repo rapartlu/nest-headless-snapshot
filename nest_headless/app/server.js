@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.8.8';
+const ADDON_VERSION = '1.8.9';
 
 const http = require('http');
 const fs = require('fs');
@@ -103,7 +103,7 @@ const cfg = {
   // Speech capture after a keyword hit (see onAudioChunk): end on this much
   // silence after speech, or at the max; recogniser hot-loads from sttModelDir.
   speechSilenceMs: intEnv('SPEECH_SILENCE_MS', 800),
-  speechMaxSeconds: intEnv('SPEECH_MAX_SECONDS', 8),
+  speechMaxSeconds: intEnv('SPEECH_MAX_SECONDS', 15),   // safety stop only; captures close on silence
   sttModelDir: process.env.STT_MODEL_DIR || path.join(CONFIG_DIR, 'nest_models/stt'),
   // Optional whisper.cpp server (Metal on a Mac): POST /inference. Falls back
   // to the in-process recogniser when unreachable. e.g. http://127.0.0.1:8178
@@ -874,13 +874,16 @@ function readJsonBody(req) {
 // silence-after-speech or the max window, then recognise and post ONE event.
 const speechCap = {};
 function rmsOf(a) { let acc = 0; for (let i = 0; i < a.length; i++) acc += a[i] * a[i]; return Math.sqrt(acc / Math.max(1, a.length)); }
-function startSpeechCapture(entityId, keyword, ring) {
+// opts.followUp (Hearth #4): a listening window opened by the brain right
+// after it has spoken - no wake phrase, so no tail phase; a short pre-roll;
+// gives up silently after opts.giveUpMs if nobody speaks.
+function startSpeechCapture(entityId, keyword, ring, opts = {}) {
   // ~1.5 s pre-roll: the spotter fires 0.3-0.7 s after the phrase, so someone
   // who runs straight on ("hey claude is the...") has already said the start
   // of the question. Whisper gets the wake phrase too; it is stripped from
   // the transcript afterwards (stripWakePhrase).
   const pre = [];
-  let need = 24000;
+  let need = opts.followUp ? 4800 : 24000;
   for (let i = ring.length - 1; i >= 0 && need > 0; i--) { pre.unshift(ring[i]); need -= ring[i].length; }
   // Noise floor from the ring's quietest tenth (x3), clamped to 0.006-0.015:
   // a ring full of conversation or a spoken answer must not lift the floor
@@ -890,7 +893,9 @@ function startSpeechCapture(entityId, keyword, ring) {
   const floor = Math.min(0.015, Math.max(0.006, (rmses[Math.floor(rmses.length * 0.1)] || 0.006) * 3));
   speechCap[entityId] = {
     keyword, chunks: [...pre], startedAt: new Date(), t0: Date.now(),
-    floor, phase: 'tail', tailQuietMs: 0, keepFrom: pre.length, listenT0: null, voicedMs: 0, silenceMs: 0,
+    floor, phase: opts.followUp ? 'listen' : 'tail', tailQuietMs: 0, keepFrom: opts.followUp ? 0 : pre.length,
+    listenT0: opts.followUp ? Date.now() : null, voicedMs: 0, silenceMs: 0,
+    followUp: !!opts.followUp, giveUpMs: opts.giveUpMs || 0,
   };
 }
 // End-pointing (Hearth #3). The spotter fires mid-phrase ("hey cl..."), so
@@ -932,7 +937,7 @@ function feedSpeechCapture(entityId, chunk) {
     if (voiced) { c.voicedMs += ms; c.silenceMs = 0; } else c.silenceMs += ms;
     const spoke = c.voicedMs >= SPEECH_MIN_VOICED_MS, listened = Date.now() - c.listenT0;
     if (spoke && c.silenceMs >= cfg.speechSilenceMs) reason = 'silence';
-    else if (!c.voicedMs && listened >= SPEECH_INITIAL_QUIET_MS) reason = 'no_speech';
+    else if (!c.voicedMs && listened >= (c.giveUpMs || SPEECH_INITIAL_QUIET_MS)) reason = 'no_speech';
     else if (!spoke && c.voicedMs && c.silenceMs >= 2000) reason = 'no_speech';   // a grunt, then nothing
     else if (elapsed >= cfg.speechMaxSeconds * 1000) reason = spoke ? 'max_seconds' : 'no_speech';
     if (!reason) return;
@@ -994,6 +999,10 @@ function stripWakePhrase(t) {
   return rest.length ? rest : '';
 }
 async function finishSpeechCapture(entityId, c, reason) {
+  if (c.followUp && reason === 'no_speech') {   // nobody replied: no event at all (Hearth #4)
+    console.log(`[nest_headless] follow-up window on ${entityId} closed: nobody spoke`);
+    return;
+  }
   const endedAt = new Date();
   // recogniser audio starts after the wake phrase's tail (see feedSpeechCapture)
   const kept = c.chunks.slice(Math.min(c.keepFrom || 0, Math.max(0, c.chunks.length - 1)));
@@ -1305,6 +1314,21 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ mgr: mgr ? { ready: mgr.ready, hits: mgr.hits, lastError: mgr.lastError } : null, page: pageState }));
       return;
+    }
+    if (parts[0] === 'listen' && parts[1] && req.method === 'POST') {
+      // Follow-up window (Hearth #4): the brain has just spoken on this
+      // camera's speaker and invites a reply. Same end-pointing and the same
+      // nest_headless_speech event as a wake word, keyword "follow-up"; no
+      // event at all if nobody speaks within ?seconds (default 8, max 30).
+      const entityId = cameraEntity(parts[1]);
+      const st = kwsCtx && kwsCtx.streams && kwsCtx.streams[entityId];
+      if (!st) { res.writeHead(404, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, reason: 'no_audio_stream' })); }
+      if (speechCap[entityId]) { res.writeHead(409, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, reason: 'capture_in_progress' })); }
+      const seconds = Math.max(1, Math.min(30, parseFloat(url.searchParams.get('seconds')) || 8));
+      startSpeechCapture(entityId, 'follow-up', st.ring || [], { followUp: true, giveUpMs: seconds * 1000 });
+      console.log(`[nest_headless] LISTEN follow-up window ${seconds}s on ${entityId}`);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: true, camera: entityId.replace(/^camera\./, ''), seconds }));
     }
     if (parts[0] === 'identity') {
       if (req.method === 'GET' && !parts[1]) {

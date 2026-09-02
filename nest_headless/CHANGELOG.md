@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.8.9
+
+- Follow-up window (Hearth #4): `POST /listen/<camera>?seconds=8` opens a
+  speech capture on that camera as if a wake word had just fired, with the
+  same end-pointing and the same `nest_headless_speech` event (`keyword:
+  "follow-up"`), for the brain to call right after it has spoken. No tail
+  phase, 300 ms pre-roll; if nobody speaks within `seconds` (default 8, max
+  30) there is no event at all. 409 while a capture is already open, 404 if
+  the camera has no audio tap.
+- `speech_max_seconds` default 15 (was 8): it is a safety stop now that
+  captures close on silence; 8 s truncated real sentences.
+
 ## 1.8.8
 
 - `wake_confirmed` on `nest_headless_speech`: the pre-roll is always given to

@@ -1,5 +1,5 @@
 name: Nest Headless Snapshot
-version: "1.8.8"
+version: "1.8.9"
 slug: nest_headless
 description: >-
   Server-side Nest camera stills via headless Chromium — the only WebRTC
@@ -35,7 +35,7 @@ options:
   sample_archive_seconds: 120
   audio_cameras: ""
   speech_silence_ms: 800
-  speech_max_seconds: 8
+  speech_max_seconds: 15
   stt_model_dir: ""
   stt_url: ""
   identity_keep_samples: false

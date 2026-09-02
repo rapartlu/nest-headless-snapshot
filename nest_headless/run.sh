@@ -46,7 +46,7 @@ if [ -f "$OPTS" ]; then
   AUDIO_OPT="$(jq -r '.audio_cameras // ""' "$OPTS")"
   [ -n "$AUDIO_OPT" ] && export AUDIO_CAMERAS="$AUDIO_OPT"
   export SPEECH_SILENCE_MS="$(jq -r '.speech_silence_ms // 800' "$OPTS")"
-  export SPEECH_MAX_SECONDS="$(jq -r '.speech_max_seconds // 8' "$OPTS")"
+  export SPEECH_MAX_SECONDS="$(jq -r '.speech_max_seconds // 15' "$OPTS")"
   STT_OPT="$(jq -r '.stt_model_dir // ""' "$OPTS")"
   [ -n "$STT_OPT" ] && export STT_MODEL_DIR="$STT_OPT"
   STT_URL_OPT="$(jq -r '.stt_url // ""' "$OPTS")"
