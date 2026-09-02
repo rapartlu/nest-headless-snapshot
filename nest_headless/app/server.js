@@ -879,9 +879,12 @@ function startSpeechCapture(entityId, keyword, ring) {
   const pre = [];
   let need = 24000;
   for (let i = ring.length - 1; i >= 0 && need > 0; i--) { pre.unshift(ring[i]); need -= ring[i].length; }
-  // noise floor from the ring's quietest recent chunks (x2.5, min 0.006)
+  // Noise floor from the ring's quietest tenth (x3), clamped to 0.006-0.015:
+  // a ring full of conversation or a spoken answer must not lift the floor
+  // above a normal voice (0.02-0.3 rms at this mic); 0.015 is well above the
+  // kitchen's ambient 0.003-0.005.
   const rmses = ring.map(rmsOf).sort((a, b) => a - b);
-  const floor = Math.max(0.006, (rmses[Math.floor(rmses.length * 0.3)] || 0.006) * 2.5);
+  const floor = Math.min(0.015, Math.max(0.006, (rmses[Math.floor(rmses.length * 0.1)] || 0.006) * 3));
   speechCap[entityId] = {
     keyword, chunks: [...pre], startedAt: new Date(), t0: Date.now(),
     floor, phase: 'tail', tailQuietMs: 0, keepFrom: pre.length, listenT0: null, voicedMs: 0, silenceMs: 0,
@@ -909,7 +912,7 @@ function feedSpeechCapture(entityId, chunk) {
   if (c.phase === 'tail') {
     c.tailQuietMs = voiced ? 0 : c.tailQuietMs + ms;
     if (c.tailQuietMs >= TAIL_GAP_MS) { c.phase = 'listen'; c.keepFrom = c.chunks.length; c.listenT0 = Date.now(); }
-    else if (elapsed >= TAIL_MAX_MS) { c.phase = 'listen'; c.keepFrom = 0; c.listenT0 = Date.now(); c.voicedMs = voiced ? ms : 0; }   // ran straight on: keep the pre-roll, the question started in it
+    else if (elapsed >= TAIL_MAX_MS) { c.phase = 'listen'; c.keepFrom = 0; c.listenT0 = Date.now(); c.voicedMs = TAIL_MAX_MS; }   // ran straight on: keep the pre-roll (the question started in it) and count the run-on as speech already
     else if (elapsed >= cfg.speechMaxSeconds * 1000) reason = 'no_speech';
     if (!reason) return;
   } else {
@@ -928,9 +931,12 @@ function feedSpeechCapture(entityId, chunk) {
 // Drop the wake phrase (and anything before it) from a transcript that
 // includes the pre-roll. Spellings cover how the recognisers render "Claude"
 // for the voices in this house ("Claws", "God", "Cloud", ...).
-const WAKE_RE = /^[\s\S]*?\b(?:hey|hi|ok|okay)[,.!?]?\s+(?:claude|claud|clawed|claws|clause|cloud|clod|clawd|god|kitchen)\b[,.!?]*\s*/i;
+const WAKE_NAMES = 'claude|claud|clawed|claws|clause|cloud|clod|clawd|god|kitchen';
+const WAKE_RE = new RegExp(`^[\\s\\S]*?\\b(?:hey|hi|ok|okay)[,.!?]?\\s+(?:${WAKE_NAMES})\\b[,.!?]*\\s*`, 'i');
+// pre-roll cut mid-phrase: transcript starts with the bare name ("clawed, is the...")
+const WAKE_HEAD_RE = new RegExp(`^\\W*(?:${WAKE_NAMES})\\b[,.!?]*\\s*`, 'i');
 function stripWakePhrase(t) {
-  const m = WAKE_RE.exec(t);
+  const m = WAKE_RE.exec(t) || WAKE_HEAD_RE.exec(t);
   if (!m) return t;
   const rest = t.slice(m[0].length).trim();
   return rest.length ? rest : '';
