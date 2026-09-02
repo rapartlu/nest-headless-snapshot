@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.10.4';
+const ADDON_VERSION = '1.10.5';
 
 const http = require('http');
 const fs = require('fs');
@@ -1229,6 +1229,7 @@ async function finishSpeechCapture(entityId, c, reason) {
     reason: text ? reason : (reason === 'no_speech' ? 'no_speech' : reason),
     engine: stt ? stt.engine : null, stt_ms: sttMs, final: true, speculative, close_to_event_ms: closeToEventMs,
     wake_confirmed: wakeConfirmed,   // Whisper heard the wake phrase in the pre-roll (false = likely a spotter false alarm)
+    ...(c.followUp ? { opened_by: c.openedBy || null, open_reason: c.openReason || null } : {}),
     // raw 16 kHz mono WAV, memory-held for 90 s, for a stronger recogniser on the brain
     audio_path: `/utterance/${utteranceId}.wav`, audio_ttl_s: 90,
   });
@@ -1525,6 +1526,8 @@ const server = http.createServer(async (req, res) => {
       if (speechCap[entityId]) { res.writeHead(409, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, reason: 'capture_in_progress' })); }
       const seconds = Math.max(1, Math.min(30, parseFloat(url.searchParams.get('seconds')) || 8));
       startSpeechCapture(entityId, 'follow-up', st.ring || [], { followUp: true, giveUpMs: seconds * 1000 });
+      speechCap[entityId].openedBy = ip;   // carried on the event as opened_by so the brain can verify the source per capture (Hearth #10)
+      speechCap[entityId].openReason = (url.searchParams.get('reason') || '').slice(0, 60) || null;
       console.log(`[nest_headless] LISTEN follow-up window ${seconds}s on ${entityId} from ${ip}${url.searchParams.get('reason') ? ' reason=' + url.searchParams.get('reason').slice(0, 60) : ''} at ${new Date().toISOString()}`);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ ok: true, camera: entityId.replace(/^camera\./, ''), seconds }));
