@@ -8,13 +8,14 @@ Audio is decoded in memory and never written to disk. Loopback only.
   WHISPER_MODEL   HF repo or local path (default mlx-community/whisper-large-v3-turbo)
   PORT            default 8178
 """
-import cgi, io, json, os, struct, sys, time
+import cgi, io, json, os, struct, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
 import mlx_whisper
 
 MODEL = os.environ.get('WHISPER_MODEL', 'mlx-community/whisper-large-v3-turbo')
+transcribe_lock = threading.Lock()   # MLX graphs are not re-entrant: one transcription at a time, callers queue (~0.7 s each)
 PORT = int(os.environ.get('PORT', '8178'))
 BIND = os.environ.get('BIND', '127.0.0.1')          # 0.0.0.0 to serve the LAN (HA Assist, phones)
 TOKEN = os.environ.get('WHISPER_TOKEN', '').strip()  # when set, /inference from anywhere but loopback needs Authorization: Bearer <token>
@@ -87,9 +88,10 @@ class H(BaseHTTPRequestHandler):
             wav = form.get('file', [b''])[0]
             audio = wav_to_float32(wav)
             t0 = time.time()
-            r = mlx_whisper.transcribe(audio, path_or_hf_repo=MODEL, language='en', task='transcribe',
-                                       temperature=0.0, condition_on_previous_text=False, fp16=True,
-                                       no_speech_threshold=0.6)
+            with transcribe_lock:
+                r = mlx_whisper.transcribe(audio, path_or_hf_repo=MODEL, language='en', task='transcribe',
+                                           temperature=0.0, condition_on_previous_text=False, fp16=True,
+                                           no_speech_threshold=0.6)
             text = (r.get('text') or '').strip()
             ms = int((time.time() - t0) * 1000)
             sys.stdout.write(f'{time.strftime("%H:%M:%S")} {len(audio)/16000:.1f}s -> {ms} ms: {text!r}\n'); sys.stdout.flush()
