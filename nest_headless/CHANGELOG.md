@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.9.0
+
+- Passage zones (Hearth #7). `watch_passages` takes polygons drawn across
+  doorways, same syntax as `watch_rois` plus an optional inside point:
+  `downstairs_hallway_camera:downstairs_toilet@x1,y1:x2,y2:x3,y3:x4,y4|in=x,y;front_door@...`.
+  A passage joins the camera's motion mask; every doorway-motion hit runs
+  the person + bag detector (8 ms on CoreML, own 0.7 s pacing) through a
+  per-camera tracker (IoU / foot-distance matching, 4 s track life). When a
+  tracked person's feet go through the polygon - or vanish inside it, the
+  usual case when the room behind the door is out of view - one
+  `nest_headless_passage` event is posted: {camera, passage, direction
+  in|out|across, track_id, t, person: {matches: []}, attributes:
+  {height_ratio, carrying: "bag"|null}}. One event per track and passage per
+  2 s; turning back in the doorway posts nothing. Passages are never cat
+  surfaces. `GET /` lists `passages` and live `tracks` per watch.
+- Face identity moves to 1.10.0.
+
 ## 1.8.12
 
 - CoreML execution provider on macOS (`ORT_COREML=0` to disable): on an M3

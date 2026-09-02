@@ -81,6 +81,26 @@ Two kinds of model run in-process (native onnxruntime, no cloud, no quota):
    linear model still provides the framing tripwire. Retraining is just
    replacing the file - it hot-loads on change.
 
+## Passage zones (doorways)
+
+`watch_passages` draws polygons across doorways, per camera, with the same
+polygon syntax as `watch_rois` plus an optional inside point after `|`:
+
+```
+watch_passages: "downstairs_hallway_camera:downstairs_toilet@0.62,0.55:0.70,0.55:0.72,0.72:0.60,0.72|in=0.66,0.40;front_door@...;  upstairs_hallway_camera:upstairs_bathroom@...|in=..."
+```
+
+`in=x,y` is any point on the room side of the door (it may lie outside the
+frame); it decides `in` versus `out`. Without it the direction is `across`.
+Draw the polygon on the floor across the threshold: the test uses the
+person's feet (box bottom-centre). When someone walks into the doorway and
+disappears (the room is out of view) that counts as going `in`; someone who
+appears in the doorway and walks away counts as coming `out`; stepping into
+the doorway and turning back posts nothing. Event: `nest_headless_passage`
+{camera, passage, direction, track_id, t, person.matches, attributes
+{height_ratio, carrying}}. The zone editor in the training kit draws these
+the same way it draws surface zones.
+
 ## Camera framing tripwire
 
 If a classifier model has reference features, each capture also reports

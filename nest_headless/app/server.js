@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.8.12';
+const ADDON_VERSION = '1.9.0';
 
 const http = require('http');
 const fs = require('fs');
@@ -39,6 +39,7 @@ const puppeteer = require('puppeteer-core');
 const fns = require('./pagefns');
 const { classify } = require('./classifier');
 const infer = require('./infer');
+const { parseWatchPassages, PassageTracker } = require('./passages');
 
 // ------------------------------------------------------------ configuration
 // HA config root: the supervisor mounts it at /homeassistant (or /config on
@@ -85,6 +86,8 @@ const cfg = {
   //   "kitchen_camera:table@0.26:0.55:0.62:0.43;island@0.30:0.32:0.22:0.12"
   // (name@x:y:w:h as fractions, boxes ';'-separated, cameras space-separated)
   watchRois: parseWatchRois(process.env.WATCH_ROIS || ''),
+  // Passage zones (doorways): polygons + optional inside point, see passages.js
+  watchPassages: parseWatchPassages(process.env.WATCH_PASSAGES || ''),
   watchDiffPct: Number(process.env.WATCH_DIFF_PCT || 4),
   watchCooldownSeconds: intEnv('WATCH_COOLDOWN_SECONDS', 60),
   // For watched cameras with a crop + trained model: score the live stream
@@ -508,6 +511,27 @@ function postHaEvent(type, data) {
   });
 }
 
+// Passage tracking (Hearth #7): every doorway-motion hit runs the person
+// detector (8 ms on CoreML) and feeds the camera's tracker; crossings become
+// nest_headless_passage events. Own pacing (0.7 s), independent of the cat
+// detection pacing below - people cross a doorway in about a second.
+async function passageTick(entityId, mgr, frameBuf, now) {
+  const passages = cfg.watchPassages[entityId] || [];
+  if (!passages.length) return;
+  if (now - (mgr.lastPassageMs || 0) < 700) return;
+  mgr.lastPassageMs = now;
+  try {
+    const d = await infer.detect(frameBuf, { conf: 0.4, classes: [0, 24, 26, 28] });   // person, backpack, handbag, suitcase
+    if (d === null) return;
+    const persons = d.filter((x) => x.cls === 0), bags = d.filter((x) => x.cls !== 0);
+    mgr.tracker = mgr.tracker || new PassageTracker(entityId, passages);
+    for (const ev of mgr.tracker.update(persons, bags, now)) {
+      console.log(`[nest_headless] PASSAGE ${ev.direction} ${ev.passage} on ${entityId} track ${ev.track_id} h=${ev.attributes.height_ratio} carrying=${ev.attributes.carrying}`);
+      postHaEvent('nest_headless_passage', { entity_id: entityId, camera: entityId.replace(/^camera\./, ''), ...ev }).catch(() => {});
+    }
+  } catch (e) { console.warn(`[nest_headless] passage tick ${entityId} failed: ${e.message}`); }
+}
+
 async function watchHit(entityId, payload) {
   const mgr = watchMgr[entityId];
   if (!mgr) return;
@@ -516,6 +540,10 @@ async function watchHit(entityId, payload) {
   // resolution for its first seconds, which diffs like motion (fired a
   // phantom deterrent 6s after a restart). Ignore hits until it settles.
   if (now - (mgr.readySinceMs || 0) < 45000) return;
+  if ((cfg.watchPassages[entityId] || []).length && payload.meanLuma >= 3) {
+    passageTick(entityId, mgr, Buffer.from(payload.dataUrl.split(',')[1], 'base64'), now).catch(() => {});
+  }
+  if (String(payload.roi || '').startsWith('passage:')) return;   // doorway motion: tracked above, not a surface hit
   // Detection PACING, not the alert cooldown: the old shared 60s cooldown
   // gated detection itself, so any motion (a person passing) blinded the
   // zone check for the next minute - a cat could land and go unseen. Local
@@ -1154,7 +1182,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function runWatch(entityId, intervalSec) {
   const mgr = watchMgr[entityId] = { ready: false, hits: 0, lastHitMs: 0, lastError: null, page: null };
-  const rois = cfg.watchRois[entityId] || [];
+  const surfaces = cfg.watchRois[entityId] || [];
+  // passage zones join the page's motion mask (named "passage:<name>") so a
+  // person in a doorway produces hits; they are never cat surfaces
+  const rois = surfaces.concat((cfg.watchPassages[entityId] || []).map((p) => ({ name: 'passage:' + p.name, pts: p.pts, x: p.x, y: p.y, w: p.w, h: p.h })));
   // No ROIs is fine: the stream still serves instant snapshots and classify
   // ticks - there is just no surface-motion event source for this camera.
   for (;;) {
@@ -1188,7 +1219,7 @@ async function runWatch(entityId, intervalSec) {
       mgr.page = page; mgr.ready = true; mgr.startedAt = new Date().toISOString(); mgr.lastError = null;
       mgr.readySinceMs = Date.now();
       mgr.lastPersonMs = Date.now(); // cold start: assume people were just about
-      console.log(`[nest_headless] watch ${entityId} live at ${dims.width}x${dims.height}, ${rois.length} ROIs, sampling every ${intervalSec}s`);
+      console.log(`[nest_headless] watch ${entityId} live at ${dims.width}x${dims.height}, ${surfaces.length} surfaces, ${(cfg.watchPassages[entityId] || []).length} passages, sampling every ${intervalSec}s`);
       // Classifier tick: local, free, and fast - a trained model (e.g. the
       // cupboard door) now sees the live stream instead of 5-minute polls.
       if (cfg.watchClassifySeconds > 0 && cfg.crops[entityId]) {
@@ -1295,6 +1326,7 @@ const server = http.createServer(async (req, res) => {
         watches: Object.fromEntries(Object.entries(watchMgr).map(([k, m]) => [k, {
           ready: m.ready, hits: m.hits, startedAt: m.startedAt, lastError: m.lastError,
           verdictWindow: (m.verdicts || []).join(''), sustainedOpen: !!m.sustainedOpen,
+          passages: (cfg.watchPassages[k] || []).map((p) => p.name), tracks: m.tracker ? m.tracker.tracks.length : 0,
         }])),
       }, null, 2));
       return;

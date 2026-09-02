@@ -38,6 +38,8 @@ if [ -f "$OPTS" ]; then
   [ -n "$WATCHES_OPT" ] && export WATCHES="$WATCHES_OPT"
   WATCH_ROIS_OPT="$(jq -r '.watch_rois // ""' "$OPTS")"
   [ -n "$WATCH_ROIS_OPT" ] && export WATCH_ROIS="$WATCH_ROIS_OPT"
+  WATCH_PASSAGES_OPT="$(jq -r '.watch_passages // ""' "$OPTS")"
+  [ -n "$WATCH_PASSAGES_OPT" ] && export WATCH_PASSAGES="$WATCH_PASSAGES_OPT"
   export WATCH_DIFF_PCT="$(jq -r '.watch_diff_pct // 4' "$OPTS")"
   export WATCH_COOLDOWN_SECONDS="$(jq -r '.watch_cooldown_seconds // 60' "$OPTS")"
   export WATCH_CLASSIFY_SECONDS="$(jq -r '.watch_classify_seconds // 15' "$OPTS")"
