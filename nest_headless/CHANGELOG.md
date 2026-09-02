@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.10.0
+
+- Face identity (Hearth #2, second half). SCRFD (10g) detection + 5-point
+  alignment + ArcFace (w600k_r50) 512-d embeddings, hot-loaded from
+  `nest_models/identity/models/{scrfd_10g.onnx, arcface_w600k_r50.onnx}`
+  (InsightFace buffalo_l), ~45 ms per 1080p frame on CoreML. During a speech
+  capture the camera's frame is sampled at the wake moment and 1 s later;
+  `nest_headless_identity.faces` becomes `[{name|null, score, box, quality:
+  {size_px, det_score, reason}, matches: [{name, score}]}]`, largest first.
+  `name` is set at cosine >= 0.4 (same person here ~0.5-0.8, strangers
+  ~0.1-0.3); the top-3 is always included. `GET /identity/who/<camera>`
+  answers from one fresh frame. `POST /identity/face/enrol` {camera, name,
+  index?} enrols the face in view; refusals: `no_face`, `face_too_small`
+  (< 60 px, with `size_px`/`needed_px`), `multiple_faces` (lists candidates
+  with `index`). Embeddings as JSON under `nest_models/identity/<name>/`;
+  an aligned 112x112 crop only with `identity_keep_samples`.
+- `nest_headless_passage.person.matches` is filled from the face inside the
+  crossing person's box when one is visible.
+- `GET /identity` reports `face_samples` per person and `face_models`.
+
 ## 1.9.0
 
 - Passage zones (Hearth #7). `watch_passages` takes polygons drawn across

@@ -303,4 +303,4 @@ async function detectCats(jpegBuf, opts = {}) {
   });
 }
 
-module.exports = { detect, detectCats, classifyDoor, hasDoorModel, annotate, warmUp };
+module.exports = { detect, detectCats, classifyDoor, hasDoorModel, annotate, warmUp, decodeJpeg, ORT_OPTS };

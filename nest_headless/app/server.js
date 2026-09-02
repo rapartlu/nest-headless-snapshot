@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.9.0';
+const ADDON_VERSION = '1.10.0';
 
 const http = require('http');
 const fs = require('fs');
@@ -40,6 +40,7 @@ const fns = require('./pagefns');
 const { classify } = require('./classifier');
 const infer = require('./infer');
 const { parseWatchPassages, PassageTracker } = require('./passages');
+const faces = require('./faces');
 
 // ------------------------------------------------------------ configuration
 // HA config root: the supervisor mounts it at /homeassistant (or /config on
@@ -525,8 +526,22 @@ async function passageTick(entityId, mgr, frameBuf, now) {
     if (d === null) return;
     const persons = d.filter((x) => x.cls === 0), bags = d.filter((x) => x.cls !== 0);
     mgr.tracker = mgr.tracker || new PassageTracker(entityId, passages);
-    for (const ev of mgr.tracker.update(persons, bags, now)) {
-      console.log(`[nest_headless] PASSAGE ${ev.direction} ${ev.passage} on ${entityId} track ${ev.track_id} h=${ev.attributes.height_ratio} carrying=${ev.attributes.carrying}`);
+    const events = mgr.tracker.update(persons, bags, now);
+    if (!events.length) return;
+    // who: faces in this frame whose centre lies inside the crossing person's box (1.10.0)
+    let seen = [];
+    if (faces.hasModels(FACE_MODELS_DIR())) {
+      try {
+        const found = await faces.facesInJpeg(FACE_MODELS_DIR(), frameBuf, { minPx: 40 });
+        seen = (found || []).filter((f) => f.embedding).map((f) => ({ box: f.box, matches: matchFace(f.embedding) }));
+      } catch (e) { /* faces are a bonus */ }
+    }
+    for (const ev of events) {
+      const t = mgr.tracker.tracks.find((x) => x.id === ev.track_id);
+      const inBox = (f) => t && f.box.x + f.box.w / 2 > t.box.x && f.box.x + f.box.w / 2 < t.box.x + t.box.w && f.box.y + f.box.h / 2 > t.box.y && f.box.y + f.box.h / 2 < t.box.y + t.box.h;
+      const face = seen.find(inBox) || (seen.length === 1 && persons.length === 1 ? seen[0] : null);
+      if (face) ev.person = { matches: face.matches };
+      console.log(`[nest_headless] PASSAGE ${ev.direction} ${ev.passage} on ${entityId} track ${ev.track_id} h=${ev.attributes.height_ratio} carrying=${ev.attributes.carrying} who=${ev.person.matches[0] ? ev.person.matches[0].name + ':' + ev.person.matches[0].score : '-'}`);
       postHaEvent('nest_headless_passage', { entity_id: entityId, camera: entityId.replace(/^camera\./, ''), ...ev }).catch(() => {});
     }
   } catch (e) { console.warn(`[nest_headless] passage tick ${entityId} failed: ${e.message}`); }
@@ -809,22 +824,94 @@ function embedVoice(samples) {
 }
 const cosine = (a, b) => { let d = 0, na = 0, nb = 0; for (let i = 0; i < a.length; i++) { d += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; } return d / Math.sqrt(na * nb || 1); };
 // enrolled: { name: [ {embedding, file} ] } loaded from identity/<name>/voice-*.json
-let enrolled = null;
+// enrolledFaces: same shape from identity/<name>/face-*.json (ArcFace 512-d)
+let enrolled = null, enrolledFaces = {};
 function loadEnrolled() {
-  enrolled = {};
+  enrolled = {}; enrolledFaces = {};
   try {
     for (const name of fs.readdirSync(cfg.identityDir)) {
       const d = path.join(cfg.identityDir, name);
       if (name === 'models' || !fs.statSync(d).isDirectory()) continue;
-      const items = [];
+      const items = [], fitems = [];
       for (const f of fs.readdirSync(d)) {
-        if (!/^voice-.*\.json$/.test(f)) continue;
-        try { const j = JSON.parse(fs.readFileSync(path.join(d, f), 'utf8')); if (Array.isArray(j.embedding)) items.push({ embedding: j.embedding, file: f, at: j.at }); } catch (e) { /* skip */ }
+        const isVoice = /^voice-.*\.json$/.test(f), isFace = /^face-.*\.json$/.test(f);
+        if (!isVoice && !isFace) continue;
+        try { const j = JSON.parse(fs.readFileSync(path.join(d, f), 'utf8')); if (Array.isArray(j.embedding)) (isVoice ? items : fitems).push({ embedding: j.embedding, file: f, at: j.at }); } catch (e) { /* skip */ }
       }
       if (items.length) enrolled[name] = items;
+      if (fitems.length) enrolledFaces[name] = fitems;
     }
   } catch (e) { /* no identity dir yet */ }
   return enrolled;
+}
+const FACE_MODELS_DIR = () => path.join(cfg.identityDir, 'models');
+function matchFace(embedding) {
+  if (!enrolled) loadEnrolled();
+  const out = [];
+  for (const [name, items] of Object.entries(enrolledFaces)) {
+    const best = Math.max(...items.map((it) => faces.cosine(embedding, it.embedding)));
+    out.push({ name, score: Math.round(best * 1000) / 1000 });
+  }
+  return out.sort((a, b) => b.score - a.score).slice(0, 3);
+}
+// Faces in a fresh frame off the held stream: [{name|null, score, box, quality, matches}], largest first.
+// ArcFace cosine: same person on this camera ~0.5-0.8, strangers ~0.1-0.3; `name` is set at >= 0.4,
+// the full top-3 is always included so the brain can apply its own threshold.
+async function facesForCamera(entityId, { minPx = 40 } = {}) {
+  const mgr = watchMgr[entityId];
+  if (!mgr || !mgr.ready || !mgr.page) return { ok: false, reason: 'camera_not_watched', faces: [] };
+  if (!faces.hasModels(FACE_MODELS_DIR())) return { ok: false, reason: 'no_face_models', faces: [] };
+  const shot = await mgr.page.evaluate(fns.grabFrame, { quality: cfg.jpegQuality, crop: null });
+  const jpg = Buffer.from(shot.dataUrl.split(',')[1], 'base64');
+  const found = await faces.facesInJpeg(FACE_MODELS_DIR(), jpg, { minPx });
+  return { ok: true, faces: (found || []).map((f) => {
+    const matches = f.embedding ? matchFace(f.embedding) : [];
+    const top = matches[0] && matches[0].score >= 0.4 ? matches[0] : null;
+    return { name: top ? top.name : null, score: top ? top.score : null, box: { x: r4(f.box.x), y: r4(f.box.y), w: r4(f.box.w), h: r4(f.box.h) }, quality: f.quality, matches, _emb: f.embedding, _aligned: f.aligned };
+  }) };
+}
+const r4 = (v) => Math.round(v * 10000) / 10000;
+const publicFace = (f) => ({ name: f.name, score: f.score, box: f.box, quality: f.quality, matches: f.matches });
+// Sample faces during a speech capture: at the wake hit and ~1 s later; best (largest) per position.
+async function sampleFacesForCapture(entityId) {
+  const out = [];
+  try {
+    const a = await facesForCamera(entityId); out.push(...a.faces);
+    await new Promise((r) => setTimeout(r, 1000));
+    const b = await facesForCamera(entityId); out.push(...b.faces);
+  } catch (e) { /* stream hiccup */ }
+  // dedupe by box overlap: keep the larger of any two faces at the same spot
+  const keep = [];
+  for (const f of out.sort((x, y) => y.box.w * y.box.h - x.box.w * x.box.h)) {
+    if (!keep.some((k) => Math.abs(k.box.x - f.box.x) < 0.05 && Math.abs(k.box.y - f.box.y) < 0.05)) keep.push(f);
+  }
+  return keep.map(publicFace);
+}
+function enrolFace(name, entityId, found, index) {
+  if (!/^[a-z0-9_-]{1,32}$/i.test(name)) return { ok: false, accepted: false, reason: 'bad_name' };
+  if (!found.ok) return { ok: false, accepted: false, reason: found.reason };
+  const usable = found.faces.filter((f) => f._emb);
+  const sizes = found.faces.map((f) => f.quality.size_px);
+  if (!found.faces.length) return { ok: true, accepted: false, reason: 'no_face', faces: 0 };
+  if (!usable.length) return { ok: true, accepted: false, reason: 'face_too_small', size_px: Math.max(...sizes), needed_px: 60, faces: found.faces.length };
+  let pick = null;
+  if (Number.isInteger(index)) pick = usable[index] || null;
+  else if (usable.length === 1) pick = usable[0];
+  else return { ok: true, accepted: false, reason: 'multiple_faces', faces: usable.map((f, i) => ({ index: i, box: f.box, size_px: f.quality.size_px, matches: f.matches })) };
+  if (!pick) return { ok: true, accepted: false, reason: 'bad_index', faces: usable.length };
+  if (pick.quality.size_px < 60) return { ok: true, accepted: false, reason: 'face_too_small', size_px: pick.quality.size_px, needed_px: 60 };
+  const d = path.join(cfg.identityDir, name.toLowerCase());
+  fs.mkdirSync(d, { recursive: true });
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  fs.writeFileSync(path.join(d, `face-${ts}.json`), JSON.stringify({ at: new Date().toISOString(), camera: entityId, quality: pick.quality, box: pick.box, embedding: pick._emb }));
+  if (cfg.identityKeepSamples && pick._aligned) {
+    const rgba = Buffer.alloc(faces.ALIGN * faces.ALIGN * 4);
+    for (let i = 0; i < faces.ALIGN * faces.ALIGN; i++) { rgba[i * 4] = pick._aligned[i * 3]; rgba[i * 4 + 1] = pick._aligned[i * 3 + 1]; rgba[i * 4 + 2] = pick._aligned[i * 3 + 2]; rgba[i * 4 + 3] = 255; }
+    fs.writeFileSync(path.join(d, `face-${ts}.jpg`), require('jpeg-js').encode({ data: rgba, width: faces.ALIGN, height: faces.ALIGN }, 90).data);
+  }
+  loadEnrolled();
+  console.log(`[nest_headless] IDENTITY enrolled face for ${name.toLowerCase()} (${enrolledFaces[name.toLowerCase()].length} samples, ${pick.quality.size_px}px)`);
+  return { ok: true, accepted: true, quality: pick.quality, samples: enrolledFaces[name.toLowerCase()].length };
 }
 function matchVoice(embedding) {
   if (!enrolled) loadEnrolled();
@@ -892,10 +979,11 @@ function forgetPerson(name) {
 }
 function identitySummary() {
   if (!enrolled) loadEnrolled();
-  return { people: Object.entries(enrolled).map(([name, items]) => ({
-    name, voice_samples: items.length, face_samples: 0,
-    updated_at: items.map((i) => i.at).sort().pop() || null,
-  })) };
+  const names = new Set([...Object.keys(enrolled), ...Object.keys(enrolledFaces)]);
+  return { people: [...names].map((name) => ({
+    name, voice_samples: (enrolled[name] || []).length, face_samples: (enrolledFaces[name] || []).length,
+    updated_at: [...(enrolled[name] || []), ...(enrolledFaces[name] || [])].map((i) => i.at).sort().pop() || null,
+  })), face_models: faces.hasModels(FACE_MODELS_DIR()) };
 }
 function readJsonBody(req) {
   return new Promise((resolve) => {
@@ -930,6 +1018,8 @@ function startSpeechCapture(entityId, keyword, ring, opts = {}) {
     floor, phase: opts.followUp ? 'listen' : 'tail', tailQuietMs: 0, keepFrom: opts.followUp ? 0 : pre.length,
     listenT0: opts.followUp ? Date.now() : null, voicedMs: 0, silenceMs: 0,
     followUp: !!opts.followUp, giveUpMs: opts.giveUpMs || 0,
+    // faces at the wake moment (+1 s), in parallel with the capture; used by the identity event
+    facesPromise: faces.hasModels(FACE_MODELS_DIR()) ? sampleFacesForCapture(entityId) : null,
   };
 }
 // End-pointing (Hearth #3). The spotter fires mid-phrase ("hey cl..."), so
@@ -1110,9 +1200,10 @@ async function finishSpeechCapture(entityId, c, reason) {
   try {
     if (quality.reason === 'ok' || quality.speech_ms >= 800) u.embedding = embedVoice(all);
     const matches = u.embedding ? matchVoice(u.embedding) : [];
+    const seen = c.facesPromise ? await c.facesPromise.catch(() => []) : [];
     await postHaEvent('nest_headless_identity', {
       entity_id: entityId, camera: entityId.replace(/^camera\./, ''), utterance_id: utteranceId,
-      speaker: { quality, matches }, faces: [],
+      speaker: { quality, matches }, faces: seen,
     });
   } catch (e) { console.warn('[nest_headless] identity failed:', e.message); }
 }
@@ -1390,6 +1481,20 @@ const server = http.createServer(async (req, res) => {
       if (req.method === 'GET' && !parts[1]) {
         res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(identitySummary()));
       }
+      if (req.method === 'GET' && parts[1] === 'who' && parts[2]) {
+        // who is in view right now: one frame, faces matched against enrolled people
+        const r = await facesForCamera(cameraEntity(parts[2]));
+        res.writeHead(r.ok ? 200 : 404, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ok: r.ok, reason: r.reason, camera: parts[2], at: new Date().toISOString(), faces: r.faces.map(publicFace) }));
+      }
+      if (req.method === 'POST' && parts[1] === 'face' && parts[2] === 'enrol') {
+        const body = await readJsonBody(req);
+        const cam = body.camera ? cameraEntity(body.camera) : null;
+        if (!cam) { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, accepted: false, reason: 'no_camera' })); }
+        const found = await facesForCamera(cam, { minPx: 40 });
+        const r = enrolFace(String(body.name || ''), cam, found, Number.isInteger(body.index) ? body.index : undefined);
+        res.writeHead(r.ok ? 200 : 400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(r));
+      }
       if (req.method === 'POST' && parts[1] === 'voice' && parts[2] === 'enrol') {
         const body = await readJsonBody(req);
         const cam = body.camera ? cameraEntity(body.camera) : null;
@@ -1469,6 +1574,7 @@ const server = http.createServer(async (req, res) => {
 server.listen(cfg.port, () => {
   console.log(`[nest_headless] listening on :${cfg.port}`);
   infer.warmUp().then((ms) => console.log(`[nest_headless] vision models warm in ${ms} ms`)).catch((e) => console.warn('[nest_headless] warm-up failed:', e.message));
+  if (faces.hasModels(FACE_MODELS_DIR())) faces.getSessions(FACE_MODELS_DIR()).catch(() => {});
   for (const [entityId, interval] of Object.entries(cfg.watches)) {
     runWatch(entityId, interval).catch((e) => console.error(`[nest_headless] watch ${entityId} crashed:`, e.message));
   }
