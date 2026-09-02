@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.8.8
+
+- `wake_confirmed` on `nest_headless_speech`: the pre-roll is always given to
+  the recogniser and the flag says whether it heard the wake phrase there.
+  The spotter is deliberately eager and fires on ordinary talk now and then;
+  an unconfirmed capture is still sent (the brain decides) but is cheap to
+  discard. The wake phrase is stripped from the transcript as before.
+
 ## 1.8.7
 
 - Once speech has been heard, "quiet" is judged relative to that speech

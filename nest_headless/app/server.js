@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.8.7';
+const ADDON_VERSION = '1.8.8';
 
 const http = require('http');
 const fs = require('fs');
@@ -915,7 +915,7 @@ function feedSpeechCapture(entityId, chunk) {
   if (c.phase === 'tail') {
     const voiced = rms > c.floor;
     c.tailQuietMs = voiced ? 0 : c.tailQuietMs + ms;
-    if (c.tailQuietMs >= TAIL_GAP_MS) { c.phase = 'listen'; c.keepFrom = c.chunks.length; c.listenT0 = Date.now(); }
+    if (c.tailQuietMs >= TAIL_GAP_MS) { c.phase = 'listen'; c.keepFrom = 0; c.listenT0 = Date.now(); }   // keep the pre-roll: Whisper confirms the wake phrase from it, then it is stripped
     else if (elapsed >= TAIL_MAX_MS) { c.phase = 'listen'; c.keepFrom = 0; c.listenT0 = Date.now(); c.voicedMs = TAIL_MAX_MS; c.peakRms = rms; }   // ran straight on: keep the pre-roll (the question started in it) and count the run-on as speech already
     else if (elapsed >= cfg.speechMaxSeconds * 1000) reason = 'no_speech';
     if (!reason) return;
@@ -983,7 +983,7 @@ function whisperServer(samples) {
     req.end(body);
   });
 }
-const WAKE_NAMES = 'claude|claud|clawed|claws|clause|cloud|clod|clawd|god|kitchen';
+const WAKE_NAMES = 'claude|claud|clawed|claws|clause|cloud|cloudy|clod|clawd|klaud|klaus|clyde|cord|god|kitchen';
 const WAKE_RE = new RegExp(`^[\\s\\S]*?\\b(?:hey|hi|ok|okay)[,.!?]?\\s+(?:${WAKE_NAMES})\\b[,.!?]*\\s*`, 'i');
 // pre-roll cut mid-phrase: transcript starts with the bare name ("clawed, is the...")
 const WAKE_HEAD_RE = new RegExp(`^\\W*(?:${WAKE_NAMES})\\b[,.!?]*\\s*`, 'i');
@@ -1031,19 +1031,26 @@ async function finishSpeechCapture(entityId, c, reason) {
     text = ((r && r.text) || '').trim().toLowerCase();
   }
   const sttMs = Date.now() - tStt;
+  // The spotter is deliberately eager (threshold 0.12) and fires on ordinary
+  // talk now and then; Whisper hearing the wake phrase in the pre-roll is
+  // the second opinion. Unconfirmed captures are still sent - the brain
+  // decides - but flagged, so an 8 s ramble after a false wake is cheap to
+  // discard.
+  const wakeConfirmed = !!text && (WAKE_RE.test(text) || WAKE_HEAD_RE.test(text));
   text = stripWakePhrase(text);
   // Whisper's stage directions - "(baby crying)", "[inaudible]", "(background
   // noise drowns out speaker)" - are not something the brain should parse.
   if (text && /^[\s(\[][^A-Za-z0-9]*[^()\[\]]*[)\]]\W*$/.test(text) && !/[a-z]{2,}\s+[a-z]{2,}.*[a-z]/i.test(text.replace(/[(\[][^)\]]*[)\]]/g, ''))) { text = ''; reason = 'unclear'; }
   const durationMs = Math.round(total / 16);
   const utteranceId = `${entityId.replace(/^camera\./, '')}-${c.t0}`;
-  console.log(`[nest_headless] SPEECH "${text}" on ${entityId} (${durationMs} ms, ${reason}, ${stt ? stt.engine : 'no-stt'} ${sttMs} ms)`);
+  console.log(`[nest_headless] SPEECH "${text}" on ${entityId} (${durationMs} ms, ${reason}, ${stt ? stt.engine : 'no-stt'} ${sttMs} ms, wake ${wakeConfirmed ? 'confirmed' : 'unconfirmed'})`);
   await postHaEvent('nest_headless_speech', {
     entity_id: entityId, camera: entityId.replace(/^camera\./, ''), keyword: c.keyword,
     utterance_id: utteranceId,
     text, duration_ms: durationMs, started_at: c.startedAt.toISOString(), ended_at: endedAt.toISOString(),
     reason: text ? reason : (reason === 'no_speech' ? 'no_speech' : reason),
     engine: stt ? stt.engine : null, stt_ms: sttMs, final: true,
+    wake_confirmed: wakeConfirmed,   // Whisper heard the wake phrase in the pre-roll (false = likely a spotter false alarm)
     // raw 16 kHz mono WAV, memory-held for 90 s, for a stronger recogniser on the brain
     audio_path: `/utterance/${utteranceId}.wav`, audio_ttl_s: 90,
   });
