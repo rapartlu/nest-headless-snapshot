@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.8.9';
+const ADDON_VERSION = '1.8.10';
 
 const http = require('http');
 const fs = require('fs');
@@ -998,10 +998,12 @@ const WAKE_RE = new RegExp(`^[\\s\\S]*?\\b(?:hey|hi|ok|okay)[,.!?]?\\s+(?:${WAKE
 // pre-roll cut mid-phrase: transcript starts with the bare name ("clawed, is the...")
 const WAKE_HEAD_RE = new RegExp(`^\\W*(?:${WAKE_NAMES})\\b[,.!?]*\\s*`, 'i');
 function stripWakePhrase(t) {
-  const m = WAKE_RE.exec(t) || WAKE_HEAD_RE.exec(t);
-  if (!m) return t;
-  const rest = t.slice(m[0].length).trim();
-  return rest.length ? rest : '';
+  for (let i = 0; i < 3; i++) {   // "hey claude, hey claude, ..." - strip repeats too
+    const m = WAKE_RE.exec(t) || WAKE_HEAD_RE.exec(t);
+    if (!m) break;
+    t = t.slice(m[0].length).trim();
+  }
+  return t;
 }
 async function finishSpeechCapture(entityId, c, reason) {
   if (c.followUp && reason === 'no_speech') {   // nobody replied: no event at all (Hearth #4)
@@ -1115,7 +1117,19 @@ function onAudioChunk(entityId, b64, sampleRate) {
     st.ring.push(Float32Array.from(f32));
     while (st.ring.length > 32) st.ring.shift();   // ~8s at 250ms chunks
     feedSpeechCapture(entityId, f32);
-    st.s.acceptWaveform({ samples: f32, sampleRate: 16000 });
+    // Light AGC for the spotter only (the ring keeps raw audio; utterances
+    // are normalised separately for the recogniser): a wake phrase from the
+    // far side of the kitchen arrives at peak 0.05-0.1 and the small model
+    // misses it; scaled to a recent-peak target of 0.5 (gain <= 8x) it does
+    // not. False wakes this invites are caught downstream by wake_confirmed.
+    let pk = 0;
+    for (let i = 0; i < f32.length; i++) { const a = Math.abs(f32[i]); if (a > pk) pk = a; }
+    st.peaks = st.peaks || [];
+    st.peaks.push(pk); while (st.peaks.length > 8) st.peaks.shift();   // ~2 s window
+    const recentPeak = Math.max(...st.peaks, 0.02);
+    const g = Math.min(8, Math.max(1, 0.5 / recentPeak));
+    const spot = g > 1.05 ? Float32Array.from(f32, (v) => Math.max(-1, Math.min(1, v * g))) : f32;
+    st.s.acceptWaveform({ samples: spot, sampleRate: 16000 });
     while (k.spotter.isReady(st.s)) {
       k.spotter.decode(st.s);
       const r = k.spotter.getResult(st.s);
