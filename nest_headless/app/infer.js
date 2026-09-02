@@ -204,7 +204,22 @@ function annotate(jpegBuf, dets, rois = [], { quality = 85 } = {}) {
       for (let y = y0; y <= y1; y++) { px(x0 + k, y, r, g, b); px(x1 - k, y, r, g, b); }
     }
   };
-  for (const r of rois) rect(r.x, r.y, r.w, r.h, 255, 210, 0, 2);          // regions: yellow
+  const line = (xa, ya, xb, yb, r, g, b, t) => {
+    const steps = Math.max(Math.abs(xb - xa), Math.abs(yb - ya)) | 0;
+    for (let i = 0; i <= steps; i++) {
+      const x = Math.round(xa + (xb - xa) * i / (steps || 1));
+      const y = Math.round(ya + (yb - ya) * i / (steps || 1));
+      for (let k = -((t / 2) | 0); k <= (t / 2) | 0; k++) { px(x + k, y, r, g, b); px(x, y + k, r, g, b); }
+    }
+  };
+  for (const r of rois) {
+    if (r.pts) {                                    // polygon zone
+      for (let i = 0; i < r.pts.length; i++) {
+        const a = r.pts[i], b2 = r.pts[(i + 1) % r.pts.length];
+        line(a[0] * W, a[1] * H, b2[0] * W, b2[1] * H, 255, 210, 0, 3);
+      }
+    } else rect(r.x, r.y, r.w, r.h, 255, 210, 0, 2); // legacy rect zone
+  }
   for (const x of dets || []) {
     const animal = x.cls === 15 || x.cls === 16;
     rect(x.box.x, x.box.y, x.box.w, x.box.h, animal ? 255 : 90, animal ? 40 : 200, animal ? 60 : 255, animal ? 6 : 3);

@@ -106,6 +106,17 @@ function parseWatchRois(spec) {
       let name = 'roi' + (i + 1), rest = box;
       const at = box.indexOf('@');
       if (at > 0) { name = box.slice(0, at); rest = box.slice(at + 1); }
+      // Polygon zones: "x1,y1:x2,y2:x3,y3..." (>=3 comma pairs). Rectangles
+      // keep the original "x:y:w:h". Perspective makes rectangles bleed onto
+      // the floor behind surfaces; polygons trace the actual counter edges.
+      if (rest.includes(',')) {
+        const pts = rest.split(':').map((pair) => pair.split(',').map(Number))
+          .filter((q) => q.length === 2 && q.every(Number.isFinite));
+        if (pts.length < 3) return { name, x: 0, y: 0, w: 0, h: 0 };
+        const xs = pts.map((q) => q[0]), ys = pts.map((q) => q[1]);
+        const x = Math.min(...xs), y = Math.min(...ys);
+        return { name, pts, x, y, w: Math.max(...xs) - x, h: Math.max(...ys) - y };
+      }
       const [x, y, w, h] = rest.split(':').map(Number);
       return { name, x, y, w, h };
     }).filter((r) => r.w > 0 && r.h > 0);
@@ -458,8 +469,13 @@ async function watchHit(entityId, payload) {
   // resolution for its first seconds, which diffs like motion (fired a
   // phantom deterrent 6s after a restart). Ignore hits until it settles.
   if (now - (mgr.readySinceMs || 0) < 45000) return;
-  if (now - mgr.lastHitMs < cfg.watchCooldownSeconds * 1000) return;
-  mgr.lastHitMs = now;
+  // Detection PACING, not the alert cooldown: the old shared 60s cooldown
+  // gated detection itself, so any motion (a person passing) blinded the
+  // zone check for the next minute - a cat could land and go unseen. Local
+  // inference is free; look every 8s whenever motion is present, and keep
+  // watch_cooldown_seconds solely for throttling repeat ALERTS below.
+  if (now - (mgr.lastDetectMs || 0) < 8000) return;
+  mgr.lastDetectMs = now;
   mgr.hits = (mgr.hits || 0) + 1;
   if (payload.meanLuma < 3) return; // black frame, nothing to see
   await persistShot(entityId, payload);
@@ -481,6 +497,8 @@ async function watchHit(entityId, payload) {
   const verdict = cat;
   console.log(`[nest_headless] watch hit ${entityId} roi=${payload.roi} changed=${payload.changedPct}% cat=${verdict} dets=${dets ? dets.map((x) => x.name + ':' + x.conf).join(',') : 'n/a'}`);
   if (verdict === false) return;
+  if (now - mgr.lastHitMs < cfg.watchCooldownSeconds * 1000) return; // alert repeat throttle
+  mgr.lastHitMs = now;
   await postHaEvent('nest_headless_surface_activity', {
     entity_id: entityId,
     camera: entityId.replace(/^camera\./, ''),
@@ -556,7 +574,20 @@ async function catOnSurface(entityId, frameBuf) {
       // placement: the animal's feet (box bottom-centre) must be on a
       // watched surface, not the floor behind it
       const fx = x.box.x + x.box.w / 2, fy = x.box.y + x.box.h;
-      const r = rois.find((r) => fx >= r.x && fx <= r.x + r.w && fy >= r.y - 0.02 && fy <= r.y + r.h + 0.04);
+      const inPoly = (pts, px2, py2) => {
+        let inside = false;
+        for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+          const [xi, yi] = pts[i], [xj, yj] = pts[j];
+          if ((yi > py2) !== (yj > py2) && px2 < ((xj - xi) * (py2 - yi)) / (yj - yi) + xi) inside = !inside;
+        }
+        return inside;
+      };
+      const onZone = (r) => r.pts
+        // same vertical tolerance the rect check had: feet may render a
+        // touch below the surface edge (+0.04) or above it (-0.02)
+        ? (inPoly(r.pts, fx, fy) || inPoly(r.pts, fx, fy - 0.04) || inPoly(r.pts, fx, fy + 0.02))
+        : (fx >= r.x && fx <= r.x + r.w && fy >= r.y - 0.02 && fy <= r.y + r.h + 0.04);
+      const r = rois.find(onZone);
       dets.push({ ...x, roi: r ? r.name : null });
       if (r && (x.cls === 15 || x.cls === 16)) cat = true;
     }

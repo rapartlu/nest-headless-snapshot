@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.5.9
+
+- Detection latency is now bounded at ~6-10s from animal-on-surface to
+  event, regardless of prior activity: the watch cooldown used to gate
+  DETECTION (any motion blinded the zone check for the next 60s - a person
+  passing 30s before the cat meant the cat went unseen). Detection now
+  paces at 8s whenever motion is present; `watch_cooldown_seconds` throttles
+  only repeat alerts.
+
+## 1.5.8
+
+- Polygon zones: `watch_rois` accepts `name@x1,y1:x2,y2:x3,y3...` alongside
+  the rectangular `name@x:y:w:h`. Motion is masked to the drawn shape, the
+  feet-on-surface test ray-casts the polygon, and alert annotations draw
+  the true outline. Rectangles bleed onto the floor behind counters under
+  camera perspective; polygons trace the actual surface edges.
+
 ## 1.5.7
 
 - Cat detection runs FULL-FRAME, the way the house model was trained. The

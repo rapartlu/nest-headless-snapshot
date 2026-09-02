@@ -183,6 +183,25 @@ const startWatchLoop = ({ intervalMs = 4000, rois = [], diffPct = 4, quality = 0
   c.width = W; c.height = H;
   const ctx = c.getContext('2d', { willReadFrequently: true });
   let prev = null;
+  // Polygon zones: precompute a coverage mask per ROI once (ray-cast per
+  // pixel of the 320x180 grid) so the diff loop only counts motion inside
+  // the drawn shape, not the whole bounding box.
+  const inPoly = (pts, px2, py2) => {
+    let inside = false;
+    for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+      const xi = pts[i][0], yi = pts[i][1], xj = pts[j][0], yj = pts[j][1];
+      if ((yi > py2) !== (yj > py2) && px2 < ((xj - xi) * (py2 - yi)) / (yj - yi) + xi) inside = !inside;
+    }
+    return inside;
+  };
+  for (const r of rois) {
+    if (r.pts) {
+      r.mask = new Uint8Array(W * H);
+      for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+        if (inPoly(r.pts, (x + 0.5) / W, (y + 0.5) / H)) r.mask[y * W + x] = 1;
+      }
+    }
+  }
   window.__watchTicks = 0;
   window.__watchTimer = setInterval(() => {
     try {
@@ -204,6 +223,7 @@ const startWatchLoop = ({ intervalMs = 4000, rois = [], diffPct = 4, quality = 0
           let changed = 0, total = 0;
           for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
             const i = y * W + x;
+            if (r.mask && !r.mask[i]) continue;   // outside the polygon
             total++;
             if (Math.abs(g[i] - prev[i]) > 22) changed++;
           }
