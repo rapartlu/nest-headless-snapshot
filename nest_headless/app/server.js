@@ -837,7 +837,12 @@ function writeWav16k(file, samples) {
 function enrolVoice(name, u) {
   if (!/^[a-z0-9_-]{1,32}$/i.test(name)) return { ok: false, accepted: false, reason: 'bad_name' };
   if (!u) return { ok: false, accepted: false, reason: 'no_utterance' };
-  if (u.quality.reason !== 'ok') return { ok: true, accepted: false, quality: u.quality, reason: u.quality.reason, samples: (enrolled && enrolled[name] || []).length };
+  if (u.quality.reason !== 'ok') {
+    // measured numbers alongside the reason so the brain can coach ("that was two seconds, I need about four")
+    return { ok: true, accepted: false, quality: u.quality, reason: u.quality.reason,
+      speech_ms: u.quality.speech_ms, rms: u.quality.rms, needed_speech_ms: 2000,
+      samples: (enrolled && enrolled[name] || []).length };
+  }
   const emb = u.embedding || embedVoice(u.samples);
   if (!emb) return { ok: false, accepted: false, reason: 'no_model' };
   const d = path.join(cfg.identityDir, name.toLowerCase());
