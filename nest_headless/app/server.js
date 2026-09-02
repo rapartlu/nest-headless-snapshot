@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.8.10';
+const ADDON_VERSION = '1.8.11';
 
 const http = require('http');
 const fs = require('fs');
@@ -237,6 +237,7 @@ let browserPromise = null;
 // (supervisor watchdog) is what restores the split.
 const INFERENCE_NICE = 10;
 function setInferencePriority(low) {
+  if (os.cpus().length >= 6) return;   // plenty of cores (the Mac): everything runs at normal priority, in parallel
   const cur = os.getPriority();
   const want = low ? Math.max(cur, INFERENCE_NICE) : cur;   // never try to go lower: EACCES
   if (want === cur) return;
