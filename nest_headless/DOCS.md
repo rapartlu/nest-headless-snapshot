@@ -263,3 +263,18 @@ token set, `POST /inference` from anywhere except loopback requires
 `Authorization: Bearer <token>`; `/health` stays open; the add-on on the same
 host keeps using loopback without one. Keep the token out of the plist by
 using `WHISPER_TOKEN_FILE`.
+
+### House Voice: Kokoro text-to-speech on the Mac (MLX)
+
+`host/tts_server.py` runs Kokoro-82M (British voices) on Apple MLX next to
+the Whisper server: `GET /health`, `GET /voices`, `POST /speak` with JSON
+`{"text", "voice", "speed"}` returning 24 kHz mono 16-bit WAV. A 15-word
+reply synthesises in ~0.2 s on an M3 Pro. Same LAN posture as the Whisper
+server: `BIND`, `TTS_TOKEN` / `TTS_TOKEN_FILE` (bearer token required for
+`/speak` off-loopback), default port 8179, voices via `TTS_VOICES`, default
+voice `TTS_VOICE`.
+
+```sh
+~/.config/nest_headless/venv/bin/pip install mlx-audio "misaki[en]"
+TTS_VOICE=bf_emma PORT=8179 ~/.config/nest_headless/venv/bin/python host/tts_server.py
+```
