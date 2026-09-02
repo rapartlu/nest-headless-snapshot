@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.10.1';
+const ADDON_VERSION = '1.10.2';
 
 const http = require('http');
 const fs = require('fs');
@@ -866,18 +866,21 @@ function matchFace(embedding) {
 // Faces in a fresh frame off the held stream: [{name|null, score, box, quality, matches}], largest first.
 // ArcFace cosine: same person on this camera ~0.5-0.8, strangers ~0.1-0.3; `name` is set at >= 0.4,
 // the full top-3 is always included so the brain can apply its own threshold.
-async function facesForCamera(entityId, { minPx = 40 } = {}) {
-  const mgr = watchMgr[entityId];
-  if (!mgr || !mgr.ready || !mgr.page) return { ok: false, reason: 'camera_not_watched', faces: [] };
+async function facesInBuffer(jpg, { minPx = 40 } = {}) {
   if (!faces.hasModels(FACE_MODELS_DIR())) return { ok: false, reason: 'no_face_models', faces: [] };
-  const shot = await mgr.page.evaluate(fns.grabFrame, { quality: cfg.jpegQuality, crop: null });
-  const jpg = Buffer.from(shot.dataUrl.split(',')[1], 'base64');
   const found = await faces.facesInJpeg(FACE_MODELS_DIR(), jpg, { minPx });
   return { ok: true, faces: (found || []).map((f) => {
     const matches = f.embedding ? matchFace(f.embedding) : [];
     const top = matches[0] && matches[0].score >= 0.4 ? matches[0] : null;
     return { name: top ? top.name : null, score: top ? top.score : null, box: { x: r4(f.box.x), y: r4(f.box.y), w: r4(f.box.w), h: r4(f.box.h) }, quality: f.quality, matches, _emb: f.embedding, _aligned: f.aligned };
   }) };
+}
+async function facesForCamera(entityId, { minPx = 40 } = {}) {
+  const mgr = watchMgr[entityId];
+  if (!mgr || !mgr.ready || !mgr.page) return { ok: false, reason: 'camera_not_watched', faces: [] };
+  if (!faces.hasModels(FACE_MODELS_DIR())) return { ok: false, reason: 'no_face_models', faces: [] };
+  const shot = await mgr.page.evaluate(fns.grabFrame, { quality: cfg.jpegQuality, crop: null });
+  return facesInBuffer(Buffer.from(shot.dataUrl.split(',')[1], 'base64'), { minPx });
 }
 const r4 = (v) => Math.round(v * 10000) / 10000;
 const publicFace = (f) => ({ name: f.name, score: f.score, box: f.box, quality: f.quality, matches: f.matches });
@@ -996,7 +999,7 @@ function identitySummary() {
 }
 function readJsonBody(req) {
   return new Promise((resolve) => {
-    let b = ''; req.on('data', (c) => { b += c; if (b.length > 1e6) req.destroy(); });
+    let b = ''; req.on('data', (c) => { b += c; if (b.length > 8e6) req.destroy(); });   // 8 MB: room for a base64 1080p JPEG
     req.on('end', () => { try { resolve(b ? JSON.parse(b) : {}); } catch (e) { resolve({}); } });
   });
 }
@@ -1499,9 +1502,17 @@ const server = http.createServer(async (req, res) => {
       if (req.method === 'POST' && parts[1] === 'face' && parts[2] === 'enrol') {
         const body = await readJsonBody(req);
         const cam = body.camera ? cameraEntity(body.camera) : null;
-        if (!cam) { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, accepted: false, reason: 'no_camera' })); }
-        const found = await facesForCamera(cam, { minPx: 40 });
-        const r = enrolFace(String(body.name || ''), cam, found, Number.isInteger(body.index) ? body.index : undefined);
+        // Hearth #9: a supplied image (JSON image_b64) instead of a live frame - for a frame the
+        // brain already holds and the owner has identified. Same detector, rules, refusals, storage.
+        let found;
+        if (body.image_b64) {
+          const jpg = Buffer.from(String(body.image_b64).replace(/^data:[^,]*,/, ''), 'base64');
+          if (jpg.length < 100) { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, accepted: false, reason: 'bad_image' })); }
+          found = await facesInBuffer(jpg, { minPx: 40 }).catch((e) => ({ ok: false, reason: 'bad_image: ' + e.message, faces: [] }));
+        } else if (cam) {
+          found = await facesForCamera(cam, { minPx: 40 });
+        } else { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, accepted: false, reason: 'no_camera_or_image' })); }
+        const r = enrolFace(String(body.name || ''), cam || 'upload', found, Number.isInteger(body.index) ? body.index : undefined);
         res.writeHead(r.ok ? 200 : 400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(r));
       }
       if (req.method === 'POST' && parts[1] === 'voice' && parts[2] === 'enrol') {

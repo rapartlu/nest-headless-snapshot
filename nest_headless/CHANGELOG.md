@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.10.2
+
+- `POST /identity/face/enrol` accepts a supplied image (Hearth #9): JSON
+  `{name, image_b64, index?}` (a data URL prefix is tolerated) enrols from
+  a frame the brain already holds instead of a live grab; `camera` becomes
+  optional. Same detector, size rule, refusals and storage; `bad_image` for
+  undecodable input. JSON bodies up to 8 MB.
+
 ## 1.10.1
 
 - Classifier health made explicit (Hearth #8): `classifier.state` is `ok`,
