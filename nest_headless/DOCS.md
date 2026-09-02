@@ -227,8 +227,12 @@ Example `~/Library/LaunchAgents/com.example.nest-headless.plist`:
     <key>LOG_FILE</key><string>/Users/you/Library/Logs/nest_headless.log</string>
   </dict>
   <key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>10</integer>
+  <key>ProcessType</key><string>Interactive</string>
 </dict></plist>
 ```
 
-Load with `launchctl bootstrap gui/$(id -u) <plist>`; the service answers on
+`ProcessType: Interactive` matters: without it macOS App Nap throttles the
+windowless Chrome and the audio tap delivers ~40% of real time (measured
+1.7 chunks/s instead of 4), which silently breaks keyword spotting and
+starves speech captures. Load with `launchctl bootstrap gui/$(id -u) <plist>`; the service answers on
 `http://127.0.0.1:8098/` and the consumers (Hearth) should use that address.
