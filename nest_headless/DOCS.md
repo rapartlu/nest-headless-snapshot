@@ -256,3 +256,10 @@ Then `"stt_url": "http://127.0.0.1:8178"` in the options file and restart the
 add-on. Run it under launchd like the add-on (KeepAlive, ProcessType
 Interactive). Audio goes over loopback only and is never written to disk;
 the add-on falls back to the in-process model whenever the server is down.
+
+**Serving the LAN (HA Assist, phones):** `BIND=0.0.0.0` and either
+`WHISPER_TOKEN=<secret>` or `WHISPER_TOKEN_FILE=<path>` (mode 600). With a
+token set, `POST /inference` from anywhere except loopback requires
+`Authorization: Bearer <token>`; `/health` stays open; the add-on on the same
+host keeps using loopback without one. Keep the token out of the plist by
+using `WHISPER_TOKEN_FILE`.

@@ -16,6 +16,13 @@ import mlx_whisper
 
 MODEL = os.environ.get('WHISPER_MODEL', 'mlx-community/whisper-large-v3-turbo')
 PORT = int(os.environ.get('PORT', '8178'))
+BIND = os.environ.get('BIND', '127.0.0.1')          # 0.0.0.0 to serve the LAN (HA Assist, phones)
+TOKEN = os.environ.get('WHISPER_TOKEN', '').strip()  # when set, /inference from anywhere but loopback needs Authorization: Bearer <token>
+if not TOKEN and os.environ.get('WHISPER_TOKEN_FILE'):
+    try:
+        TOKEN = open(os.environ['WHISPER_TOKEN_FILE']).read().strip()
+    except OSError:
+        TOKEN = ''
 
 
 def wav_to_float32(data: bytes) -> np.ndarray:
@@ -66,6 +73,10 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.path.startswith('/inference'):
             return self._json(404, {'error': 'not found'})
+        if TOKEN and self.client_address[0] not in ('127.0.0.1', '::1'):
+            auth = self.headers.get('Authorization', '')
+            if auth != f'Bearer {TOKEN}':
+                return self._json(401, {'error': 'unauthorized'})
         try:
             ctype, pdict = cgi.parse_header(self.headers.get('Content-Type', ''))
             if ctype != 'multipart/form-data':
@@ -91,5 +102,5 @@ if __name__ == '__main__':
     # warm the model once so the first real utterance is not slow
     t0 = time.time()
     mlx_whisper.transcribe(np.zeros(16000, dtype=np.float32), path_or_hf_repo=MODEL, language='en', fp16=True)
-    sys.stdout.write(f'model {MODEL} ready in {time.time()-t0:.1f}s; listening on 127.0.0.1:{PORT}\n'); sys.stdout.flush()
-    ThreadingHTTPServer(('127.0.0.1', PORT), H).serve_forever()
+    sys.stdout.write(f'model {MODEL} ready in {time.time()-t0:.1f}s; listening on {BIND}:{PORT} (token {"on" if TOKEN else "off"})\n'); sys.stdout.flush()
+    ThreadingHTTPServer((BIND, PORT), H).serve_forever()
