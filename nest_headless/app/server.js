@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.10.0';
+const ADDON_VERSION = '1.10.1';
 
 const http = require('http');
 const fs = require('fs');
@@ -361,18 +361,26 @@ async function persistShot(entityId, shot) {
           console.warn(`[nest_headless] onnx classify ${entityId} failed: ${e.message}`); return null;
         });
         if (cnn) {
-          const framingOk = verdict ? verdict.framingOk : undefined;
-          verdict = {
-            ...cnn,
-            ...(verdict && verdict.refCorr !== undefined ? { refCorr: verdict.refCorr, framingOk } : {}),
-            // The CNN's verdict stands on its own: a WIDE-open door occludes
-            // the reference region and tanks refCorr, so the framing veto
-            // muted the exact state this classifier exists to catch (score
-            // 1.00 suppressed for over an hour on 2026-08-31). refCorr stays
-            // in the meta as a camera-moved telltale for humans; only the
-            // linear engine still needs the gate.
-            positive: cnn.positive,
-          };
+          // The CNN's verdict stands on its own: a WIDE-open door occludes
+          // the linear model's reference region and tanks refCorr, so the
+          // framing veto muted the exact state this classifier exists to
+          // catch (score 1.00 suppressed for over an hour on 2026-08-31).
+          // The linear reference also predates the laser-slice crop, so its
+          // framingOk is stale noise here (Hearth #8): not reported.
+          verdict = { ...cnn, positive: cnn.positive };
+        }
+      }
+      // Explicit health for consumers (Hearth #8): ok | dark | framing_drift
+      // (framing_drift only means something for the linear engine's gate).
+      if (verdict) {
+        verdict.state = shot.meanLuma < 3 ? 'dark' : (verdict.engine !== 'onnx' && verdict.framingOk === false ? 'framing_drift' : 'ok');
+        const prev = classifierState[entityId];
+        if (prev !== verdict.state) {
+          classifierState[entityId] = verdict.state;
+          if (prev !== undefined) {
+            console.log(`[nest_headless] classifier state ${entityId}: ${prev} -> ${verdict.state}`);
+            postHaEvent('nest_headless_health', { entity_id: entityId, camera: entityId.replace(/^camera\./, ''), classifier_state: verdict.state, previous: prev }).catch(() => {});
+          }
         }
       }
     }
@@ -483,6 +491,7 @@ async function captureCoalesced(entityId) {
 
 // ------------------------------------------------------------ watch mode
 const watchMgr = {}; // entityId -> { page, ready, hits, lastHitMs, startedAt, lastError }
+const classifierState = {}; // entityId -> 'ok' | 'dark' | 'framing_drift' (last reported, for nest_headless_health)
 
 async function watchGrab(entityId) {
   const mgr = watchMgr[entityId];

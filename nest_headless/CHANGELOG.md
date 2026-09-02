@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.10.1
+
+- Classifier health made explicit (Hearth #8): `classifier.state` is `ok`,
+  `dark` (mean luma < 3) or `framing_drift` (linear engine's reference gate
+  only), and `nest_headless_health` {camera, classifier_state, previous}
+  fires when it changes. The ONNX door verdict no longer carries the linear
+  model's `framingOk`/`refCorr`: that reference predates the laser-slice crop,
+  so it read `false` permanently while meaning nothing for the CNN.
+
 ## 1.10.0
 
 - Face identity (Hearth #2, second half). SCRFD (10g) detection + 5-point
