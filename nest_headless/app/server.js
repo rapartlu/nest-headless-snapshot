@@ -28,11 +28,12 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.7.0';
+const ADDON_VERSION = '1.8.1';
 
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const WebSocket = require('ws');
 const puppeteer = require('puppeteer-core');
 const fns = require('./pagefns');
@@ -97,6 +98,10 @@ const cfg = {
   speechSilenceMs: intEnv('SPEECH_SILENCE_MS', 800),
   speechMaxSeconds: intEnv('SPEECH_MAX_SECONDS', 8),
   sttModelDir: process.env.STT_MODEL_DIR || (fs.existsSync('/homeassistant') ? '/homeassistant/nest_models/stt' : '/config/nest_models/stt'),
+  // Voice identity: embeddings + enrolments under <config>/nest_models/identity/.
+  // Raw enrolment WAVs are kept only when identity_keep_samples is on.
+  identityDir: (fs.existsSync('/homeassistant') ? '/homeassistant/nest_models/identity' : '/config/nest_models/identity'),
+  identityKeepSamples: (process.env.IDENTITY_KEEP_SAMPLES || 'false') === 'true',
 };
 
 function parseWatches(spec) {
@@ -212,8 +217,17 @@ function haOfferSession(entityId, offerSdp, { onAnswer, onCandidate, onError }) 
 
 // ------------------------------------------------------------ browser
 let browserPromise = null;
+// Inference (onnxruntime, sherpa) runs in this process and can saturate the
+// NAS; Chromium's WebRTC audio/network threads must always win that contention
+// or the received audio gaps (jitter-buffer expand) and keyword spotting dies.
+// Chromium is spawned at nice 0, then this process lowers itself to nice 10.
+const INFERENCE_NICE = 10;
+function setInferencePriority(low) {
+  try { os.setPriority(low ? INFERENCE_NICE : 0); } catch (e) { console.warn('[nest_headless] setPriority failed:', e.message); }
+}
 async function getBrowser() {
   if (!browserPromise) {
+    setInferencePriority(false);
     browserPromise = puppeteer.launch({
       executablePath: cfg.chromiumPath,
       headless: 'new',
@@ -228,6 +242,8 @@ async function getBrowser() {
       ],
     }).then(async (b) => {
       b.on('disconnected', () => { browserPromise = null; });
+      setInferencePriority(true);
+      console.log(`[nest_headless] chromium pid ${b.process() ? b.process().pid : '?'} at nice 0; node now nice ${os.getPriority()} (${os.cpus().length} cpus)`);
       // log codec support once — H.264 must be present for Nest
       const p = await b.newPage();
       const codecs = await p.evaluate(fns.videoCodecs);
@@ -688,6 +704,123 @@ function getStt() {
   return sttCtx;
 }
 
+// ------------------------------------------------------------ voice identity
+// Speaker embeddings (sherpa-onnx SpeakerEmbeddingExtractor, model hot-loaded
+// from identity/models/speaker.onnx) matched by cosine against enrolled
+// people. The add-on never decides identity or enrols on its own: it reports
+// scores; the brain (Hearth) owns consent and the decision.
+let spkCtx = null;
+function getSpeakerExtractor() {
+  if (spkCtx !== null) return spkCtx;
+  try {
+    const sherpa = require('sherpa-onnx-node');
+    const model = path.join(cfg.identityDir, 'models', 'speaker.onnx');
+    if (!fs.existsSync(model)) { spkCtx = false; return spkCtx; }
+    spkCtx = { ex: new sherpa.SpeakerEmbeddingExtractor({ model, numThreads: 2, provider: 'cpu' }) };
+    console.log('[nest_headless] speaker embedding model loaded');
+  } catch (e) { console.warn('[nest_headless] speaker model unavailable:', e.message); spkCtx = false; }
+  return spkCtx;
+}
+function embedVoice(samples) {
+  const k = getSpeakerExtractor();
+  if (!k) return null;
+  const st = k.ex.createStream();
+  st.acceptWaveform({ samples, sampleRate: 16000 });
+  st.inputFinished();
+  return Array.from(k.ex.compute(st));
+}
+const cosine = (a, b) => { let d = 0, na = 0, nb = 0; for (let i = 0; i < a.length; i++) { d += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; } return d / Math.sqrt(na * nb || 1); };
+// enrolled: { name: [ {embedding, file} ] } loaded from identity/<name>/voice-*.json
+let enrolled = null;
+function loadEnrolled() {
+  enrolled = {};
+  try {
+    for (const name of fs.readdirSync(cfg.identityDir)) {
+      const d = path.join(cfg.identityDir, name);
+      if (name === 'models' || !fs.statSync(d).isDirectory()) continue;
+      const items = [];
+      for (const f of fs.readdirSync(d)) {
+        if (!/^voice-.*\.json$/.test(f)) continue;
+        try { const j = JSON.parse(fs.readFileSync(path.join(d, f), 'utf8')); if (Array.isArray(j.embedding)) items.push({ embedding: j.embedding, file: f, at: j.at }); } catch (e) { /* skip */ }
+      }
+      if (items.length) enrolled[name] = items;
+    }
+  } catch (e) { /* no identity dir yet */ }
+  return enrolled;
+}
+function matchVoice(embedding) {
+  if (!enrolled) loadEnrolled();
+  const out = [];
+  for (const [name, items] of Object.entries(enrolled)) {
+    const best = Math.max(...items.map((it) => cosine(embedding, it.embedding)));
+    out.push({ name, score: Math.round(best * 1000) / 1000 });
+  }
+  return out.sort((a, b) => b.score - a.score).slice(0, 3);
+}
+// recent utterances kept 90 s for enrolment: id -> {camera, samples, quality, embedding, at}
+const utterances = new Map();
+function rememberUtterance(id, u) {
+  utterances.set(id, u);
+  setTimeout(() => utterances.delete(id), 90000).unref();
+}
+function latestUtterance(entityId) {
+  let best = null;
+  for (const u of utterances.values()) if (u.camera === entityId && (!best || u.at > best.at)) best = u;
+  return best;
+}
+function voiceQuality(c, samples) {
+  const voicedMs = c.chunks.filter((ch) => rmsOf(ch) > c.floor).reduce((a, ch) => a + ch.length / 16, 0);
+  const rms = rmsOf(samples);
+  let reason = 'ok';
+  if (voicedMs < 2000) reason = 'too_short';
+  else if (rms < c.floor) reason = 'too_quiet';
+  return { speech_ms: Math.round(voicedMs), rms: Math.round(rms * 10000) / 10000, reason };
+}
+function writeWav16k(file, samples) {
+  const pcm = Buffer.alloc(samples.length * 2);
+  for (let i = 0; i < samples.length; i++) pcm.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(samples[i] * 32767))), i * 2);
+  const h = Buffer.alloc(44);
+  h.write('RIFF', 0); h.writeUInt32LE(36 + pcm.length, 4); h.write('WAVE', 8); h.write('fmt ', 12);
+  h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20); h.writeUInt16LE(1, 22); h.writeUInt32LE(16000, 24);
+  h.writeUInt32LE(32000, 28); h.writeUInt16LE(2, 32); h.writeUInt16LE(16, 34); h.write('data', 36); h.writeUInt32LE(pcm.length, 40);
+  fs.writeFileSync(file, Buffer.concat([h, pcm]));
+}
+function enrolVoice(name, u) {
+  if (!/^[a-z0-9_-]{1,32}$/i.test(name)) return { ok: false, accepted: false, reason: 'bad_name' };
+  if (!u) return { ok: false, accepted: false, reason: 'no_utterance' };
+  if (u.quality.reason !== 'ok') return { ok: true, accepted: false, quality: u.quality, reason: u.quality.reason, samples: (enrolled && enrolled[name] || []).length };
+  const emb = u.embedding || embedVoice(u.samples);
+  if (!emb) return { ok: false, accepted: false, reason: 'no_model' };
+  const d = path.join(cfg.identityDir, name.toLowerCase());
+  fs.mkdirSync(d, { recursive: true });
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  fs.writeFileSync(path.join(d, `voice-${ts}.json`), JSON.stringify({ at: new Date().toISOString(), camera: u.camera, quality: u.quality, embedding: emb }));
+  if (cfg.identityKeepSamples) writeWav16k(path.join(d, `voice-${ts}.wav`), u.samples);
+  loadEnrolled();
+  console.log(`[nest_headless] IDENTITY enrolled voice for ${name.toLowerCase()} (${enrolled[name.toLowerCase()].length} samples)`);
+  return { ok: true, accepted: true, quality: u.quality, samples: enrolled[name.toLowerCase()].length };
+}
+function forgetPerson(name) {
+  const d = path.join(cfg.identityDir, name.toLowerCase());
+  if (!/^[a-z0-9_-]{1,32}$/i.test(name) || !fs.existsSync(d)) return { ok: false, reason: 'unknown' };
+  fs.rmSync(d, { recursive: true, force: true });
+  loadEnrolled();
+  return { ok: true };
+}
+function identitySummary() {
+  if (!enrolled) loadEnrolled();
+  return { people: Object.entries(enrolled).map(([name, items]) => ({
+    name, voice_samples: items.length, face_samples: 0,
+    updated_at: items.map((i) => i.at).sort().pop() || null,
+  })) };
+}
+function readJsonBody(req) {
+  return new Promise((resolve) => {
+    let b = ''; req.on('data', (c) => { b += c; if (b.length > 1e6) req.destroy(); });
+    req.on('end', () => { try { resolve(b ? JSON.parse(b) : {}); } catch (e) { resolve({}); } });
+  });
+}
+
 // Per-camera capture state: after a keyword hit, accumulate 16k samples until
 // silence-after-speech or the max window, then recognise and post ONE event.
 const speechCap = {};
@@ -734,12 +867,26 @@ async function finishSpeechCapture(entityId, c, reason) {
     text = ((r && r.text) || '').trim().toLowerCase();
   }
   const durationMs = Math.round(total / 16);
+  const utteranceId = `${entityId.replace(/^camera\./, '')}-${c.t0}`;
   console.log(`[nest_headless] SPEECH "${text}" on ${entityId} (${durationMs} ms, ${reason})`);
   await postHaEvent('nest_headless_speech', {
     entity_id: entityId, camera: entityId.replace(/^camera\./, ''), keyword: c.keyword,
+    utterance_id: utteranceId,
     text, duration_ms: durationMs, started_at: c.startedAt.toISOString(), ended_at: endedAt.toISOString(),
     reason: text ? reason : (reason === 'no_speech' ? 'no_speech' : reason),
   });
+  // Identity follows as its own event so it can never delay the transcript.
+  const quality = voiceQuality(c, all);
+  const u = { camera: entityId, samples: all, quality, embedding: null, at: Date.now() };
+  rememberUtterance(utteranceId, u);
+  try {
+    if (quality.reason === 'ok' || quality.speech_ms >= 800) u.embedding = embedVoice(all);
+    const matches = u.embedding ? matchVoice(u.embedding) : [];
+    await postHaEvent('nest_headless_identity', {
+      entity_id: entityId, camera: entityId.replace(/^camera\./, ''), utterance_id: utteranceId,
+      speaker: { quality, matches }, faces: [],
+    });
+  } catch (e) { console.warn('[nest_headless] identity failed:', e.message); }
 }
 
 const lastKeywordMs = {};
@@ -931,7 +1078,8 @@ const server = http.createServer(async (req, res) => {
         addon: 'nest_headless', outDir: cfg.outDir,
         cameras: Object.fromEntries(Object.entries(state).map(([k, v]) => [k, v.lastMeta])),
         addon: 'nest_headless', version: ADDON_VERSION,
-        audio: audioStats,
+        cpus: os.cpus().length, nice: os.getPriority(), load: os.loadavg().map((v) => +v.toFixed(2)),
+        audio: audioStats, capturing: Object.keys(speechCap),
         watches: Object.fromEntries(Object.entries(watchMgr).map(([k, m]) => [k, {
           ready: m.ready, hits: m.hits, startedAt: m.startedAt, lastError: m.lastError,
           verdictWindow: (m.verdicts || []).join(''), sustainedOpen: !!m.sustainedOpen,
@@ -964,6 +1112,23 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ mgr: mgr ? { ready: mgr.ready, hits: mgr.hits, lastError: mgr.lastError } : null, page: pageState }));
       return;
+    }
+    if (parts[0] === 'identity') {
+      if (req.method === 'GET' && !parts[1]) {
+        res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(identitySummary()));
+      }
+      if (req.method === 'POST' && parts[1] === 'voice' && parts[2] === 'enrol') {
+        const body = await readJsonBody(req);
+        const cam = body.camera ? cameraEntity(body.camera) : null;
+        const u = body.utterance_id ? utterances.get(body.utterance_id) : (cam ? latestUtterance(cam) : null);
+        const r = enrolVoice(String(body.name || ''), u);
+        res.writeHead(r.ok ? 200 : 400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(r));
+      }
+      if (req.method === 'DELETE' && parts[1]) {
+        const r = forgetPerson(parts[1]);
+        res.writeHead(r.ok ? 200 : 404, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(r));
+      }
+      res.writeHead(404); return res.end('unknown identity route');
     }
     if (parts[0] === 'frame' && parts[1]) {
       // Instant JPEG off the held stream - no persist, detect, or archive.

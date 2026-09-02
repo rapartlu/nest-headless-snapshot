@@ -17,6 +17,9 @@ const fs = require('fs');
 const path = require('path');
 const jpeg = require('jpeg-js');
 const ort = require('onnxruntime-node');
+const os = require('os');
+// Leave at least one core for Chromium's WebRTC receive path (see server.js getBrowser).
+const ORT_OPTS = { executionProviders: ['cpu'], intraOpNumThreads: Math.max(1, Math.min(4, os.cpus().length - 1)) };
 
 const DET_PATH = '/app/assets/models/yolo11n.onnx';
 // House-trained single-class cat detector (fine-tuned on this kitchen's own
@@ -32,7 +35,7 @@ const MODELS_DIRS = ['/homeassistant/nest_models', '/config/nest_models'];
 let catSession = null;
 async function getCatDetector() {
   if (catSession === null && fs.existsSync(CAT_PATH)) {
-    catSession = ort.InferenceSession.create(CAT_PATH, { executionProviders: ['cpu'] })
+    catSession = ort.InferenceSession.create(CAT_PATH, ORT_OPTS)
       .then((s) => { console.log('[nest_headless] house cat detector loaded'); return s; })
       .catch((e) => { console.warn('[nest_headless] cat detector load failed:', e.message); return null; });
   }
@@ -42,7 +45,7 @@ async function getCatDetector() {
 let detSession = null;
 async function getDetector() {
   if (detSession === null && fs.existsSync(DET_PATH)) {
-    detSession = ort.InferenceSession.create(DET_PATH, { executionProviders: ['cpu'] })
+    detSession = ort.InferenceSession.create(DET_PATH, ORT_OPTS)
       .then((s) => { console.log('[nest_headless] detector loaded (yolo11n)'); return s; })
       .catch((e) => { console.warn('[nest_headless] detector load failed:', e.message); return null; });
   }
@@ -65,7 +68,7 @@ async function getCls(camera) {
   const st = fs.statSync(p);
   const c = clsCache[camera];
   if (c && c.mtimeMs === st.mtimeMs && c.session) return c.session;
-  const session = await ort.InferenceSession.create(p, { executionProviders: ['cpu'] });
+  const session = await ort.InferenceSession.create(p, ORT_OPTS);
   clsCache[camera] = { session, mtimeMs: st.mtimeMs };
   console.log(`[nest_headless] onnx classifier loaded ${p}`);
   return session;

@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.8.1
+
+- Fixed keyword spotting dying under load. Inference (onnxruntime, sherpa)
+  shares the container with Chromium; when it saturated the host, Chromium's
+  WebRTC receiver missed its audio deadlines and the jitter buffer expanded
+  to silence, so the mic audio reached the spotter as intact words separated
+  by dead gaps that no phrase survived (measured: a continuous 3.5 s phrase
+  arrived as bursts over 6.5 s). Chromium is now spawned at nice 0 and the
+  Node process lowers itself to nice 10 after launch, so the browser always
+  wins CPU contention; onnxruntime sessions are capped to `cpus - 1`
+  intra-op threads. `GET /` reports `cpus`, `nice`, `load` and `capturing`
+  (cameras with a speech capture in progress).
+
+## 1.8.0
+
+- Voice identity (Hearth issue #2). Each `nest_headless_speech` utterance is
+  followed by `nest_headless_identity` {utterance_id, speaker: {quality,
+  matches: [{name, score}]}, faces: []} using a 3D-Speaker ERes2Net
+  embedding (`nest_models/identity/models/speaker.onnx`), cosine against
+  enrolled people. `GET /identity` lists people; `POST /identity/voice/enrol`
+  {camera, name, utterance_id?} enrols from a recent utterance (kept 90 s in
+  memory); `DELETE /identity/<name>` forgets. Embeddings are stored as JSON
+  under `nest_models/identity/<name>/`; raw WAV only with
+  `identity_keep_samples: true`. `utterance_id` added to
+  `nest_headless_speech`. Face identity is reserved for a later release.
+
 ## 1.7.0
 
 - Speech-to-text after a keyword hit: the utterance following the phrase is
