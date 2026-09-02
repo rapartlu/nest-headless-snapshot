@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.8.12
+
+- CoreML execution provider on macOS (`ORT_COREML=0` to disable): on an M3
+  Pro the cat model runs in 18 ms (was 67), the person model in 8 ms (was
+  25), the door classifier in 1 ms (was 4). Sessions are warmed at start-up
+  (~2.3 s) so the first live detection does not pay the compile.
+- JPEG decoding moved off the event loop: `sharp` (libvips, native, async)
+  replaces jpeg-js for detection and door classification. A 1080p decode was
+  ~90 ms of blocking JavaScript per detection; it is now ~10 ms in a worker.
+  jpeg-js remains for annotation and the legacy classifier.
+- Measured `/detect` (capture + decode + both models) on the Mac: 0.18-0.25 s
+  (was ~0.40 s).
+- 1.8.11: the Node process no longer lowers its own priority on hosts with
+  six or more cores; both camera microphones enabled in the Mac config.
+
 ## 1.8.9 (host)
 
 - `host/whisper_server.py`: Whisper large-v3-turbo via Apple MLX behind the

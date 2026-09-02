@@ -21,7 +21,15 @@ const os = require('os');
 // All cores: the process runs at nice 10 (see server.js getBrowser), so Chromium's
 // WebRTC receive path wins contention anyway; a thread cap only slowed detection
 // (measured 3.5-4.7 s per /detect on a 2-core NAS with one thread).
-const ORT_OPTS = { executionProviders: ['cpu'], intraOpNumThreads: Math.max(1, Math.min(4, os.cpus().length)) };
+// On macOS the CoreML execution provider runs the graphs on the GPU/ANE:
+// measured on an M3 Pro, cats 960 67 -> 18 ms, yolo11n 640 25 -> 8 ms, door
+// cls 4 -> 1 ms, at the cost of ~1.4 s compilation per session at load
+// (sessions are warmed at start-up, see warmUp). Elsewhere: CPU.
+const ORT_OPTS = {
+  executionProviders: process.platform === 'darwin' && process.env.ORT_COREML !== '0' ? ['coreml', 'cpu'] : ['cpu'],
+  intraOpNumThreads: Math.max(1, Math.min(4, os.cpus().length)),
+  logSeverityLevel: 3,   // CoreML partition notices are expected; keep the log clean
+};
 
 const DET_PATH = path.join(__dirname, 'assets/models/yolo11n.onnx');
 // House-trained single-class cat detector (fine-tuned on this kitchen's own
@@ -106,6 +114,32 @@ function iou(a, b) {
   return inter / (a.w * a.h + b.w * b.h - inter + 1e-9);
 }
 
+// JPEG -> RGBA off the event loop. jpeg-js decodes a 1080p frame in ~90 ms of
+// main-thread JavaScript, which is the only part of a detection that blocks
+// anything (onnxruntime already runs on its own threads); sharp (libvips) does
+// it natively in a worker in ~10 ms. Same {data, width, height} shape.
+let sharpMod = null;
+function getSharp() {
+  if (sharpMod === null) { try { sharpMod = require('sharp'); } catch (e) { sharpMod = false; console.warn('[nest_headless] sharp unavailable, decoding JPEG in JS:', e.message); } }
+  return sharpMod;
+}
+async function decodeJpeg(jpegBuf, maxMB = 96) {
+  const sharp = getSharp();
+  if (sharp) {
+    const { data, info } = await sharp(jpegBuf).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+    return { data, width: info.width, height: info.height };
+  }
+  return jpeg.decode(jpegBuf, { useTArray: true, maxMemoryUsageInMB: maxMB });
+}
+
+// Load (and on CoreML, compile) the sessions at start-up so the first live
+// detection does not pay ~1.4 s per model.
+async function warmUp() {
+  const t = Date.now();
+  await Promise.all([getCatDetector(), getDetector()]);
+  return Date.now() - t;
+}
+
 // Detect objects in a JPEG buffer. Returns [{cls, name, conf, box:{x,y,w,h}}]
 // with box coords as fractions of the frame.
 // `region` ({x,y,w,h} fractions) restricts detection to a zoomed sub-view -
@@ -115,7 +149,7 @@ async function detect(jpegBuf, { conf = CONF_DEFAULT, classes = null, region = n
   session = session || await getDetector();
   if (!session) return null;
   const DS = size || DET_SIZE;
-  const img = jpeg.decode(jpegBuf, { useTArray: true, maxMemoryUsageInMB: 96 });
+  const img = await decodeJpeg(jpegBuf, 96);
   const rx = region ? Math.max(0, region.x) * img.width : 0;
   const ry = region ? Math.max(0, region.y) * img.height : 0;
   const rw = region ? Math.min(1 - Math.max(0, region.x), region.w) * img.width : img.width;
@@ -171,7 +205,7 @@ async function detect(jpegBuf, { conf = CONF_DEFAULT, classes = null, region = n
 async function classifyDoor(camera, jpegBuf, { size = 256, threshold = 0.30, label = 'door_open' } = {}) {
   const session = await getCls(camera);
   if (!session) return null;
-  const img = jpeg.decode(jpegBuf, { useTArray: true, maxMemoryUsageInMB: 64 });
+  const img = await decodeJpeg(jpegBuf, 64);
   // ultralytics classify eval: resize shortest side to `size`, center crop
   const s = size / Math.min(img.width, img.height);
   const rw = img.width * s, rh = img.height * s;
@@ -269,4 +303,4 @@ async function detectCats(jpegBuf, opts = {}) {
   });
 }
 
-module.exports = { detect, detectCats, classifyDoor, hasDoorModel, annotate };
+module.exports = { detect, detectCats, classifyDoor, hasDoorModel, annotate, warmUp };

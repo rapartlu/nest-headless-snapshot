@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.8.11';
+const ADDON_VERSION = '1.8.12';
 
 const http = require('http');
 const fs = require('fs');
@@ -1436,6 +1436,7 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(cfg.port, () => {
   console.log(`[nest_headless] listening on :${cfg.port}`);
+  infer.warmUp().then((ms) => console.log(`[nest_headless] vision models warm in ${ms} ms`)).catch((e) => console.warn('[nest_headless] warm-up failed:', e.message));
   for (const [entityId, interval] of Object.entries(cfg.watches)) {
     runWatch(entityId, interval).catch((e) => console.error(`[nest_headless] watch ${entityId} crashed:`, e.message));
   }
