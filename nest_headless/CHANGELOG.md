@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.10.4
+
+- API authentication for the sensitive routes (Hearth #10): `/listen`,
+  `/identity`, `/utterance`, `/audiodebug` are loopback-only unless the
+  caller presents `Authorization: Bearer <API_TOKEN>` (`API_TOKEN` or
+  `API_TOKEN_FILE`). Denials are logged with the caller's address. Snapshot,
+  frame, detect and status routes stay LAN-open for Home Assistant.
+- Every `POST /listen` is logged with the caller's address, optional
+  `?reason=`, and timestamp; the log file is now appended across restarts
+  (with a start marker) so the audit trail survives.
+- Fixed a 1.10.3 regression that made every speech capture fail after the
+  transcription refactor (`total is not defined`).
+
+## 1.10.3
+
+- Faster turn-around: transcription starts speculatively after 350 ms of
+  closing silence; if nobody speaks again before the window closes, the
+  event goes out with the result already in hand (~0.5 s sooner). The
+  speech event carries `speculative` and `close_to_event_ms`. Example
+  config drops `speech_silence_ms` to 600.
+
 ## 1.10.2
 
 - `POST /identity/face/enrol` accepts a supplied image (Hearth #9): JSON

@@ -1,5 +1,5 @@
 name: Nest Headless Snapshot
-version: "1.10.2"
+version: "1.10.4"
 slug: nest_headless
 description: >-
   Server-side Nest camera stills via headless Chromium — the only WebRTC

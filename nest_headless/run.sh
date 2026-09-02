@@ -7,7 +7,8 @@ CFG="${HA_CONFIG_DIR:-/homeassistant}"
 LOG="${LOG_FILE:-$CFG/nest_headless_boot.log}"
 touch "$LOG" 2>/dev/null || LOG=/config/nest_headless_boot.log
 touch "$LOG" 2>/dev/null || LOG=/tmp/boot.log
-exec > "$LOG" 2>&1
+exec >> "$LOG" 2>&1   # append: the audit trail (LISTEN, DENIED, IDENTITY) must survive restarts
+echo "[nest_headless] ---- start $(date -u +%Y-%m-%dT%H:%M:%SZ) ----"
 set -e
 
 # This Supervisor (flagged "Docker misconfigured") injects NO env vars into
@@ -16,6 +17,7 @@ set -e
 # directly on the internal network instead of the supervisor proxy (which
 # only accepts SUPERVISOR_TOKEN).
 TOKEN_FILE="${TOKEN_FILE:-$CFG/.nest_headless_token}"
+# API_TOKEN / API_TOKEN_FILE (bearer for the sensitive routes off-loopback) pass straight through to node
 if [ -z "$SUPERVISOR_TOKEN" ] && [ -z "$HA_TOKEN" ] && [ -f "$TOKEN_FILE" ]; then
   export HA_TOKEN="$(cat "$TOKEN_FILE")"
   export HA_WS_URL="${HA_WS_URL:-ws://homeassistant:8123/api/websocket}"

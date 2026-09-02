@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.10.2';
+const ADDON_VERSION = '1.10.4';
 
 const http = require('http');
 const fs = require('fs');
@@ -112,6 +112,10 @@ const cfg = {
   // Optional whisper.cpp server (Metal on a Mac): POST /inference. Falls back
   // to the in-process recogniser when unreachable. e.g. http://127.0.0.1:8178
   sttUrl: (process.env.STT_URL || '').replace(/\/+$/, ''),
+  // Bearer token for the sensitive routes (/listen, /identity, /utterance,
+  // /audiodebug) from anywhere but loopback (Hearth #10). API_TOKEN or
+  // API_TOKEN_FILE; when neither is set those routes are loopback-only.
+  apiToken: (process.env.API_TOKEN || (process.env.API_TOKEN_FILE && (() => { try { return fs.readFileSync(process.env.API_TOKEN_FILE, 'utf8'); } catch (e) { return ''; } })()) || '').trim(),
   // Voice identity: embeddings + enrolments under <config>/nest_models/identity/.
   // Raw enrolment WAVs are kept only when identity_keep_samples is on.
   identityDir: path.join(CONFIG_DIR, 'nest_models/identity'),
@@ -1070,8 +1074,14 @@ function feedSpeechCapture(entityId, chunk) {
     const heard = c.voicedMs >= SPEECH_MIN_VOICED_MS;
     const quietBelow = heard ? Math.max(c.floor, 0.18 * c.peakRms) : c.floor;
     const voiced = rms > quietBelow;
-    if (voiced) { c.voicedMs += ms; c.silenceMs = 0; } else c.silenceMs += ms;
+    if (voiced) { c.voicedMs += ms; c.silenceMs = 0; if (c.spec) c.specStale = true; } else c.silenceMs += ms;
     const spoke = c.voicedMs >= SPEECH_MIN_VOICED_MS, listened = Date.now() - c.listenT0;
+    // Speculative transcription during the closing silence (see finishSpeechCapture)
+    if (spoke && !voiced && c.silenceMs >= 350 && c.silenceMs < cfg.speechSilenceMs && (!c.spec || c.specStale)) {
+      const kept = c.chunks.slice(Math.min(c.keepFrom || 0, Math.max(0, c.chunks.length - 1)));
+      c.specStale = false;
+      c.spec = transcribeSamples(samplesFromChunks(kept));
+    }
     if (spoke && c.silenceMs >= cfg.speechSilenceMs) reason = 'silence';
     else if (!c.voicedMs && listened >= (c.giveUpMs || SPEECH_INITIAL_QUIET_MS)) reason = 'no_speech';
     else if (!spoke && c.voicedMs && c.silenceMs >= 2000) reason = 'no_speech';   // a grunt, then nothing
@@ -1136,17 +1146,12 @@ function stripWakePhrase(t) {
   }
   return t;
 }
-async function finishSpeechCapture(entityId, c, reason) {
-  if (c.followUp && reason === 'no_speech') {   // nobody replied: no event at all (Hearth #4)
-    console.log(`[nest_headless] follow-up window on ${entityId} closed: nobody spoke`);
-    return;
-  }
-  const endedAt = new Date();
-  // recogniser audio starts after the wake phrase's tail (see feedSpeechCapture)
-  const kept = c.chunks.slice(Math.min(c.keepFrom || 0, Math.max(0, c.chunks.length - 1)));
-  const total = kept.reduce((a, b) => a + b.length, 0);
+// Concatenate the recogniser's chunks, normalise, transcribe. Shared by the
+// final pass and the speculative pass started during the closing silence.
+function samplesFromChunks(chunks) {
+  const total = chunks.reduce((a, b) => a + b.length, 0);
   const all = new Float32Array(total); let o = 0;
-  for (const ch of kept) { all.set(ch, o); o += ch.length; }
+  for (const ch of chunks) { all.set(ch, o); o += ch.length; }
   // Normalise for the recogniser (peak to -3 dBFS, at most x20): the mic sits
   // above the patio doors and speech from the far side of the kitchen arrives
   // at rms 0.01-0.08, which Whisper reads as noise; scaled, it reads it fine.
@@ -1154,11 +1159,12 @@ async function finishSpeechCapture(entityId, c, reason) {
   for (let i = 0; i < all.length; i++) { const a = Math.abs(all[i]); if (a > peak) peak = a; }
   const gain = peak > 0 ? Math.min(20, 0.7 / peak) : 1;
   if (gain > 1.05) for (let i = 0; i < all.length; i++) all[i] = Math.max(-1, Math.min(1, all[i] * gain));
-  let text = '';
-  let stt = reason === 'no_speech' ? null : getStt();
+  return all;
+}
+async function transcribeSamples(all) {
   const tStt = Date.now();
-  let remote = null;
-  if (reason !== 'no_speech' && cfg.sttUrl) {
+  let text = '', stt = getStt(), remote = null;
+  if (cfg.sttUrl) {
     remote = await whisperServer(all).catch((e) => { console.warn('[nest_headless] whisper server failed, using local recogniser:', e.message); return null; });
   }
   if (remote) {
@@ -1177,7 +1183,27 @@ async function finishSpeechCapture(entityId, c, reason) {
     const r = stt.rec.getResult(st);
     text = ((r && r.text) || '').trim().toLowerCase();
   }
-  const sttMs = Date.now() - tStt;
+  return { text, engine: stt ? stt.engine : null, sttMs: Date.now() - tStt };
+}
+async function finishSpeechCapture(entityId, c, reason) {
+  if (c.followUp && reason === 'no_speech') {   // nobody replied: no event at all (Hearth #4)
+    console.log(`[nest_headless] follow-up window on ${entityId} closed: nobody spoke`);
+    return;
+  }
+  const endedAt = new Date();
+  const tClose = Date.now();
+  // recogniser audio starts after the wake phrase's tail (see feedSpeechCapture)
+  const kept = c.chunks.slice(Math.min(c.keepFrom || 0, Math.max(0, c.chunks.length - 1)));
+  const all = samplesFromChunks(kept);
+  let text = '', stt = null, sttMs = 0, speculative = false;
+  if (reason !== 'no_speech') {
+    // Speculative pass: transcription started at 350 ms of closing silence
+    // (feedSpeechCapture); if nobody spoke again before the window closed, the
+    // result is already here and the event goes out ~0.5 s sooner.
+    const r = (c.spec && !c.specStale) ? await c.spec.then((x) => { speculative = true; return x; }).catch(() => null) : null;
+    const t = r || await transcribeSamples(all);
+    text = t.text; stt = { engine: t.engine }; sttMs = t.sttMs;
+  }
   // The spotter is deliberately eager (threshold 0.12) and fires on ordinary
   // talk now and then; Whisper hearing the wake phrase in the pre-roll is
   // the second opinion. Unconfirmed captures are still sent - the brain
@@ -1192,15 +1218,16 @@ async function finishSpeechCapture(entityId, c, reason) {
     console.log(`[nest_headless] follow-up window on ${entityId} closed: nothing intelligible (${reason})`);
     return;
   }
-  const durationMs = Math.round(total / 16);
+  const durationMs = Math.round(all.length / 16);
   const utteranceId = `${entityId.replace(/^camera\./, '')}-${c.t0}`;
-  console.log(`[nest_headless] SPEECH "${text}" on ${entityId} (${durationMs} ms, ${reason}, ${stt ? stt.engine : 'no-stt'} ${sttMs} ms, wake ${wakeConfirmed ? 'confirmed' : 'unconfirmed'})`);
+  const closeToEventMs = Date.now() - tClose;
+  console.log(`[nest_headless] SPEECH "${text}" on ${entityId} (${durationMs} ms, ${reason}, ${stt ? stt.engine : 'no-stt'} ${sttMs} ms${speculative ? ' speculative' : ''}, close->event ${closeToEventMs} ms, wake ${wakeConfirmed ? 'confirmed' : 'unconfirmed'})`);
   await postHaEvent('nest_headless_speech', {
     entity_id: entityId, camera: entityId.replace(/^camera\./, ''), keyword: c.keyword,
     utterance_id: utteranceId,
     text, duration_ms: durationMs, started_at: c.startedAt.toISOString(), ended_at: endedAt.toISOString(),
     reason: text ? reason : (reason === 'no_speech' ? 'no_speech' : reason),
-    engine: stt ? stt.engine : null, stt_ms: sttMs, final: true,
+    engine: stt ? stt.engine : null, stt_ms: sttMs, final: true, speculative, close_to_event_ms: closeToEventMs,
     wake_confirmed: wakeConfirmed,   // Whisper heard the wake phrase in the pre-roll (false = likely a spotter false alarm)
     // raw 16 kHz mono WAV, memory-held for 90 s, for a stronger recogniser on the brain
     audio_path: `/utterance/${utteranceId}.wav`, audio_ttl_s: 90,
@@ -1407,6 +1434,19 @@ function serveFile(res, entityId, extraHeaders = {}) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   const parts = url.pathname.split('/').filter(Boolean);
+  // Sensitive routes - opening a listening window, identity, raw audio -
+  // are loopback-only unless the caller presents the API token (Hearth #10).
+  // Snapshots, frames, detection and status stay LAN-open for HA.
+  const ip = (req.socket.remoteAddress || '').replace(/^::ffff:/, '');
+  const loopback = ip === '127.0.0.1' || ip === '::1';
+  const sensitive = parts[0] === 'listen' || parts[0] === 'identity' || parts[0] === 'utterance' || parts[0] === 'audiodebug';
+  if (sensitive && !loopback) {
+    const auth = req.headers.authorization || '';
+    if (!cfg.apiToken || auth !== `Bearer ${cfg.apiToken}`) {
+      console.warn(`[nest_headless] DENIED ${req.method} ${url.pathname} from ${ip} (${cfg.apiToken ? 'bad or missing token' : 'loopback only'}) at ${new Date().toISOString()}`);
+      res.writeHead(403, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, reason: 'forbidden' }));
+    }
+  }
 
   try {
     if (url.pathname === '/blank') {
@@ -1485,7 +1525,7 @@ const server = http.createServer(async (req, res) => {
       if (speechCap[entityId]) { res.writeHead(409, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, reason: 'capture_in_progress' })); }
       const seconds = Math.max(1, Math.min(30, parseFloat(url.searchParams.get('seconds')) || 8));
       startSpeechCapture(entityId, 'follow-up', st.ring || [], { followUp: true, giveUpMs: seconds * 1000 });
-      console.log(`[nest_headless] LISTEN follow-up window ${seconds}s on ${entityId}`);
+      console.log(`[nest_headless] LISTEN follow-up window ${seconds}s on ${entityId} from ${ip}${url.searchParams.get('reason') ? ' reason=' + url.searchParams.get('reason').slice(0, 60) : ''} at ${new Date().toISOString()}`);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ ok: true, camera: entityId.replace(/^camera\./, ''), seconds }));
     }
