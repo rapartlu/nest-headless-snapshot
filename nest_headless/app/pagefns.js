@@ -13,6 +13,9 @@ const initPeer = async () => {
       if (ev.track.kind === 'video') {
         res(ev.streams && ev.streams[0] ? ev.streams[0] : new MediaStream([ev.track]));
       }
+      // the camera's microphone rides the same session - stash it for the
+      // optional audio pipeline (keyword spotting)
+      if (ev.track.kind === 'audio') window.__audioStream = new MediaStream([ev.track]);
     };
   });
   pc.addTransceiver('audio', { direction: 'recvonly' });   // order matters
@@ -247,6 +250,36 @@ const startWatchLoop = ({ intervalMs = 4000, rois = [], diffPct = 4, quality = 0
   return true;
 };
 
+// Tap the camera microphone: mono PCM chunks (~1s) shipped to Node as
+// base64 Int16 via window.__audioChunkNode(b64, sampleRate). Node resamples
+// to 16k and runs the keyword spotter. Nothing is recorded anywhere.
+const startWatchAudio = async () => {
+  if (!window.__audioStream) return { ok: false, reason: 'no audio track' };
+  const ctx = new AudioContext();
+  await ctx.resume().catch(() => {});
+  const src = ctx.createMediaStreamSource(window.__audioStream);
+  const proc = ctx.createScriptProcessor(4096, 1, 1);
+  let buf = [];
+  let len = 0;
+  proc.onaudioprocess = (e) => {
+    const ch = e.inputBuffer.getChannelData(0);
+    buf.push(new Float32Array(ch)); len += ch.length;
+    if (len >= ctx.sampleRate) {                    // ~1s chunks
+      const all = new Float32Array(len);
+      let o = 0; for (const b of buf) { all.set(b, o); o += b.length; }
+      buf = []; len = 0;
+      const i16 = new Int16Array(all.length);
+      for (let i = 0; i < all.length; i++) i16[i] = Math.max(-32768, Math.min(32767, all[i] * 32768));
+      let bin = ''; const u8 = new Uint8Array(i16.buffer);
+      for (let i = 0; i < u8.length; i += 0x8000) bin += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+      if (window.__audioChunkNode) window.__audioChunkNode(btoa(bin), ctx.sampleRate);
+    }
+  };
+  src.connect(proc); proc.connect(ctx.destination);
+  window.__audioCtx = ctx;
+  return { ok: true, sampleRate: ctx.sampleRate };
+};
+
 const watchState = () => ({
   ticks: window.__watchTicks || 0,
   hits: window.__watchHits || 0,
@@ -261,4 +294,4 @@ const videoCodecs = () => {
   return caps ? caps.codecs.map((c) => c.mimeType) : [];
 };
 
-module.exports = { initPeer, setRemoteAnswer, addRemoteCandidate, connectionState, waitAndCapture, videoCodecs, startWatchVideo, grabFrame, startWatchLoop, watchState };
+module.exports = { initPeer, setRemoteAnswer, addRemoteCandidate, connectionState, waitAndCapture, videoCodecs, startWatchVideo, grabFrame, startWatchLoop, startWatchAudio, watchState };

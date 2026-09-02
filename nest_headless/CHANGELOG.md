@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.6.0
+
+- Action phrases from the camera microphone. The WebRTC session has always
+  carried the camera's audio track; `audio_cameras` now taps it in-page
+  (AudioWorklet-style PCM chunks -> Node) and runs a sherpa-onnx keyword
+  spotter (3.3M-param zipformer, ~2% of a core, sub-second) for the phrases
+  in `app/assets/kws/keywords.txt` (defaults: "hey kitchen", "hey claude").
+  A hit fires `nest_headless_keyword` {camera, keyword}. Audio is processed
+  in memory only - nothing is ever written to disk. Custom phrases: encode
+  with the model's `bpe.model` via sentencepiece (see DOCS).
+- Kitchen sampling defaults to 1 s in the example config; static TTS
+  phrases should use `cache: true` so repeat announcements skip generation.
+- Note for local add-on installs: the supervisor caches the options schema
+  per version - bump `version` and run the add-on update (not just a
+  rebuild) when options change, or new keys are silently dropped.
+
 ## 1.5.9
 
 - Detection latency is now bounded at ~6-10s from animal-on-surface to

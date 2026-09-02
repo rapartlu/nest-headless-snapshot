@@ -8,6 +8,7 @@
     "jpeg-js": "^0.4.4",
     "puppeteer-core": "^24.0.0",
     "ws": "^8.18.0",
-    "onnxruntime-node": "^1.19.2"
+    "onnxruntime-node": "^1.19.2",
+    "sherpa-onnx-node": "^1.10.30"
   }
 }

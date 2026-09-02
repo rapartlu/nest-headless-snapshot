@@ -84,6 +84,10 @@ const cfg = {
   // positives (and the last 3 all positive) before the event fires.
   // 16 ticks at 15 s = a solid 4 minutes of evidence. 0 or 1 = fire at once.
   watchClassifyPersistTicks: intEnv('WATCH_CLASSIFY_PERSIST_TICKS', 16),
+  // Cameras whose microphone feeds the keyword spotter ("hey kitchen").
+  // Space-separated names; empty disables the audio pipeline entirely.
+  // Audio is processed in-memory only - nothing is ever written to disk.
+  audioCameras: (process.env.AUDIO_CAMERAS || '').split(/\s+/).filter(Boolean).map((n) => 'camera.' + n.replace(/^camera\./, '')),
 };
 
 function parseWatches(spec) {
@@ -599,6 +603,69 @@ async function catOnSurface(entityId, frameBuf) {
   }
 }
 
+// ------------------------------------------------------------ keyword spotting
+let kwsCtx = null;
+function getKws() {
+  if (kwsCtx !== null) return kwsCtx;
+  try {
+    const sherpa = require('sherpa-onnx-node');
+    const K = '/app/assets/kws';
+    const spotter = new sherpa.KeywordSpotter({
+      featConfig: { sampleRate: 16000, featureDim: 80 },
+      modelConfig: {
+        transducer: {
+          encoder: K + '/encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx',
+          decoder: K + '/decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx',
+          joiner: K + '/joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx',
+        },
+        tokens: K + '/tokens.txt', numThreads: 2, provider: 'cpu',
+      },
+      keywordsFile: K + '/keywords.txt',
+    });
+    kwsCtx = { sherpa, spotter, streams: {} };
+    console.log('[nest_headless] keyword spotter loaded');
+  } catch (e) {
+    console.warn('[nest_headless] keyword spotter unavailable:', e.message);
+    kwsCtx = false;
+  }
+  return kwsCtx;
+}
+
+const lastKeywordMs = {};
+function onAudioChunk(entityId, b64, sampleRate) {
+  const k = getKws();
+  if (!k) return;
+  try {
+    const raw = Buffer.from(b64, 'base64');
+    const i16 = new Int16Array(raw.buffer, raw.byteOffset, raw.byteLength >> 1);
+    let f32 = new Float32Array(i16.length);
+    for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
+    let st = k.streams[entityId];
+    if (!st) {
+      st = k.streams[entityId] = {
+        s: k.spotter.createStream(),
+        rs: sampleRate !== 16000 ? new k.sherpa.LinearResampler(sampleRate, 16000) : null,
+      };
+    }
+    if (st.rs) f32 = st.rs.resample(f32, false);
+    st.s.acceptWaveform({ samples: f32, sampleRate: 16000 });
+    while (k.spotter.isReady(st.s)) {
+      k.spotter.decode(st.s);
+      const r = k.spotter.getResult(st.s);
+      if (r && r.keyword) {
+        k.spotter.reset(st.s);
+        const now = Date.now();
+        if (now - (lastKeywordMs[entityId] || 0) < 2500) continue;
+        lastKeywordMs[entityId] = now;
+        console.log(`[nest_headless] KEYWORD "${r.keyword}" on ${entityId}`);
+        postHaEvent('nest_headless_keyword', {
+          entity_id: entityId, camera: entityId.replace(/^camera\./, ''), keyword: r.keyword,
+        }).catch(() => {});
+      }
+    }
+  } catch (e) { console.warn('[nest_headless] audio chunk failed:', e.message); }
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function runWatch(entityId, intervalSec) {
@@ -614,6 +681,9 @@ async function runWatch(entityId, intervalSec) {
       await page.goto('about:blank');
       await page.exposeFunction('__watchHitNode', (payload) =>
         watchHit(entityId, payload).catch((e) => console.warn('[nest_headless] watch hit failed:', e.message)));
+      if (cfg.audioCameras.includes(entityId)) {
+        await page.exposeFunction('__audioChunkNode', (b64, rate) => onAudioChunk(entityId, b64, rate));
+      }
       session = await dialSession(entityId, page, cfg.captureTimeoutSeconds * 1000);
       const dims = await page.evaluate(fns.startWatchVideo, {
         timeoutMs: cfg.captureTimeoutSeconds * 1000, warmupFrames: cfg.warmupFrames,
@@ -625,6 +695,11 @@ async function runWatch(entityId, intervalSec) {
         await page.evaluate(fns.startWatchLoop, {
           intervalMs: intervalSec * 1000, rois, diffPct: cfg.watchDiffPct, quality: cfg.jpegQuality,
         });
+      }
+      if (cfg.audioCameras.includes(entityId)) {
+        const au = await page.evaluate(fns.startWatchAudio).catch((e) => ({ ok: false, reason: e.message }));
+        console.log(`[nest_headless] audio tap ${entityId}:`, JSON.stringify(au));
+        if (kwsCtx && kwsCtx.streams) delete kwsCtx.streams[entityId]; // fresh stream state per (re)connect
       }
       mgr.page = page; mgr.ready = true; mgr.startedAt = new Date().toISOString(); mgr.lastError = null;
       mgr.readySinceMs = Date.now();

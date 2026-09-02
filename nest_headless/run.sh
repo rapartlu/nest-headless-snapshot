@@ -39,6 +39,8 @@ if [ -f "$OPTS" ]; then
   export WATCH_CLASSIFY_SECONDS="$(jq -r '.watch_classify_seconds // 15' "$OPTS")"
   export WATCH_CLASSIFY_PERSIST_TICKS="$(jq -r '.watch_classify_persist_ticks // 16' "$OPTS")"
   export SAMPLE_ARCHIVE_SECONDS="$(jq -r '.sample_archive_seconds // 120' "$OPTS")"
+  AUDIO_OPT="$(jq -r '.audio_cameras // ""' "$OPTS")"
+  [ -n "$AUDIO_OPT" ] && export AUDIO_CAMERAS="$AUDIO_OPT"
 fi
 
 exec node /app/server.js
