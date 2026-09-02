@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.8.3';
+const ADDON_VERSION = '1.8.4';
 
 const http = require('http');
 const fs = require('fs');
@@ -872,8 +872,12 @@ function readJsonBody(req) {
 const speechCap = {};
 function rmsOf(a) { let acc = 0; for (let i = 0; i < a.length; i++) acc += a[i] * a[i]; return Math.sqrt(acc / Math.max(1, a.length)); }
 function startSpeechCapture(entityId, keyword, ring) {
-  const pre = [];  // ~300 ms pre-roll so a fast talker's first syllable survives
-  let need = 4800;
+  // ~1.5 s pre-roll: the spotter fires 0.3-0.7 s after the phrase, so someone
+  // who runs straight on ("hey claude is the...") has already said the start
+  // of the question. Whisper gets the wake phrase too; it is stripped from
+  // the transcript afterwards (stripWakePhrase).
+  const pre = [];
+  let need = 24000;
   for (let i = ring.length - 1; i >= 0 && need > 0; i--) { pre.unshift(ring[i]); need -= ring[i].length; }
   // noise floor from the ring's quietest recent chunks (x2.5, min 0.006)
   const rmses = ring.map(rmsOf).sort((a, b) => a - b);
@@ -905,7 +909,7 @@ function feedSpeechCapture(entityId, chunk) {
   if (c.phase === 'tail') {
     c.tailQuietMs = voiced ? 0 : c.tailQuietMs + ms;
     if (c.tailQuietMs >= TAIL_GAP_MS) { c.phase = 'listen'; c.keepFrom = c.chunks.length; c.listenT0 = Date.now(); }
-    else if (elapsed >= TAIL_MAX_MS) { c.phase = 'listen'; c.listenT0 = Date.now(); c.voicedMs = voiced ? ms : 0; }
+    else if (elapsed >= TAIL_MAX_MS) { c.phase = 'listen'; c.keepFrom = 0; c.listenT0 = Date.now(); c.voicedMs = voiced ? ms : 0; }   // ran straight on: keep the pre-roll, the question started in it
     else if (elapsed >= cfg.speechMaxSeconds * 1000) reason = 'no_speech';
     if (!reason) return;
   } else {
@@ -920,6 +924,16 @@ function feedSpeechCapture(entityId, chunk) {
   }
   delete speechCap[entityId];
   finishSpeechCapture(entityId, c, reason).catch((e) => console.warn('[nest_headless] speech capture failed:', e.message));
+}
+// Drop the wake phrase (and anything before it) from a transcript that
+// includes the pre-roll. Spellings cover how the recognisers render "Claude"
+// for the voices in this house ("Claws", "God", "Cloud", ...).
+const WAKE_RE = /^[\s\S]*?\b(?:hey|hi|ok|okay)[,.!?]?\s+(?:claude|claud|clawed|claws|clause|cloud|clod|clawd|god|kitchen)\b[,.!?]*\s*/i;
+function stripWakePhrase(t) {
+  const m = WAKE_RE.exec(t);
+  if (!m) return t;
+  const rest = t.slice(m[0].length).trim();
+  return rest.length ? rest : '';
 }
 async function finishSpeechCapture(entityId, c, reason) {
   const endedAt = new Date();
@@ -946,6 +960,7 @@ async function finishSpeechCapture(entityId, c, reason) {
     text = ((r && r.text) || '').trim().toLowerCase();
   }
   const sttMs = Date.now() - tStt;
+  text = stripWakePhrase(text);
   const durationMs = Math.round(total / 16);
   const utteranceId = `${entityId.replace(/^camera\./, '')}-${c.t0}`;
   console.log(`[nest_headless] SPEECH "${text}" on ${entityId} (${durationMs} ms, ${reason}, ${stt ? stt.engine : 'no-stt'} ${sttMs} ms)`);

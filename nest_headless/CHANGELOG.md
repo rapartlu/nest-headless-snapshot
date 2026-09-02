@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.8.4
+
+- 1.5 s pre-roll on speech captures (was 300 ms): the spotter fires 0.3-0.7 s
+  after the wake phrase, so someone who runs straight on has already said
+  the start of the question. When no gap follows the wake phrase the
+  pre-roll is kept for the recogniser and the wake phrase is stripped from
+  the transcript (`stripWakePhrase`, spellings cover how the recognisers
+  render "Claude": Claws, God, Cloud, ...).
+
 ## 1.8.3
 
 - Whisper transcripts. Point `stt_model_dir` at a sherpa-onnx Whisper model
