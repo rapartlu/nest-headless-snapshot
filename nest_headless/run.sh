@@ -55,6 +55,8 @@ if [ -f "$OPTS" ]; then
   [ -n "$STT_OPT" ] && export STT_MODEL_DIR="$STT_OPT"
   STT_URL_OPT="$(jq -r '.stt_url // ""' "$OPTS")"
   [ -n "$STT_URL_OPT" ] && export STT_URL="$STT_URL_OPT"
+  STT_SHADOW_OPT="$(jq -r '.stt_shadow_url // ""' "$OPTS")"
+  [ -n "$STT_SHADOW_OPT" ] && export STT_SHADOW_URL="$STT_SHADOW_OPT"
   export IDENTITY_KEEP_SAMPLES="$(jq -r '.identity_keep_samples // false' "$OPTS")"
 fi
 

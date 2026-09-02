@@ -13,38 +13,61 @@ import multiprocessing as mp
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
-import mlx_whisper
+try:
+    import mlx_whisper
+except ImportError:  # parakeet-only installs
+    mlx_whisper = None
+single_backend = None
 
-MODEL = os.environ.get('WHISPER_MODEL', 'mlx-community/whisper-large-v3-turbo')
+ENGINE = os.environ.get('STT_ENGINE', 'mlx-whisper')    # mlx-whisper | parakeet-mlx
+MODEL = os.environ.get('WHISPER_MODEL', 'mlx-community/parakeet-tdt-0.6b-v3' if ENGINE == 'parakeet-mlx' else 'mlx-community/whisper-large-v3-turbo')
 WORKERS = int(os.environ.get('WHISPER_WORKERS', '2'))   # model copies on the GPU; ~1.6 GB each; requests use whichever is free
 transcribe_lock = threading.Lock()   # fallback when WORKERS <= 1: MLX graphs are not re-entrant
 pool = queue.Queue()                 # idle worker connections
 
 
-def worker_main(conn, model):
-    """One model copy in its own process: warm, then loop transcribing what the parent sends."""
+def make_backend(engine, model):
+    """Returns transcribe(audio_float32_16k) -> text for the chosen engine."""
     import numpy as _np
+    if engine == 'parakeet-mlx':
+        import mlx.core as _mx
+        from parakeet_mlx import from_pretrained
+        m = from_pretrained(model)
+        from parakeet_mlx.audio import get_logmel
+        def run(audio):
+            # in-memory path (transcribe() wants a file): log-mel from the 16 kHz float array, then generate
+            res = m.generate(get_logmel(_mx.array(audio), m.preprocessor_config))
+            r = res[0] if isinstance(res, list) else res
+            return (r.text or '').strip()
+        run(_np.zeros(16000, dtype=_np.float32))
+        return run
     import mlx_whisper as _mw
-    _mw.transcribe(_np.zeros(16000, dtype=_np.float32), path_or_hf_repo=model, language='en', fp16=True)
+    def run(audio):
+        r = _mw.transcribe(audio, path_or_hf_repo=model, language='en', task='transcribe',
+                           temperature=0.0, condition_on_previous_text=False, fp16=True, no_speech_threshold=0.6)
+        return (r.get('text') or '').strip()
+    run(_np.zeros(16000, dtype=_np.float32))
+    return run
+
+
+def worker_main(conn, model, engine='mlx-whisper'):
+    """One model copy in its own process: warm, then loop transcribing what the parent sends."""
+    run = make_backend(engine, model)
     conn.send(('ready', os.getpid()))
     while True:
         audio = conn.recv()
         if audio is None:
             break
         try:
-            r = _mw.transcribe(audio, path_or_hf_repo=model, language='en', task='transcribe',
-                               temperature=0.0, condition_on_previous_text=False, fp16=True, no_speech_threshold=0.6)
-            conn.send(('ok', (r.get('text') or '').strip()))
+            conn.send(('ok', run(audio)))
         except Exception as e:  # noqa: BLE001
             conn.send(('err', str(e)))
 
 
 def transcribe(audio):
-    if WORKERS <= 1:
+    if WORKERS < 1:   # in-process (not thread-safe for MLX: only for debugging)
         with transcribe_lock:
-            r = mlx_whisper.transcribe(audio, path_or_hf_repo=MODEL, language='en', task='transcribe',
-                                       temperature=0.0, condition_on_previous_text=False, fp16=True, no_speech_threshold=0.6)
-            return (r.get('text') or '').strip()
+            return single_backend(audio)
     conn = pool.get()          # blocks only when every worker is busy
     try:
         conn.send(audio)
@@ -106,7 +129,7 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path in ('/', '/health'):
-            return self._json(200, {'ok': True, 'model': MODEL, 'workers': WORKERS})
+            return self._json(200, {'ok': True, 'engine': ENGINE, 'model': MODEL, 'workers': WORKERS})
         self._json(404, {'error': 'not found'})
 
     def do_POST(self):
@@ -129,26 +152,25 @@ class H(BaseHTTPRequestHandler):
             text = transcribe(audio)
             ms = int((time.time() - t0) * 1000)
             sys.stdout.write(f'{time.strftime("%H:%M:%S")} {len(audio)/16000:.1f}s -> {ms} ms: {text!r}\n'); sys.stdout.flush()
-            self._json(200, {'text': text, 'engine': 'mlx-whisper', 'model': MODEL, 'ms': ms})
+            self._json(200, {'text': text, 'engine': ENGINE, 'model': MODEL, 'ms': ms})
         except Exception as e:  # noqa: BLE001
             self._json(500, {'error': str(e)})
 
 
 if __name__ == '__main__':
     t0 = time.time()
-    if WORKERS > 1:
+    if WORKERS >= 1:   # always worker processes: MLX streams are bound to the thread that created them
         ctx = mp.get_context('spawn')
         procs = []
         for _ in range(WORKERS):
             parent, child = ctx.Pipe()
-            p = ctx.Process(target=worker_main, args=(child, MODEL), daemon=True)
+            p = ctx.Process(target=worker_main, args=(child, MODEL, ENGINE), daemon=True)
             p.start(); procs.append((parent, p))
         for parent, p in procs:
             st, pid = parent.recv()
             pool.put(parent)
         sys.stdout.write(f'{WORKERS} model workers ready in {time.time()-t0:.1f}s; listening on {BIND}:{PORT} (token {"on" if TOKEN else "off"})\n'); sys.stdout.flush()
     else:
-        # warm the model once so the first real utterance is not slow
-        mlx_whisper.transcribe(np.zeros(16000, dtype=np.float32), path_or_hf_repo=MODEL, language='en', fp16=True)
+        single_backend = make_backend(ENGINE, MODEL)   # warms the model so the first real utterance is not slow
         sys.stdout.write(f'model {MODEL} ready in {time.time()-t0:.1f}s; listening on {BIND}:{PORT} (token {"on" if TOKEN else "off"})\n'); sys.stdout.flush()
     ThreadingHTTPServer((BIND, PORT), H).serve_forever()

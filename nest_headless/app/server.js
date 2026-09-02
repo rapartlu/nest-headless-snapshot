@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.10.5';
+const ADDON_VERSION = '1.10.6';
 
 const http = require('http');
 const fs = require('fs');
@@ -112,6 +112,9 @@ const cfg = {
   // Optional whisper.cpp server (Metal on a Mac): POST /inference. Falls back
   // to the in-process recogniser when unreachable. e.g. http://127.0.0.1:8178
   sttUrl: (process.env.STT_URL || '').replace(/\/+$/, ''),
+  // Shadow recogniser for bake-offs: every utterance is also sent here and the
+  // result only logged (SHADOW lines), never used or posted. Empty = off.
+  sttShadowUrl: (process.env.STT_SHADOW_URL || '').replace(/\/+$/, ''),
   // Bearer token for the sensitive routes (/listen, /identity, /utterance,
   // /audiodebug) from anywhere but loopback (Hearth #10). API_TOKEN or
   // API_TOKEN_FILE; when neither is set those routes are loopback-only.
@@ -1106,7 +1109,7 @@ function wavBuffer(samples) {
   h.writeUInt32LE(32000, 28); h.writeUInt16LE(2, 32); h.writeUInt16LE(16, 34); h.write('data', 36); h.writeUInt32LE(pcm.length, 40);
   return Buffer.concat([h, pcm]);
 }
-function whisperServer(samples) {
+function whisperServer(samples, base = cfg.sttUrl) {
   return new Promise((resolve, reject) => {
     const boundary = '----nest' + Date.now().toString(36);
     const field = (name, value) => Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`);
@@ -1116,7 +1119,7 @@ function whisperServer(samples) {
       field('response_format', 'json'), field('temperature', '0'), field('language', 'en'),
       Buffer.from(`--${boundary}--\r\n`),
     ]);
-    const u = new URL(cfg.sttUrl + '/inference');
+    const u = new URL(base + '/inference');
     const req = http.request({ host: u.hostname, port: u.port || 80, path: u.pathname, method: 'POST', timeout: 8000,
       headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}`, 'Content-Length': body.length } }, (res) => {
       const chunks = [];
@@ -1164,6 +1167,12 @@ function samplesFromChunks(chunks) {
 async function transcribeSamples(all) {
   const tStt = Date.now();
   let text = '', stt = getStt(), remote = null;
+  if (cfg.sttShadowUrl) {   // bake-off: log what the shadow engine hears, in parallel, never used
+    const t0 = Date.now();
+    whisperServer(all, cfg.sttShadowUrl)
+      .then((r) => console.log(`[nest_headless] SHADOW ${r.engine} "${r.text}" (${Date.now() - t0} ms, ${(all.length / 16000).toFixed(1)} s audio)`))
+      .catch((e) => console.warn(`[nest_headless] SHADOW failed: ${e.message}`));
+  }
   if (cfg.sttUrl) {
     remote = await whisperServer(all).catch((e) => { console.warn('[nest_headless] whisper server failed, using local recogniser:', e.message); return null; });
   }

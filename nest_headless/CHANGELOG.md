@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.10.6
+
+- `stt_shadow_url`: a second recogniser that receives every utterance in
+  parallel; its text is only logged (`SHADOW` lines), never used or posted.
+  For bake-offs on real household audio without keeping recordings.
+- `host/whisper_server.py` gains `STT_ENGINE=parakeet-mlx` (NVIDIA
+  Parakeet-TDT 0.6B v3 via parakeet-mlx, in-memory log-mel + generate, no
+  disk) alongside `mlx-whisper`, and always serves from worker processes
+  (MLX streams are bound to their creating thread). Parakeet transcribes a
+  4.6 s clip in ~0.15-0.27 s on an M3 Pro versus ~0.70 s for
+  whisper-large-v3-turbo.
+- 1.10.5: follow-up speech events carry `opened_by` and `open_reason`.
+
 ## 1.10.4
 
 - API authentication for the sensitive routes (Hearth #10): `/listen`,
