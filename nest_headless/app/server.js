@@ -620,7 +620,10 @@ function getKws() {
         },
         tokens: K + '/tokens.txt', numThreads: 2, provider: 'cpu',
       },
-      keywordsFile: K + '/keywords.txt',
+      // phrases hot-configurable: <config>/nest_models/keywords.txt (BPE token
+      // lines, see DOCS) outranks the baked default - no rebuild to change
+      keywordsFile: ['/homeassistant/nest_models/keywords.txt', '/config/nest_models/keywords.txt']
+        .find((f) => { try { return fs.existsSync(f); } catch (e) { return false; } }) || (K + '/keywords.txt'),
       // sensitivity: default threshold 0.25 / score 1.0 heard speech-level
       // audio (rms 0.02) and matched nothing; be more eager - a false
       // "Yes? I heard you." is cheap, a missed phrase is the feature failing
@@ -663,7 +666,7 @@ function onAudioChunk(entityId, b64, sampleRate) {
     // GET /audiodebug/<camera>.wav on explicit request - never persisted
     st.ring = st.ring || [];
     st.ring.push(Float32Array.from(f32));
-    while (st.ring.length > 8) st.ring.shift();
+    while (st.ring.length > 32) st.ring.shift();   // ~8s at 250ms chunks
     st.s.acceptWaveform({ samples: f32, sampleRate: 16000 });
     while (k.spotter.isReady(st.s)) {
       k.spotter.decode(st.s);
@@ -673,7 +676,7 @@ function onAudioChunk(entityId, b64, sampleRate) {
         const now = Date.now();
         if (now - (lastKeywordMs[entityId] || 0) < 2500) continue;
         lastKeywordMs[entityId] = now; st0.hits++;
-        console.log(`[nest_headless] KEYWORD "${r.keyword}" on ${entityId}`);
+        console.log(`[nest_headless] KEYWORD "${r.keyword}" on ${entityId} at ${new Date().toISOString()}`);
         postHaEvent('nest_headless_keyword', {
           entity_id: entityId, camera: entityId.replace(/^camera\./, ''), keyword: r.keyword,
         }).catch(() => {});

@@ -271,7 +271,7 @@ const startWatchAudio = async () => {
   proc.onaudioprocess = (e) => {
     const ch = e.inputBuffer.getChannelData(0);
     buf.push(new Float32Array(ch)); len += ch.length;
-    if (len >= ctx.sampleRate) {                    // ~1s chunks
+    if (len >= ctx.sampleRate / 4) {                // ~250ms chunks: recognition lag was up to 1s per chunk
       const all = new Float32Array(len);
       let o = 0; for (const b of buf) { all.set(b, o); o += b.length; }
       buf = []; len = 0;
