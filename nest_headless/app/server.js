@@ -26,6 +26,10 @@
 
 'use strict';
 
+// Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
+// from GET / to detect that a deploy has landed.
+const ADDON_VERSION = '1.7.0';
+
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -926,6 +930,7 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({
         addon: 'nest_headless', outDir: cfg.outDir,
         cameras: Object.fromEntries(Object.entries(state).map(([k, v]) => [k, v.lastMeta])),
+        addon: 'nest_headless', version: ADDON_VERSION,
         audio: audioStats,
         watches: Object.fromEntries(Object.entries(watchMgr).map(([k, m]) => [k, {
           ready: m.ready, hits: m.hits, startedAt: m.startedAt, lastError: m.lastError,
