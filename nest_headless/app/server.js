@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.8.1';
+const ADDON_VERSION = '1.8.2';
 
 const http = require('http');
 const fs = require('fs');
@@ -41,6 +41,12 @@ const { classify } = require('./classifier');
 const infer = require('./infer');
 
 // ------------------------------------------------------------ configuration
+// HA config root: the supervisor mounts it at /homeassistant (or /config on
+// older bases); outside the supervisor (e.g. a Mac on the LAN) point
+// HA_CONFIG_DIR at the mounted config share. Bundled assets live next to
+// this file, so __dirname works in both worlds.
+const CONFIG_DIR = process.env.HA_CONFIG_DIR || (fs.existsSync('/homeassistant') ? '/homeassistant' : '/config');
+const ASSETS_DIR = path.join(__dirname, 'assets');
 const cfg = {
   port: intEnv('PORT', 8098),
   minIntervalSeconds: intEnv('MIN_INTERVAL_SECONDS', 10),
@@ -49,10 +55,11 @@ const cfg = {
   warmupFrames: intEnv('WARMUP_FRAMES', 3),
   // supervisor mounts HA config at /homeassistant (homeassistant_config map)
   // or /config (legacy map) depending on base/supervisor version
-  outDir: process.env.OUT_DIR ||
-    (fs.existsSync('/homeassistant') ? '/homeassistant/www/nest' : '/config/www/nest'),
+  outDir: process.env.OUT_DIR || path.join(CONFIG_DIR, 'www/nest'),
   chromiumPath: process.env.CHROMIUM_PATH || firstExisting(
-    ['/usr/bin/chromium-browser', '/usr/bin/chromium', '/usr/bin/google-chrome'], true),
+    ['/usr/bin/chromium-browser', '/usr/bin/chromium', '/usr/bin/google-chrome',
+      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      '/Applications/Chromium.app/Contents/MacOS/Chromium'], true),
   haWsUrl: process.env.HA_WS_URL || 'ws://supervisor/core/websocket',
   haToken: process.env.SUPERVISOR_TOKEN || process.env.HA_TOKEN || '',
   // Fixed regions of interest, e.g. "downstairs_hallway_camera:0.22:0.0:0.30:0.62"
@@ -97,10 +104,10 @@ const cfg = {
   // silence after speech, or at the max; recogniser hot-loads from sttModelDir.
   speechSilenceMs: intEnv('SPEECH_SILENCE_MS', 800),
   speechMaxSeconds: intEnv('SPEECH_MAX_SECONDS', 8),
-  sttModelDir: process.env.STT_MODEL_DIR || (fs.existsSync('/homeassistant') ? '/homeassistant/nest_models/stt' : '/config/nest_models/stt'),
+  sttModelDir: process.env.STT_MODEL_DIR || path.join(CONFIG_DIR, 'nest_models/stt'),
   // Voice identity: embeddings + enrolments under <config>/nest_models/identity/.
   // Raw enrolment WAVs are kept only when identity_keep_samples is on.
-  identityDir: (fs.existsSync('/homeassistant') ? '/homeassistant/nest_models/identity' : '/config/nest_models/identity'),
+  identityDir: path.join(CONFIG_DIR, 'nest_models/identity'),
   identityKeepSamples: (process.env.IDENTITY_KEEP_SAMPLES || 'false') === 'true',
 };
 
@@ -221,9 +228,16 @@ let browserPromise = null;
 // NAS; Chromium's WebRTC audio/network threads must always win that contention
 // or the received audio gaps (jitter-buffer expand) and keyword spotting dies.
 // Chromium is spawned at nice 0, then this process lowers itself to nice 10.
+// Only matters on a starved host (2-core NAS); on a big box it is a no-op.
+// Note: an unprivileged process cannot lower its nice again, so a Chromium
+// relaunch after a browser crash inherits nice 10 - the container restart
+// (supervisor watchdog) is what restores the split.
 const INFERENCE_NICE = 10;
 function setInferencePriority(low) {
-  try { os.setPriority(low ? INFERENCE_NICE : 0); } catch (e) { console.warn('[nest_headless] setPriority failed:', e.message); }
+  const cur = os.getPriority();
+  const want = low ? Math.max(cur, INFERENCE_NICE) : cur;   // never try to go lower: EACCES
+  if (want === cur) return;
+  try { os.setPriority(want); } catch (e) { console.warn('[nest_headless] setPriority failed:', e.message); }
 }
 async function getBrowser() {
   if (!browserPromise) {
@@ -643,7 +657,7 @@ function getKws() {
   if (kwsCtx !== null) return kwsCtx;
   try {
     const sherpa = require('sherpa-onnx-node');
-    const K = '/app/assets/kws';
+    const K = path.join(ASSETS_DIR, 'kws');
     const spotter = new sherpa.KeywordSpotter({
       featConfig: { sampleRate: 16000, featureDim: 80 },
       modelConfig: {
@@ -656,7 +670,7 @@ function getKws() {
       },
       // phrases hot-configurable: <config>/nest_models/keywords.txt (BPE token
       // lines, see DOCS) outranks the baked default - no rebuild to change
-      keywordsFile: ['/homeassistant/nest_models/keywords.txt', '/config/nest_models/keywords.txt']
+      keywordsFile: [path.join(CONFIG_DIR, 'nest_models/keywords.txt')]
         .find((f) => { try { return fs.existsSync(f); } catch (e) { return false; } }) || (K + '/keywords.txt'),
       // sensitivity: default threshold 0.25 / score 1.0 heard speech-level
       // audio (rms 0.02) and matched nothing; be more eager - a false
@@ -676,27 +690,37 @@ function getKws() {
 // ------------------------------------------------------------ speech-to-text
 // Offline recogniser (sherpa-onnx streaming zipformer transducer) hot-loaded
 // from cfg.sttModelDir: encoder*.onnx, decoder*.onnx, joiner*.onnx, tokens.txt.
+// Default recogniser is the keyword spotter's own gigaspeech transducer (same
+// files, already resident): on far-field kitchen audio it transcribed a
+// question the LibriSpeech en-20M model returned "" for. The local transcript
+// is a fallback; the brain gets the raw utterance (GET /utterance/<id>.wav)
+// and can run Whisper on real hardware.
 let sttCtx = null;
 function getStt() {
   if (sttCtx !== null) return sttCtx;
   try {
     const sherpa = require('sherpa-onnx-node');
-    const d = cfg.sttModelDir;
+    const K = path.join(ASSETS_DIR, 'kws');
+    const d = cfg.sttModelDir && fs.existsSync(cfg.sttModelDir) ? cfg.sttModelDir : null;
     const pick = (prefix, preferInt8) => {
       const fsx = fs.readdirSync(d).filter((f) => f.startsWith(prefix) && f.endsWith('.onnx'));
       const i8 = fsx.find((f) => f.includes('int8'));
       return path.join(d, (preferInt8 && i8) ? i8 : (fsx.find((f) => !f.includes('int8')) || i8));
     };
+    const transducer = d
+      ? { encoder: pick('encoder', true), decoder: pick('decoder', false), joiner: pick('joiner', true) }
+      : {
+        encoder: K + '/encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx',
+        decoder: K + '/decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx',
+        joiner: K + '/joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx',
+      };
     const rec = new sherpa.OnlineRecognizer({
       featConfig: { sampleRate: 16000, featureDim: 80 },
-      modelConfig: {
-        transducer: { encoder: pick('encoder', true), decoder: pick('decoder', false), joiner: pick('joiner', true) },
-        tokens: path.join(d, 'tokens.txt'), numThreads: 2, provider: 'cpu',
-      },
+      modelConfig: { transducer, tokens: d ? path.join(d, 'tokens.txt') : K + '/tokens.txt', numThreads: 2, provider: 'cpu' },
       decodingMethod: 'greedy_search',
     });
     sttCtx = { rec };
-    console.log(`[nest_headless] speech recogniser loaded from ${d}`);
+    console.log(`[nest_headless] speech recogniser loaded from ${d || 'built-in gigaspeech transducer'}`);
   } catch (e) {
     console.warn('[nest_headless] speech recogniser unavailable:', e.message);
     sttCtx = false;
@@ -834,34 +858,60 @@ function startSpeechCapture(entityId, keyword, ring) {
   const floor = Math.max(0.006, (rmses[Math.floor(rmses.length * 0.3)] || 0.006) * 2.5);
   speechCap[entityId] = {
     keyword, chunks: [...pre], startedAt: new Date(), t0: Date.now(),
-    floor, spoke: false, silenceMs: 0,
+    floor, phase: 'tail', tailQuietMs: 0, keepFrom: pre.length, listenT0: null, voicedMs: 0, silenceMs: 0,
   };
 }
+// End-pointing (Hearth #3). The spotter fires mid-phrase ("hey cl..."), so
+// the audio after the hit starts with the wake phrase's own tail; counting
+// that as "has spoken" let the natural pause after it close the window
+// before the question began. Phases:
+//   tail   - wait for the wake phrase to end: the first >= 300 ms below the
+//            speech floor. Nothing here counts as speech, and the recogniser
+//            audio starts after it. If no gap shows up within 1.2 s the
+//            person ran straight on ("hey claude is the..."): keep the audio
+//            from the hit and start listening.
+//   listen - up to 3 s of initial quiet (people wait for an acknowledgement);
+//            >= 500 ms voiced before `speech_silence_ms` of quiet can close
+//            it; speech_max_seconds is the hard stop throughout.
+const TAIL_GAP_MS = 300, TAIL_MAX_MS = 1200, SPEECH_MIN_VOICED_MS = 500, SPEECH_INITIAL_QUIET_MS = 3000;
 function feedSpeechCapture(entityId, chunk) {
   const c = speechCap[entityId];
   if (!c) return;
   c.chunks.push(chunk);
-  const r = rmsOf(chunk), ms = chunk.length / 16;
-  if (r > c.floor) { c.spoke = true; c.silenceMs = 0; } else if (c.spoke) c.silenceMs += ms;
-  const elapsed = Date.now() - c.t0;
+  const ms = chunk.length / 16, elapsed = Date.now() - c.t0, voiced = rmsOf(chunk) > c.floor;
   let reason = null;
-  if (c.spoke && c.silenceMs >= cfg.speechSilenceMs) reason = 'silence';
-  else if (elapsed >= cfg.speechMaxSeconds * 1000) reason = c.spoke ? 'max_seconds' : 'no_speech';
-  if (!reason) return;
+  if (c.phase === 'tail') {
+    c.tailQuietMs = voiced ? 0 : c.tailQuietMs + ms;
+    if (c.tailQuietMs >= TAIL_GAP_MS) { c.phase = 'listen'; c.keepFrom = c.chunks.length; c.listenT0 = Date.now(); }
+    else if (elapsed >= TAIL_MAX_MS) { c.phase = 'listen'; c.listenT0 = Date.now(); c.voicedMs = voiced ? ms : 0; }
+    else if (elapsed >= cfg.speechMaxSeconds * 1000) reason = 'no_speech';
+    if (!reason) return;
+  } else {
+    if (voiced) { c.voicedMs += ms; c.silenceMs = 0; } else c.silenceMs += ms;
+    const spoke = c.voicedMs >= SPEECH_MIN_VOICED_MS, listened = Date.now() - c.listenT0;
+    if (spoke && c.silenceMs >= cfg.speechSilenceMs) reason = 'silence';
+    else if (!c.voicedMs && listened >= SPEECH_INITIAL_QUIET_MS) reason = 'no_speech';
+    else if (!spoke && c.voicedMs && c.silenceMs >= 2000) reason = 'no_speech';   // a grunt, then nothing
+    else if (elapsed >= cfg.speechMaxSeconds * 1000) reason = spoke ? 'max_seconds' : 'no_speech';
+    if (!reason) return;
+    c.spoke = spoke;
+  }
   delete speechCap[entityId];
   finishSpeechCapture(entityId, c, reason).catch((e) => console.warn('[nest_headless] speech capture failed:', e.message));
 }
 async function finishSpeechCapture(entityId, c, reason) {
   const endedAt = new Date();
-  const total = c.chunks.reduce((a, b) => a + b.length, 0);
+  // recogniser audio starts after the wake phrase's tail (see feedSpeechCapture)
+  const kept = c.chunks.slice(Math.min(c.keepFrom || 0, Math.max(0, c.chunks.length - 1)));
+  const total = kept.reduce((a, b) => a + b.length, 0);
   const all = new Float32Array(total); let o = 0;
-  for (const ch of c.chunks) { all.set(ch, o); o += ch.length; }
+  for (const ch of kept) { all.set(ch, o); o += ch.length; }
   let text = '';
   const stt = reason === 'no_speech' ? null : getStt();
   if (stt) {
     const st = stt.rec.createStream();
     st.acceptWaveform({ samples: all, sampleRate: 16000 });
-    st.acceptWaveform({ samples: new Float32Array(8000), sampleRate: 16000 }); // flush tail
+    st.acceptWaveform({ samples: new Float32Array(16000), sampleRate: 16000 }); // 1 s zero pad flushes the last word (input_finished alone does not)
     while (stt.rec.isReady(st)) stt.rec.decode(st);
     const r = stt.rec.getResult(st);
     text = ((r && r.text) || '').trim().toLowerCase();
@@ -874,6 +924,8 @@ async function finishSpeechCapture(entityId, c, reason) {
     utterance_id: utteranceId,
     text, duration_ms: durationMs, started_at: c.startedAt.toISOString(), ended_at: endedAt.toISOString(),
     reason: text ? reason : (reason === 'no_speech' ? 'no_speech' : reason),
+    // raw 16 kHz mono WAV, memory-held for 90 s, for a stronger recogniser on the brain
+    audio_path: `/utterance/${utteranceId}.wav`, audio_ttl_s: 90,
   });
   // Identity follows as its own event so it can never delay the transcript.
   const quality = voiceQuality(c, all);
@@ -1103,6 +1155,20 @@ const server = http.createServer(async (req, res) => {
       h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20); h.writeUInt16LE(1, 22); h.writeUInt32LE(16000, 24);
       h.writeUInt32LE(32000, 28); h.writeUInt16LE(2, 32); h.writeUInt16LE(16, 34); h.write('data', 36); h.writeUInt32LE(pcm.length, 40);
       res.writeHead(200, { 'Content-Type': 'audio/wav' }); return res.end(Buffer.concat([h, pcm]));
+    }
+    if (parts[0] === 'utterance' && parts[1]) {
+      // the audio behind a nest_headless_speech event (utterance_id), while it
+      // is still in memory (90 s); never written to disk here
+      const u = utterances.get(parts[1].replace(/\.wav$/, ''));
+      if (!u || !u.samples) { res.writeHead(404); return res.end('no such utterance (expired after 90 s?)'); }
+      const pcm = Buffer.alloc(u.samples.length * 2);
+      for (let i = 0; i < u.samples.length; i++) pcm.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(u.samples[i] * 32767))), i * 2);
+      const h = Buffer.alloc(44);
+      h.write('RIFF', 0); h.writeUInt32LE(36 + pcm.length, 4); h.write('WAVE', 8); h.write('fmt ', 12);
+      h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20); h.writeUInt16LE(1, 22); h.writeUInt32LE(16000, 24);
+      h.writeUInt32LE(32000, 28); h.writeUInt16LE(2, 32); h.writeUInt16LE(16, 34); h.write('data', 36); h.writeUInt32LE(pcm.length, 40);
+      res.writeHead(200, { 'Content-Type': 'audio/wav', 'X-Utterance-Age-Seconds': String(Math.round((Date.now() - u.at) / 1000)) });
+      return res.end(Buffer.concat([h, pcm]));
     }
     if (parts[0] === 'watchstate' && parts[1]) {
       const entityId = cameraEntity(parts[1]);

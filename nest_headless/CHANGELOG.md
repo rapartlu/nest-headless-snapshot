@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.8.2
+
+- Speech end-pointing (Hearth #3): the pre-roll and the first 300 ms after
+  the keyword hit are recogniser input only, never evidence that the question
+  has started; up to 3 s of initial quiet is allowed (people wait for an
+  acknowledgement); at least 500 ms of voiced audio is required before
+  `speech_silence_ms` of quiet can close the capture; `speech_max_seconds`
+  is the hard stop. Previously the wake phrase's own tail satisfied "has
+  spoken" and the natural pause after it closed the window 0.2-1.1 s after
+  the hit, before the question began.
+- `GET /utterance/<utterance_id>.wav`: the 16 kHz mono audio behind a
+  `nest_headless_speech` event, memory-held for 90 s, so the brain can run a
+  stronger recogniser (Whisper on real hardware). The event carries
+  `audio_path` and `audio_ttl_s`. Nothing is written to disk.
+- Local transcript falls back to the keyword spotter's own gigaspeech
+  transducer (already resident) when `stt_model_dir` is unset: on far-field
+  kitchen audio it transcribed a question the LibriSpeech en-20M model
+  returned "" for. It is a rough fallback, not the product.
+- Runs outside the Supervisor. `HA_CONFIG_DIR` points at a mounted HA config
+  share, `OPTIONS_FILE` at a copy of the add-on options, `HA_WS_URL` +
+  `HA_TOKEN` (or `<config>/.nest_headless_token`) at HA; bundled assets
+  resolve relative to `app/`; macOS Chrome is found automatically. See DOCS
+  "Running on a Mac". On an M3 Pro the cat detector runs in ~160 ms versus
+  3.5-4.7 s on a 2-core NAS.
+- onnxruntime uses all cores again (the 1.8.1 `cpus - 1` cap only slowed
+  detection; nice 10 alone protects the browser). Note that an unprivileged
+  process cannot lower its nice back, so a Chromium relaunch after a browser
+  crash inherits nice 10 until the container restarts.
+
 ## 1.8.1
 
 - Fixed keyword spotting dying under load. Inference (onnxruntime, sherpa)

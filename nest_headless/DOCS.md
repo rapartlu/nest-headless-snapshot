@@ -176,3 +176,59 @@ built in:
 - **The Log tab is always empty.** Create an empty file named
   `nest_headless_log_to_file` in your config folder, and the add-on will
   write its log to `nest_headless_boot.log` there instead.
+
+## Running on a Mac (outside the Supervisor)
+
+The app is plain Node + Chromium; nothing in it needs the Supervisor. On a
+Mac on the same LAN it gets ~20x the CPU of a small NAS (cat detection
+~160 ms instead of 3-5 s) and the browser's WebRTC audio never starves.
+
+Requirements: Node 20, Google Chrome, `jq`, the HA config directory mounted
+(SMB share), and a long-lived HA token.
+
+```sh
+cd nest_headless/app && npm install
+# copy the ONNX models you built into app/assets/models/ (see Local vision models)
+```
+
+Environment (a launchd plist is the natural home; see the example below):
+
+| variable | value |
+|---|---|
+| `HA_CONFIG_DIR` | the mounted HA config dir, e.g. `/Volumes/docker/homeassistant/homeassistant` |
+| `OPTIONS_FILE` | a JSON copy of the add-on options (same keys as `config.yaml`) |
+| `HA_WS_URL` | `ws://<ha-host>:8123/api/websocket` |
+| `TOKEN_FILE` | local file holding a long-lived HA token (mode 600) |
+| `LOG_FILE` | local log path (keeps `sh` off the share) |
+
+Start with `sh nest_headless/run.sh`. Samples, `latest`, the timeline and
+models still live on the HA config share, so dashboards keep working.
+
+macOS privacy: a launchd agent is refused access to network volumes
+("Operation not permitted") until the `node` binary is granted **Full Disk
+Access** (System Settings -> Privacy & Security). `run.sh` only touches the
+share through `node`, so that one grant is enough. Keep the Mac from sleeping
+(`pmset -c disablesleep 1` on power) or the cameras go unwatched while the lid
+is closed; keep the Supervisor add-on installed with `boot: manual` as a cold
+standby.
+
+Example `~/Library/LaunchAgents/com.example.nest-headless.plist`:
+
+```xml
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.example.nest-headless</string>
+  <key>ProgramArguments</key><array><string>/bin/sh</string><string>/path/to/nest_headless/run.sh</string></array>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/path/to/node/bin:/usr/bin:/bin</string>
+    <key>HA_CONFIG_DIR</key><string>/Volumes/docker/homeassistant/homeassistant</string>
+    <key>OPTIONS_FILE</key><string>/Users/you/.config/nest_headless/options.json</string>
+    <key>HA_WS_URL</key><string>ws://192.168.0.69:8123/api/websocket</string>
+    <key>TOKEN_FILE</key><string>/Users/you/.config/nest_headless/token</string>
+    <key>LOG_FILE</key><string>/Users/you/Library/Logs/nest_headless.log</string>
+  </dict>
+  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>10</integer>
+</dict></plist>
+```
+
+Load with `launchctl bootstrap gui/$(id -u) <plist>`; the service answers on
+`http://127.0.0.1:8098/` and the consumers (Hearth) should use that address.

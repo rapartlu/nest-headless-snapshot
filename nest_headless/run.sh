@@ -1,7 +1,10 @@
 #!/usr/bin/env sh
 # Server log goes to a file reachable over the config share: this supervised
 # install has no journal gateway, so `Log` in the add-on UI shows nothing.
-LOG=/homeassistant/nest_headless_boot.log
+# Outside the supervisor (e.g. a Mac on the LAN) set HA_CONFIG_DIR to the
+# mounted HA config share and OPTIONS_FILE to a copy of the add-on options.
+CFG="${HA_CONFIG_DIR:-/homeassistant}"
+LOG="${LOG_FILE:-$CFG/nest_headless_boot.log}"
 touch "$LOG" 2>/dev/null || LOG=/config/nest_headless_boot.log
 touch "$LOG" 2>/dev/null || LOG=/tmp/boot.log
 exec > "$LOG" 2>&1
@@ -12,12 +15,13 @@ set -e
 # a long-lived HA token read from the mapped config dir, talking to HA core
 # directly on the internal network instead of the supervisor proxy (which
 # only accepts SUPERVISOR_TOKEN).
-if [ -z "$SUPERVISOR_TOKEN" ] && [ -z "$HA_TOKEN" ] && [ -f /homeassistant/.nest_headless_token ]; then
-  export HA_TOKEN="$(cat /homeassistant/.nest_headless_token)"
+TOKEN_FILE="${TOKEN_FILE:-$CFG/.nest_headless_token}"
+if [ -z "$SUPERVISOR_TOKEN" ] && [ -z "$HA_TOKEN" ] && [ -f "$TOKEN_FILE" ]; then
+  export HA_TOKEN="$(cat "$TOKEN_FILE")"
   export HA_WS_URL="${HA_WS_URL:-ws://homeassistant:8123/api/websocket}"
 fi
 
-OPTS=/data/options.json
+OPTS="${OPTIONS_FILE:-/data/options.json}"
 if [ -f "$OPTS" ]; then
   export MIN_INTERVAL_SECONDS="$(jq -r '.min_interval_seconds // 10' "$OPTS")"
   export JPEG_QUALITY="$(jq -r '.jpeg_quality // 85' "$OPTS")"
@@ -48,4 +52,4 @@ if [ -f "$OPTS" ]; then
   export IDENTITY_KEEP_SAMPLES="$(jq -r '.identity_keep_samples // false' "$OPTS")"
 fi
 
-exec node /app/server.js
+exec node "$(cd "$(dirname "$0")" && pwd)/app/server.js"

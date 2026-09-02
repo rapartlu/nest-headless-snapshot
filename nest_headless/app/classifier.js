@@ -16,7 +16,7 @@ const fs = require('fs');
 const path = require('path');
 const jpeg = require('jpeg-js');
 
-const MODELS_DIRS = ['/homeassistant/nest_models', '/config/nest_models'];
+const MODELS_DIRS = [path.join(process.env.HA_CONFIG_DIR || '/homeassistant', 'nest_models'), '/config/nest_models'];
 
 const cache = {}; // camera -> { model, mtimeMs } | { missing: true }
 

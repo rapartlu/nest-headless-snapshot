@@ -18,19 +18,21 @@ const path = require('path');
 const jpeg = require('jpeg-js');
 const ort = require('onnxruntime-node');
 const os = require('os');
-// Leave at least one core for Chromium's WebRTC receive path (see server.js getBrowser).
-const ORT_OPTS = { executionProviders: ['cpu'], intraOpNumThreads: Math.max(1, Math.min(4, os.cpus().length - 1)) };
+// All cores: the process runs at nice 10 (see server.js getBrowser), so Chromium's
+// WebRTC receive path wins contention anyway; a thread cap only slowed detection
+// (measured 3.5-4.7 s per /detect on a 2-core NAS with one thread).
+const ORT_OPTS = { executionProviders: ['cpu'], intraOpNumThreads: Math.max(1, Math.min(4, os.cpus().length)) };
 
-const DET_PATH = '/app/assets/models/yolo11n.onnx';
+const DET_PATH = path.join(__dirname, 'assets/models/yolo11n.onnx');
 // House-trained single-class cat detector (fine-tuned on this kitchen's own
 // cats - the pretrained COCO model is nearly blind to them). When the file
 // exists it owns cat detection; the COCO model still serves person checks.
-const CAT_PATH = '/app/assets/models/cats.onnx';
+const CAT_PATH = path.join(__dirname, 'assets/models/cats.onnx');
 const CAT_SIZE = 960;
 const DET_SIZE = 640;
 const CONF_DEFAULT = 0.35;
 const COCO = { 0: 'person', 15: 'cat', 16: 'dog' };
-const MODELS_DIRS = ['/homeassistant/nest_models', '/config/nest_models'];
+const MODELS_DIRS = [path.join(process.env.HA_CONFIG_DIR || '/homeassistant', 'nest_models'), '/config/nest_models'];
 
 let catSession = null;
 async function getCatDetector() {
