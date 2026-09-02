@@ -255,6 +255,13 @@ const startWatchLoop = ({ intervalMs = 4000, rois = [], diffPct = 4, quality = 0
 // to 16k and runs the keyword spotter. Nothing is recorded anywhere.
 const startWatchAudio = async () => {
   if (!window.__audioStream) return { ok: false, reason: 'no audio track' };
+  // Chromium only decodes a REMOTE WebRTC audio track that is attached to a
+  // playing media element - the watch <video> is muted, so WebAudio saw
+  // pure silence (RMS 0). Attach the track to an unmuted, volume-0 <audio>.
+  const a = document.createElement('audio');
+  a.srcObject = window.__audioStream; a.volume = 0; a.autoplay = true;
+  document.body.appendChild(a);
+  await a.play().catch(() => {});
   const ctx = new AudioContext();
   await ctx.resume().catch(() => {});
   const src = ctx.createMediaStreamSource(window.__audioStream);

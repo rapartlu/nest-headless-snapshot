@@ -632,14 +632,19 @@ function getKws() {
 }
 
 const lastKeywordMs = {};
+const audioStats = {};   // per camera: chunks, lastRms, rate, resampledLen, hits, lastError
 function onAudioChunk(entityId, b64, sampleRate) {
+  const st0 = audioStats[entityId] || (audioStats[entityId] = { chunks: 0, lastRms: 0, rate: sampleRate, resampledLen: 0, hits: 0, lastError: null });
+  st0.chunks++; st0.rate = sampleRate;
   const k = getKws();
-  if (!k) return;
+  if (!k) { st0.lastError = 'no spotter'; return; }
   try {
     const raw = Buffer.from(b64, 'base64');
     const i16 = new Int16Array(raw.buffer, raw.byteOffset, raw.byteLength >> 1);
     let f32 = new Float32Array(i16.length);
-    for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
+    let acc = 0;
+    for (let i = 0; i < i16.length; i++) { f32[i] = i16[i] / 32768; acc += f32[i] * f32[i]; }
+    st0.lastRms = Math.round(Math.sqrt(acc / Math.max(1, i16.length)) * 10000) / 10000;
     let st = k.streams[entityId];
     if (!st) {
       st = k.streams[entityId] = {
@@ -647,7 +652,8 @@ function onAudioChunk(entityId, b64, sampleRate) {
         rs: sampleRate !== 16000 ? new k.sherpa.LinearResampler(sampleRate, 16000) : null,
       };
     }
-    if (st.rs) f32 = st.rs.resample(f32, false);
+    if (st.rs) { const r = st.rs.resample(f32, false); f32 = r.samples || r; }
+    st0.resampledLen = f32.length;
     st.s.acceptWaveform({ samples: f32, sampleRate: 16000 });
     while (k.spotter.isReady(st.s)) {
       k.spotter.decode(st.s);
@@ -656,14 +662,14 @@ function onAudioChunk(entityId, b64, sampleRate) {
         k.spotter.reset(st.s);
         const now = Date.now();
         if (now - (lastKeywordMs[entityId] || 0) < 2500) continue;
-        lastKeywordMs[entityId] = now;
+        lastKeywordMs[entityId] = now; st0.hits++;
         console.log(`[nest_headless] KEYWORD "${r.keyword}" on ${entityId}`);
         postHaEvent('nest_headless_keyword', {
           entity_id: entityId, camera: entityId.replace(/^camera\./, ''), keyword: r.keyword,
         }).catch(() => {});
       }
     }
-  } catch (e) { console.warn('[nest_headless] audio chunk failed:', e.message); }
+  } catch (e) { st0.lastError = e.message; console.warn('[nest_headless] audio chunk failed:', e.message); }
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -793,6 +799,7 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({
         addon: 'nest_headless', outDir: cfg.outDir,
         cameras: Object.fromEntries(Object.entries(state).map(([k, v]) => [k, v.lastMeta])),
+        audio: audioStats,
         watches: Object.fromEntries(Object.entries(watchMgr).map(([k, m]) => [k, {
           ready: m.ready, hits: m.hits, startedAt: m.startedAt, lastError: m.lastError,
           verdictWindow: (m.verdicts || []).join(''), sustainedOpen: !!m.sustainedOpen,
