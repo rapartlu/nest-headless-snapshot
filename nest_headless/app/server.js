@@ -88,6 +88,11 @@ const cfg = {
   // Space-separated names; empty disables the audio pipeline entirely.
   // Audio is processed in-memory only - nothing is ever written to disk.
   audioCameras: (process.env.AUDIO_CAMERAS || '').split(/\s+/).filter(Boolean).map((n) => 'camera.' + n.replace(/^camera\./, '')),
+  // Speech capture after a keyword hit (see onAudioChunk): end on this much
+  // silence after speech, or at the max; recogniser hot-loads from sttModelDir.
+  speechSilenceMs: intEnv('SPEECH_SILENCE_MS', 800),
+  speechMaxSeconds: intEnv('SPEECH_MAX_SECONDS', 8),
+  sttModelDir: process.env.STT_MODEL_DIR || (fs.existsSync('/homeassistant') ? '/homeassistant/nest_models/stt' : '/config/nest_models/stt'),
 };
 
 function parseWatches(spec) {
@@ -510,6 +515,7 @@ async function watchHit(entityId, payload) {
     changed_pct: payload.changedPct,
     cat: verdict,
     detections: dets ? dets.slice(0, 5) : null,
+    people: await countPeople(frameBuf),
   });
 }
 
@@ -553,6 +559,14 @@ function saveCatSnapshot(entityId, frameBuf, dets) {
   } catch (e) {
     console.warn(`[nest_headless] cat snapshot ${entityId} failed: ${e.message}`);
   }
+}
+
+// People in frame (COCO class 0, conf >= 0.5) - a count only, no event.
+async function countPeople(frameBuf) {
+  try {
+    const d = await infer.detect(frameBuf, { conf: 0.5, classes: [0] });
+    return d === null ? null : d.length;
+  } catch (e) { return null; }
 }
 
 // Is a cat (or dog) standing on one of this camera's watched surfaces?
@@ -639,6 +653,91 @@ function getKws() {
   return kwsCtx;
 }
 
+// ------------------------------------------------------------ speech-to-text
+// Offline recogniser (sherpa-onnx streaming zipformer transducer) hot-loaded
+// from cfg.sttModelDir: encoder*.onnx, decoder*.onnx, joiner*.onnx, tokens.txt.
+let sttCtx = null;
+function getStt() {
+  if (sttCtx !== null) return sttCtx;
+  try {
+    const sherpa = require('sherpa-onnx-node');
+    const d = cfg.sttModelDir;
+    const pick = (prefix, preferInt8) => {
+      const fsx = fs.readdirSync(d).filter((f) => f.startsWith(prefix) && f.endsWith('.onnx'));
+      const i8 = fsx.find((f) => f.includes('int8'));
+      return path.join(d, (preferInt8 && i8) ? i8 : (fsx.find((f) => !f.includes('int8')) || i8));
+    };
+    const rec = new sherpa.OnlineRecognizer({
+      featConfig: { sampleRate: 16000, featureDim: 80 },
+      modelConfig: {
+        transducer: { encoder: pick('encoder', true), decoder: pick('decoder', false), joiner: pick('joiner', true) },
+        tokens: path.join(d, 'tokens.txt'), numThreads: 2, provider: 'cpu',
+      },
+      decodingMethod: 'greedy_search',
+    });
+    sttCtx = { rec };
+    console.log(`[nest_headless] speech recogniser loaded from ${d}`);
+  } catch (e) {
+    console.warn('[nest_headless] speech recogniser unavailable:', e.message);
+    sttCtx = false;
+  }
+  return sttCtx;
+}
+
+// Per-camera capture state: after a keyword hit, accumulate 16k samples until
+// silence-after-speech or the max window, then recognise and post ONE event.
+const speechCap = {};
+function rmsOf(a) { let acc = 0; for (let i = 0; i < a.length; i++) acc += a[i] * a[i]; return Math.sqrt(acc / Math.max(1, a.length)); }
+function startSpeechCapture(entityId, keyword, ring) {
+  const pre = [];  // ~300 ms pre-roll so a fast talker's first syllable survives
+  let need = 4800;
+  for (let i = ring.length - 1; i >= 0 && need > 0; i--) { pre.unshift(ring[i]); need -= ring[i].length; }
+  // noise floor from the ring's quietest recent chunks (x2.5, min 0.006)
+  const rmses = ring.map(rmsOf).sort((a, b) => a - b);
+  const floor = Math.max(0.006, (rmses[Math.floor(rmses.length * 0.3)] || 0.006) * 2.5);
+  speechCap[entityId] = {
+    keyword, chunks: [...pre], startedAt: new Date(), t0: Date.now(),
+    floor, spoke: false, silenceMs: 0,
+  };
+}
+function feedSpeechCapture(entityId, chunk) {
+  const c = speechCap[entityId];
+  if (!c) return;
+  c.chunks.push(chunk);
+  const r = rmsOf(chunk), ms = chunk.length / 16;
+  if (r > c.floor) { c.spoke = true; c.silenceMs = 0; } else if (c.spoke) c.silenceMs += ms;
+  const elapsed = Date.now() - c.t0;
+  let reason = null;
+  if (c.spoke && c.silenceMs >= cfg.speechSilenceMs) reason = 'silence';
+  else if (elapsed >= cfg.speechMaxSeconds * 1000) reason = c.spoke ? 'max_seconds' : 'no_speech';
+  if (!reason) return;
+  delete speechCap[entityId];
+  finishSpeechCapture(entityId, c, reason).catch((e) => console.warn('[nest_headless] speech capture failed:', e.message));
+}
+async function finishSpeechCapture(entityId, c, reason) {
+  const endedAt = new Date();
+  const total = c.chunks.reduce((a, b) => a + b.length, 0);
+  const all = new Float32Array(total); let o = 0;
+  for (const ch of c.chunks) { all.set(ch, o); o += ch.length; }
+  let text = '';
+  const stt = reason === 'no_speech' ? null : getStt();
+  if (stt) {
+    const st = stt.rec.createStream();
+    st.acceptWaveform({ samples: all, sampleRate: 16000 });
+    st.acceptWaveform({ samples: new Float32Array(8000), sampleRate: 16000 }); // flush tail
+    while (stt.rec.isReady(st)) stt.rec.decode(st);
+    const r = stt.rec.getResult(st);
+    text = ((r && r.text) || '').trim().toLowerCase();
+  }
+  const durationMs = Math.round(total / 16);
+  console.log(`[nest_headless] SPEECH "${text}" on ${entityId} (${durationMs} ms, ${reason})`);
+  await postHaEvent('nest_headless_speech', {
+    entity_id: entityId, camera: entityId.replace(/^camera\./, ''), keyword: c.keyword,
+    text, duration_ms: durationMs, started_at: c.startedAt.toISOString(), ended_at: endedAt.toISOString(),
+    reason: text ? reason : (reason === 'no_speech' ? 'no_speech' : reason),
+  });
+}
+
 const lastKeywordMs = {};
 const audioStats = {};   // per camera: chunks, lastRms, rate, resampledLen, hits, lastError
 function onAudioChunk(entityId, b64, sampleRate) {
@@ -667,6 +766,7 @@ function onAudioChunk(entityId, b64, sampleRate) {
     st.ring = st.ring || [];
     st.ring.push(Float32Array.from(f32));
     while (st.ring.length > 32) st.ring.shift();   // ~8s at 250ms chunks
+    feedSpeechCapture(entityId, f32);
     st.s.acceptWaveform({ samples: f32, sampleRate: 16000 });
     while (k.spotter.isReady(st.s)) {
       k.spotter.decode(st.s);
@@ -674,12 +774,14 @@ function onAudioChunk(entityId, b64, sampleRate) {
       if (r && r.keyword) {
         k.spotter.reset(st.s);
         const now = Date.now();
+        if (speechCap[entityId]) continue;                       // capture in progress: no re-trigger
         if (now - (lastKeywordMs[entityId] || 0) < 2500) continue;
         lastKeywordMs[entityId] = now; st0.hits++;
         console.log(`[nest_headless] KEYWORD "${r.keyword}" on ${entityId} at ${new Date().toISOString()}`);
         postHaEvent('nest_headless_keyword', {
           entity_id: entityId, camera: entityId.replace(/^camera\./, ''), keyword: r.keyword,
         }).catch(() => {});
+        startSpeechCapture(entityId, r.keyword, st.ring || []);
       }
     }
   } catch (e) { st0.lastError = e.message; console.warn('[nest_headless] audio chunk failed:', e.message); }
@@ -786,16 +888,22 @@ async function runWatch(entityId, intervalSec) {
 // ------------------------------------------------------------ HTTP API
 function serveFile(res, entityId, extraHeaders = {}) {
   const file = cameraFile(entityId);
+  // Read fully, then send: the watch loop rewrites this file every second, so
+  // stat-then-stream raced the writer and the Content-Length mismatch reset
+  // the connection (curl exit 56 on /latest).
   fs.stat(file, (err, st) => {
     if (err) { res.writeHead(404); res.end('no snapshot yet'); return; }
-    const age = (Date.now() - st.mtimeMs) / 1000;
-    res.writeHead(200, {
-      'Content-Type': 'image/jpeg',
-      'Content-Length': st.size,
-      'X-Capture-Age-Seconds': age.toFixed(1),
-      ...extraHeaders,
+    fs.readFile(file, (err2, data) => {
+      if (err2) { res.writeHead(404); res.end('no snapshot yet'); return; }
+      const age = (Date.now() - st.mtimeMs) / 1000;
+      res.writeHead(200, {
+        'Content-Type': 'image/jpeg',
+        'Content-Length': data.length,
+        'X-Capture-Age-Seconds': age.toFixed(1),
+        ...extraHeaders,
+      });
+      res.end(data);
     });
-    fs.createReadStream(file).pipe(res);
   });
 }
 
@@ -852,12 +960,32 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ mgr: mgr ? { ready: mgr.ready, hits: mgr.hits, lastError: mgr.lastError } : null, page: pageState }));
       return;
     }
+    if (parts[0] === 'frame' && parts[1]) {
+      // Instant JPEG off the held stream - no persist, detect, or archive.
+      // /snapshot's fast path still runs persistShot (annotate + archive on
+      // the NAS CPU) and falls into a full re-dial when that stalls, hence
+      // the 30-45 s Hearth measured.
+      const entityId = cameraEntity(parts[1]);
+      const mgr = watchMgr[entityId];
+      if (!mgr || !mgr.ready || !mgr.page) { res.writeHead(404); return res.end('camera not in watch mode'); }
+      const t0 = Date.now();
+      const shot = await mgr.page.evaluate(fns.grabFrame, { quality: cfg.jpegQuality, crop: null });
+      const jpg = Buffer.from(shot.dataUrl.split(',')[1], 'base64');
+      res.writeHead(200, {
+        'Content-Type': 'image/jpeg', 'Content-Length': jpg.length,
+        'X-Capture-Age-Seconds': ((Date.now() - t0) / 1000).toFixed(2),
+        'X-Mean-Luma': String(Math.round(shot.meanLuma * 10) / 10),
+        'X-Width': String(shot.width), 'X-Height': String(shot.height),
+      });
+      return res.end(jpg);
+    }
     if (parts[0] === 'detect' && parts[1]) {
       const entityId = cameraEntity(parts[1]);
       const { buf } = await captureCoalesced(entityId);
       const { cat, dets } = await catOnSurface(entityId, buf);
+      const people = await countPeople(buf);
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ cat_on_surface: cat, detections: dets }));
+      res.end(JSON.stringify({ cat_on_surface: cat, detections: dets, people }));
       return;
     }
     if (parts[0] === 'snapshot' && parts[1]) {

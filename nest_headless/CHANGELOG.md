@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.7.0
+
+- Speech-to-text after a keyword hit: the utterance following the phrase is
+  captured (300 ms pre-roll; ends on `speech_silence_ms` of quiet after
+  speech or at `speech_max_seconds`) and recognised with a sherpa-onnx
+  streaming zipformer hot-loaded from `nest_models/stt/` (`stt_model_dir`).
+  One event: `nest_headless_speech` {camera, keyword, text, duration_ms,
+  started_at, ended_at, reason: silence|max_seconds|no_speech}. Audio stays
+  in memory; keyword hits are suppressed on that camera during a capture.
+- `GET /frame/<camera>`: instant JPEG off the held stream with no persist,
+  detect or archive side effects (~0.5 s). `/snapshot` remains the archiving
+  path.
+- Fixed `GET /latest/<camera>.jpg` resetting the connection: the file is
+  rewritten every second by the watch loop, so stat-then-stream raced the
+  writer; it is now read whole and sent.
+- `people` (COCO person count, conf >= 0.5) on `/detect` responses and on
+  `nest_headless_surface_activity`. No new event.
+- Audio tap moved to an AudioWorklet (ScriptProcessor dropped every other
+  buffer under page load, corrupting speech); watch pages load from
+  `http://127.0.0.1:<port>/blank` because AudioWorklet needs a secure context.
+
 ## 1.6.0
 
 - Action phrases from the camera microphone. The WebRTC session has always
