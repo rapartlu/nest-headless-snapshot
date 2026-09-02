@@ -1050,6 +1050,10 @@ async function finishSpeechCapture(entityId, c, reason) {
   // Whisper's stage directions - "(baby crying)", "[inaudible]", "(background
   // noise drowns out speaker)" - are not something the brain should parse.
   if (text && /^[\s(\[][^A-Za-z0-9]*[^()\[\]]*[)\]]\W*$/.test(text) && !/[a-z]{2,}\s+[a-z]{2,}.*[a-z]/i.test(text.replace(/[(\[][^)\]]*[)\]]/g, ''))) { text = ''; reason = 'unclear'; }
+  if (c.followUp && !text) {   // a follow-up window that caught only noise is the same as nobody replying (Hearth #4)
+    console.log(`[nest_headless] follow-up window on ${entityId} closed: nothing intelligible (${reason})`);
+    return;
+  }
   const durationMs = Math.round(total / 16);
   const utteranceId = `${entityId.replace(/^camera\./, '')}-${c.t0}`;
   console.log(`[nest_headless] SPEECH "${text}" on ${entityId} (${durationMs} ms, ${reason}, ${stt ? stt.engine : 'no-stt'} ${sttMs} ms, wake ${wakeConfirmed ? 'confirmed' : 'unconfirmed'})`);
