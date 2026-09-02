@@ -276,7 +276,7 @@ async function capture(entityId) {
   let session = null;
   const timeoutMs = cfg.captureTimeoutSeconds * 1000;
   try {
-    await page.goto('about:blank');
+    await page.goto(`http://127.0.0.1:${cfg.port}/blank`);
     session = await dialSession(entityId, page, timeoutMs);
 
     const shot = await page.evaluate(fns.waitAndCapture, {
@@ -697,7 +697,7 @@ async function runWatch(entityId, intervalSec) {
     try {
       const browser = await getBrowser();
       page = await browser.newPage();
-      await page.goto('about:blank');
+      await page.goto(`http://127.0.0.1:${cfg.port}/blank`);
       await page.exposeFunction('__watchHitNode', (payload) =>
         watchHit(entityId, payload).catch((e) => console.warn('[nest_headless] watch hit failed:', e.message)));
       if (cfg.audioCameras.includes(entityId)) {
@@ -804,6 +804,12 @@ const server = http.createServer(async (req, res) => {
   const parts = url.pathname.split('/').filter(Boolean);
 
   try {
+    if (url.pathname === '/blank') {
+      // watch pages load this instead of about:blank: localhost is a secure
+      // context, which AudioWorklet requires (about:blank is opaque-origin)
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      return res.end('<!doctype html><title>nest_headless watch</title>');
+    }
     if (url.pathname === '/health') {
       res.writeHead(200); res.end('ok'); return;
     }

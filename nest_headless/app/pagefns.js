@@ -265,26 +265,58 @@ const startWatchAudio = async () => {
   const ctx = new AudioContext();
   await ctx.resume().catch(() => {});
   const src = ctx.createMediaStreamSource(window.__audioStream);
+  // AudioWorklet, not ScriptProcessor: the deprecated ScriptProcessorNode
+  // runs on the page's main thread and dropped every other 4096-sample
+  // buffer while the motion loop was busy (a clean 186 ms click train on
+  // both cameras; speech unrecognisable). The worklet runs on the audio
+  // rendering thread and cannot be starved by page work.
+  const code = `
+    class Tap extends AudioWorkletProcessor {
+      constructor() { super(); this.buf = []; this.len = 0; this.target = Math.round(sampleRate / 4); }
+      process(inputs) {
+        const ch = inputs[0] && inputs[0][0];
+        if (ch && ch.length) {
+          this.buf.push(new Float32Array(ch)); this.len += ch.length;
+          if (this.len >= this.target) {
+            const all = new Float32Array(this.len); let o = 0;
+            for (const b of this.buf) { all.set(b, o); o += b.length; }
+            this.buf = []; this.len = 0;
+            this.port.postMessage(all, [all.buffer]);
+          }
+        }
+        return true;
+      }
+    }
+    registerProcessor('nest-tap', Tap);`;
+  const ship = (all) => {
+    const i16 = new Int16Array(all.length);
+    for (let i = 0; i < all.length; i++) i16[i] = Math.max(-32768, Math.min(32767, all[i] * 32768));
+    let bin = ''; const u8 = new Uint8Array(i16.buffer);
+    for (let i = 0; i < u8.length; i += 0x8000) bin += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+    if (window.__audioChunkNode) window.__audioChunkNode(btoa(bin), ctx.sampleRate);
+  };
+  if (ctx.audioWorklet) {   // needs a secure context: the watch page is served from localhost for this
+    await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([code], { type: 'application/javascript' })));
+    const node = new AudioWorkletNode(ctx, 'nest-tap');
+    node.port.onmessage = (e) => ship(e.data);
+    src.connect(node); node.connect(ctx.destination);
+    window.__audioCtx = ctx;
+    return { ok: true, sampleRate: ctx.sampleRate, worklet: true };
+  }
+  // fallback (insecure context): main-thread ScriptProcessor - glitch-prone
   const proc = ctx.createScriptProcessor(4096, 1, 1);
-  let buf = [];
-  let len = 0;
+  let buf = [], len = 0;
   proc.onaudioprocess = (e) => {
     const ch = e.inputBuffer.getChannelData(0);
     buf.push(new Float32Array(ch)); len += ch.length;
-    if (len >= ctx.sampleRate / 4) {                // ~250ms chunks: recognition lag was up to 1s per chunk
-      const all = new Float32Array(len);
-      let o = 0; for (const b of buf) { all.set(b, o); o += b.length; }
-      buf = []; len = 0;
-      const i16 = new Int16Array(all.length);
-      for (let i = 0; i < all.length; i++) i16[i] = Math.max(-32768, Math.min(32767, all[i] * 32768));
-      let bin = ''; const u8 = new Uint8Array(i16.buffer);
-      for (let i = 0; i < u8.length; i += 0x8000) bin += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
-      if (window.__audioChunkNode) window.__audioChunkNode(btoa(bin), ctx.sampleRate);
+    if (len >= ctx.sampleRate / 4) {
+      const all = new Float32Array(len); let o = 0; for (const b of buf) { all.set(b, o); o += b.length; }
+      buf = []; len = 0; ship(all);
     }
   };
   src.connect(proc); proc.connect(ctx.destination);
   window.__audioCtx = ctx;
-  return { ok: true, sampleRate: ctx.sampleRate };
+  return { ok: true, sampleRate: ctx.sampleRate, worklet: false };
 };
 
 const watchState = () => ({
