@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.8.3
+
+- Whisper transcripts. Point `stt_model_dir` at a sherpa-onnx Whisper model
+  directory (`<name>-encoder*.onnx`, `<name>-decoder*.onnx`,
+  `<name>-tokens.txt`; e.g. `sherpa-onnx-whisper-small.en`) and the add-on
+  transcribes with it in-process: small.en int8 takes ~0.6 s per utterance
+  on an M3 Pro and turned tonight's far-field captures into "Hey kitchen, is
+  the understair cupboard open?" where the transducers gave fragments.
+  Transcripts stay authoritative in the add-on (Hearth #3). Hosts without a
+  Whisper dir keep the transducer fallback. `nest_headless_speech` gains
+  `engine`, `stt_ms` and `final: true`; Whisper text keeps its casing and
+  punctuation.
+
 ## 1.8.2
 
 - Speech end-pointing (Hearth #3): the pre-roll and the first 300 ms after

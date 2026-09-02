@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.8.2';
+const ADDON_VERSION = '1.8.3';
 
 const http = require('http');
 const fs = require('fs');
@@ -707,6 +707,28 @@ function getStt() {
       const i8 = fsx.find((f) => f.includes('int8'));
       return path.join(d, (preferInt8 && i8) ? i8 : (fsx.find((f) => !f.includes('int8')) || i8));
     };
+    // Whisper (sherpa-onnx OfflineRecognizer): a dir holding <name>-encoder*.onnx,
+    // <name>-decoder*.onnx, <name>-tokens.txt. small.en int8 transcribes an
+    // 8 s utterance in ~0.6 s on an M3 Pro and is the product; the
+    // transducers below are the fallback for hosts that cannot afford it.
+    const wfiles = d ? fs.readdirSync(d) : [];
+    const wEnc = wfiles.find((f) => /-encoder\.int8\.onnx$/.test(f)) || wfiles.find((f) => /-encoder\.onnx$/.test(f));
+    const wDec = wfiles.find((f) => /-decoder\.int8\.onnx$/.test(f)) || wfiles.find((f) => /-decoder\.onnx$/.test(f));
+    const wTok = wfiles.find((f) => /-tokens\.txt$/.test(f));
+    if (wEnc && wDec && wTok) {
+      const name = wEnc.replace(/-encoder.*$/, '');
+      const rec = new sherpa.OfflineRecognizer({
+        featConfig: { sampleRate: 16000, featureDim: 80 },
+        modelConfig: {
+          whisper: { encoder: path.join(d, wEnc), decoder: path.join(d, wDec), language: 'en', task: 'transcribe', tailPaddings: -1 },
+          tokens: path.join(d, wTok), numThreads: Math.max(2, Math.min(6, os.cpus().length - 2)), provider: 'cpu', debug: 0,
+        },
+        decodingMethod: 'greedy_search',
+      });
+      sttCtx = { rec, kind: 'offline', engine: `whisper-${name}` };
+      console.log(`[nest_headless] speech recogniser loaded: whisper ${name} from ${d}`);
+      return sttCtx;
+    }
     const transducer = d
       ? { encoder: pick('encoder', true), decoder: pick('decoder', false), joiner: pick('joiner', true) }
       : {
@@ -719,7 +741,7 @@ function getStt() {
       modelConfig: { transducer, tokens: d ? path.join(d, 'tokens.txt') : K + '/tokens.txt', numThreads: 2, provider: 'cpu' },
       decodingMethod: 'greedy_search',
     });
-    sttCtx = { rec };
+    sttCtx = { rec, kind: 'online', engine: d ? 'zipformer-' + path.basename(d) : 'zipformer-gigaspeech-3.3M' };
     console.log(`[nest_headless] speech recogniser loaded from ${d || 'built-in gigaspeech transducer'}`);
   } catch (e) {
     console.warn('[nest_headless] speech recogniser unavailable:', e.message);
@@ -908,7 +930,14 @@ async function finishSpeechCapture(entityId, c, reason) {
   for (const ch of kept) { all.set(ch, o); o += ch.length; }
   let text = '';
   const stt = reason === 'no_speech' ? null : getStt();
-  if (stt) {
+  const tStt = Date.now();
+  if (stt && stt.kind === 'offline') {
+    const st = stt.rec.createStream();
+    st.acceptWaveform({ samples: all, sampleRate: 16000 });
+    stt.rec.decode(st);
+    const r = stt.rec.getResult(st);
+    text = ((r && r.text) || '').trim();
+  } else if (stt) {
     const st = stt.rec.createStream();
     st.acceptWaveform({ samples: all, sampleRate: 16000 });
     st.acceptWaveform({ samples: new Float32Array(16000), sampleRate: 16000 }); // 1 s zero pad flushes the last word (input_finished alone does not)
@@ -916,14 +945,16 @@ async function finishSpeechCapture(entityId, c, reason) {
     const r = stt.rec.getResult(st);
     text = ((r && r.text) || '').trim().toLowerCase();
   }
+  const sttMs = Date.now() - tStt;
   const durationMs = Math.round(total / 16);
   const utteranceId = `${entityId.replace(/^camera\./, '')}-${c.t0}`;
-  console.log(`[nest_headless] SPEECH "${text}" on ${entityId} (${durationMs} ms, ${reason})`);
+  console.log(`[nest_headless] SPEECH "${text}" on ${entityId} (${durationMs} ms, ${reason}, ${stt ? stt.engine : 'no-stt'} ${sttMs} ms)`);
   await postHaEvent('nest_headless_speech', {
     entity_id: entityId, camera: entityId.replace(/^camera\./, ''), keyword: c.keyword,
     utterance_id: utteranceId,
     text, duration_ms: durationMs, started_at: c.startedAt.toISOString(), ended_at: endedAt.toISOString(),
     reason: text ? reason : (reason === 'no_speech' ? 'no_speech' : reason),
+    engine: stt ? stt.engine : null, stt_ms: sttMs, final: true,
     // raw 16 kHz mono WAV, memory-held for 90 s, for a stronger recogniser on the brain
     audio_path: `/utterance/${utteranceId}.wav`, audio_ttl_s: 90,
   });
