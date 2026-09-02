@@ -621,6 +621,11 @@ function getKws() {
         tokens: K + '/tokens.txt', numThreads: 2, provider: 'cpu',
       },
       keywordsFile: K + '/keywords.txt',
+      // sensitivity: default threshold 0.25 / score 1.0 heard speech-level
+      // audio (rms 0.02) and matched nothing; be more eager - a false
+      // "Yes? I heard you." is cheap, a missed phrase is the feature failing
+      keywordsThreshold: 0.12,
+      keywordsScore: 2.0,
     });
     kwsCtx = { sherpa, spotter, streams: {} };
     console.log('[nest_headless] keyword spotter loaded');
@@ -654,6 +659,11 @@ function onAudioChunk(entityId, b64, sampleRate) {
     }
     if (st.rs) { const r = st.rs.resample(f32, false); f32 = r.samples || r; }
     st0.resampledLen = f32.length;
+    // diagnostic ring buffer: last ~8s of 16k audio, memory only, served by
+    // GET /audiodebug/<camera>.wav on explicit request - never persisted
+    st.ring = st.ring || [];
+    st.ring.push(Float32Array.from(f32));
+    while (st.ring.length > 8) st.ring.shift();
     st.s.acceptWaveform({ samples: f32, sampleRate: 16000 });
     while (k.spotter.isReady(st.s)) {
       k.spotter.decode(st.s);
@@ -810,6 +820,19 @@ const server = http.createServer(async (req, res) => {
     if (parts[0] === 'latest' && parts[1]) {
       serveFile(res, cameraEntity(parts[1].replace(/\.jpg$/, '')));
       return;
+    }
+    if (parts[0] === 'audiodebug' && parts[1]) {
+      const cam = 'camera.' + parts[1].replace(/\.wav$/, '');
+      const st = kwsCtx && kwsCtx.streams && kwsCtx.streams[cam];
+      if (!st || !st.ring || !st.ring.length) { res.writeHead(404); return res.end('no audio buffered'); }
+      const n = st.ring.reduce((a, b) => a + b.length, 0);
+      const pcm = Buffer.alloc(n * 2); let o = 0;
+      for (const c of st.ring) for (let i = 0; i < c.length; i++) { pcm.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(c[i] * 32767))), o); o += 2; }
+      const h = Buffer.alloc(44);
+      h.write('RIFF', 0); h.writeUInt32LE(36 + pcm.length, 4); h.write('WAVE', 8); h.write('fmt ', 12);
+      h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20); h.writeUInt16LE(1, 22); h.writeUInt32LE(16000, 24);
+      h.writeUInt32LE(32000, 28); h.writeUInt16LE(2, 32); h.writeUInt16LE(16, 34); h.write('data', 36); h.writeUInt32LE(pcm.length, 40);
+      res.writeHead(200, { 'Content-Type': 'audio/wav' }); return res.end(Buffer.concat([h, pcm]));
     }
     if (parts[0] === 'watchstate' && parts[1]) {
       const entityId = cameraEntity(parts[1]);
