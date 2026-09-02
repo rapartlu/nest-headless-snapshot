@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.8.6';
+const ADDON_VERSION = '1.8.7';
 
 const http = require('http');
 const fs = require('fs');
@@ -910,15 +910,25 @@ function feedSpeechCapture(entityId, chunk) {
   const c = speechCap[entityId];
   if (!c) return;
   c.chunks.push(chunk);
-  const ms = chunk.length / 16, elapsed = Date.now() - c.t0, voiced = rmsOf(chunk) > c.floor;
+  const ms = chunk.length / 16, elapsed = Date.now() - c.t0, rms = rmsOf(chunk);
   let reason = null;
   if (c.phase === 'tail') {
+    const voiced = rms > c.floor;
     c.tailQuietMs = voiced ? 0 : c.tailQuietMs + ms;
     if (c.tailQuietMs >= TAIL_GAP_MS) { c.phase = 'listen'; c.keepFrom = c.chunks.length; c.listenT0 = Date.now(); }
-    else if (elapsed >= TAIL_MAX_MS) { c.phase = 'listen'; c.keepFrom = 0; c.listenT0 = Date.now(); c.voicedMs = TAIL_MAX_MS; }   // ran straight on: keep the pre-roll (the question started in it) and count the run-on as speech already
+    else if (elapsed >= TAIL_MAX_MS) { c.phase = 'listen'; c.keepFrom = 0; c.listenT0 = Date.now(); c.voicedMs = TAIL_MAX_MS; c.peakRms = rms; }   // ran straight on: keep the pre-roll (the question started in it) and count the run-on as speech already
     else if (elapsed >= cfg.speechMaxSeconds * 1000) reason = 'no_speech';
     if (!reason) return;
   } else {
+    // Once speech has been heard, "quiet" is judged relative to that speech
+    // (18% of its running peak, never below the floor): kitchen bustle at
+    // 0.01-0.06 rms sat above a fixed floor and kept captures open to the
+    // hard stop (Hearth #3, 8 s for a 3.5 s question). The absolute floor
+    // still decides whether anything was said at all.
+    c.peakRms = Math.max(c.peakRms || 0, rms);
+    const heard = c.voicedMs >= SPEECH_MIN_VOICED_MS;
+    const quietBelow = heard ? Math.max(c.floor, 0.18 * c.peakRms) : c.floor;
+    const voiced = rms > quietBelow;
     if (voiced) { c.voicedMs += ms; c.silenceMs = 0; } else c.silenceMs += ms;
     const spoke = c.voicedMs >= SPEECH_MIN_VOICED_MS, listened = Date.now() - c.listenT0;
     if (spoke && c.silenceMs >= cfg.speechSilenceMs) reason = 'silence';

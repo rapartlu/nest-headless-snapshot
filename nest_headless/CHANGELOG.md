@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.8.7
+
+- Once speech has been heard, "quiet" is judged relative to that speech
+  (18% of the utterance's running peak rms, never below the floor). Kitchen
+  bustle at 0.01-0.06 rms sat above the fixed floor and kept captures open
+  to the 8 s hard stop for a 3.5 s question (Hearth #3, instrumented). The
+  absolute floor still decides whether anything was said at all.
+
 ## 1.8.6
 
 - Utterances are peak-normalised (to -3 dBFS, at most x20) before
