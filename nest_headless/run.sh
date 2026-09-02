@@ -49,6 +49,8 @@ if [ -f "$OPTS" ]; then
   export SPEECH_MAX_SECONDS="$(jq -r '.speech_max_seconds // 8' "$OPTS")"
   STT_OPT="$(jq -r '.stt_model_dir // ""' "$OPTS")"
   [ -n "$STT_OPT" ] && export STT_MODEL_DIR="$STT_OPT"
+  STT_URL_OPT="$(jq -r '.stt_url // ""' "$OPTS")"
+  [ -n "$STT_URL_OPT" ] && export STT_URL="$STT_URL_OPT"
   export IDENTITY_KEEP_SAMPLES="$(jq -r '.identity_keep_samples // false' "$OPTS")"
 fi
 

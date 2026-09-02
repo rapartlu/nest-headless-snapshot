@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.8.5';
+const ADDON_VERSION = '1.8.6';
 
 const http = require('http');
 const fs = require('fs');
@@ -105,6 +105,9 @@ const cfg = {
   speechSilenceMs: intEnv('SPEECH_SILENCE_MS', 800),
   speechMaxSeconds: intEnv('SPEECH_MAX_SECONDS', 8),
   sttModelDir: process.env.STT_MODEL_DIR || path.join(CONFIG_DIR, 'nest_models/stt'),
+  // Optional whisper.cpp server (Metal on a Mac): POST /inference. Falls back
+  // to the in-process recogniser when unreachable. e.g. http://127.0.0.1:8178
+  sttUrl: (process.env.STT_URL || '').replace(/\/+$/, ''),
   // Voice identity: embeddings + enrolments under <config>/nest_models/identity/.
   // Raw enrolment WAVs are kept only when identity_keep_samples is on.
   identityDir: path.join(CONFIG_DIR, 'nest_models/identity'),
@@ -931,6 +934,45 @@ function feedSpeechCapture(entityId, chunk) {
 // Drop the wake phrase (and anything before it) from a transcript that
 // includes the pre-roll. Spellings cover how the recognisers render "Claude"
 // for the voices in this house ("Claws", "God", "Cloud", ...).
+// whisper.cpp `whisper-server` (POST /inference, multipart "file" = 16 kHz
+// mono WAV). Audio goes over loopback and is never written to disk.
+function wavBuffer(samples) {
+  const pcm = Buffer.alloc(samples.length * 2);
+  for (let i = 0; i < samples.length; i++) pcm.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(samples[i] * 32767))), i * 2);
+  const h = Buffer.alloc(44);
+  h.write('RIFF', 0); h.writeUInt32LE(36 + pcm.length, 4); h.write('WAVE', 8); h.write('fmt ', 12);
+  h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20); h.writeUInt16LE(1, 22); h.writeUInt32LE(16000, 24);
+  h.writeUInt32LE(32000, 28); h.writeUInt16LE(2, 32); h.writeUInt16LE(16, 34); h.write('data', 36); h.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([h, pcm]);
+}
+function whisperServer(samples) {
+  return new Promise((resolve, reject) => {
+    const boundary = '----nest' + Date.now().toString(36);
+    const field = (name, value) => Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`);
+    const body = Buffer.concat([
+      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="u.wav"\r\nContent-Type: audio/wav\r\n\r\n`),
+      wavBuffer(samples), Buffer.from('\r\n'),
+      field('response_format', 'json'), field('temperature', '0'), field('language', 'en'),
+      Buffer.from(`--${boundary}--\r\n`),
+    ]);
+    const u = new URL(cfg.sttUrl + '/inference');
+    const req = http.request({ host: u.hostname, port: u.port || 80, path: u.pathname, method: 'POST', timeout: 8000,
+      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}`, 'Content-Length': body.length } }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        if (res.statusCode !== 200) return reject(new Error(`http ${res.statusCode}`));
+        try {
+          const j = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          resolve({ text: String(j.text || '').trim(), engine: 'whisper.cpp' });
+        } catch (e) { reject(e); }
+      });
+    });
+    req.on('timeout', () => req.destroy(new Error('timeout')));
+    req.on('error', reject);
+    req.end(body);
+  });
+}
 const WAKE_NAMES = 'claude|claud|clawed|claws|clause|cloud|clod|clawd|god|kitchen';
 const WAKE_RE = new RegExp(`^[\\s\\S]*?\\b(?:hey|hi|ok|okay)[,.!?]?\\s+(?:${WAKE_NAMES})\\b[,.!?]*\\s*`, 'i');
 // pre-roll cut mid-phrase: transcript starts with the bare name ("clawed, is the...")
@@ -948,10 +990,23 @@ async function finishSpeechCapture(entityId, c, reason) {
   const total = kept.reduce((a, b) => a + b.length, 0);
   const all = new Float32Array(total); let o = 0;
   for (const ch of kept) { all.set(ch, o); o += ch.length; }
+  // Normalise for the recogniser (peak to -3 dBFS, at most x20): the mic sits
+  // above the patio doors and speech from the far side of the kitchen arrives
+  // at rms 0.01-0.08, which Whisper reads as noise; scaled, it reads it fine.
+  let peak = 0;
+  for (let i = 0; i < all.length; i++) { const a = Math.abs(all[i]); if (a > peak) peak = a; }
+  const gain = peak > 0 ? Math.min(20, 0.7 / peak) : 1;
+  if (gain > 1.05) for (let i = 0; i < all.length; i++) all[i] = Math.max(-1, Math.min(1, all[i] * gain));
   let text = '';
-  const stt = reason === 'no_speech' ? null : getStt();
+  let stt = reason === 'no_speech' ? null : getStt();
   const tStt = Date.now();
-  if (stt && stt.kind === 'offline') {
+  let remote = null;
+  if (reason !== 'no_speech' && cfg.sttUrl) {
+    remote = await whisperServer(all).catch((e) => { console.warn('[nest_headless] whisper server failed, using local recogniser:', e.message); return null; });
+  }
+  if (remote) {
+    text = remote.text; stt = { engine: remote.engine };
+  } else if (stt && stt.kind === 'offline') {
     const st = stt.rec.createStream();
     st.acceptWaveform({ samples: all, sampleRate: 16000 });
     stt.rec.decode(st);
@@ -967,6 +1022,9 @@ async function finishSpeechCapture(entityId, c, reason) {
   }
   const sttMs = Date.now() - tStt;
   text = stripWakePhrase(text);
+  // Whisper's stage directions - "(baby crying)", "[inaudible]", "(background
+  // noise drowns out speaker)" - are not something the brain should parse.
+  if (text && /^[\s(\[][^A-Za-z0-9]*[^()\[\]]*[)\]]\W*$/.test(text) && !/[a-z]{2,}\s+[a-z]{2,}.*[a-z]/i.test(text.replace(/[(\[][^)\]]*[)\]]/g, ''))) { text = ''; reason = 'unclear'; }
   const durationMs = Math.round(total / 16);
   const utteranceId = `${entityId.replace(/^camera\./, '')}-${c.t0}`;
   console.log(`[nest_headless] SPEECH "${text}" on ${entityId} (${durationMs} ms, ${reason}, ${stt ? stt.engine : 'no-stt'} ${sttMs} ms)`);

@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.8.6
+
+- Utterances are peak-normalised (to -3 dBFS, at most x20) before
+  recognition: speech from the far side of the kitchen arrives at rms
+  0.01-0.08 and Whisper read it as noise (Hearth #3).
+- Whisper's bracketed sound tags ("(baby crying)", "[inaudible]") are never
+  posted as `text`: the event carries `text: ""` with `reason: "unclear"`.
+- `stt_url`: optional whisper.cpp `whisper-server` (POST /inference over
+  loopback, audio never touches disk) used ahead of the in-process model,
+  with automatic fallback when unreachable. `engine: "whisper.cpp"`.
+
+## 1.8.5
+
+- Speech noise floor = the ring's quietest tenth x3, clamped to 0.006-0.015:
+  a ring full of conversation or a spoken answer had lifted it to ~0.1,
+  above a normal voice, producing false `no_speech`. The 1.2 s run-on
+  fallback now counts the run-on as speech already (Hearth #3). Transcripts
+  that begin with the bare wake name are stripped too.
+
 ## 1.8.4
 
 - 1.5 s pre-roll on speech captures (was 300 ms): the spotter fires 0.3-0.7 s
