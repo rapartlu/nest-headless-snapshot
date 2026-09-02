@@ -278,3 +278,7 @@ voice `TTS_VOICE`.
 ~/.config/nest_headless/venv/bin/pip install mlx-audio "misaki[en]"
 TTS_VOICE=bf_emma PORT=8179 ~/.config/nest_headless/venv/bin/python host/tts_server.py
 ```
+
+Note for both host servers: launchd reads `EnvironmentVariables` only at
+`bootstrap`; after editing the plist do `launchctl bootout` then `bootstrap`
+(a `kickstart -k` restarts the process with the old environment).
