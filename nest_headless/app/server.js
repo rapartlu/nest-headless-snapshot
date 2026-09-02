@@ -979,7 +979,7 @@ function whisperServer(samples) {
         if (res.statusCode !== 200) return reject(new Error(`http ${res.statusCode}`));
         try {
           const j = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-          resolve({ text: String(j.text || '').trim(), engine: 'whisper.cpp' });
+          resolve({ text: String(j.text || '').trim(), engine: String(j.engine || 'whisper-server') + (j.model ? ':' + String(j.model).replace(/^.*\//, '') : '') });
         } catch (e) { reject(e); }
       });
     });

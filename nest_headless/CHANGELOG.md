@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.8.9 (host)
+
+- `host/whisper_server.py`: Whisper large-v3-turbo via Apple MLX behind the
+  same `POST /inference` API as whisper.cpp, for `stt_url`. ~0.5-0.7 s per
+  utterance on an M3 Pro; `engine` reports `mlx-whisper:whisper-large-v3-turbo`.
+
 ## 1.8.9
 
 - Follow-up window (Hearth #4): `POST /listen/<camera>?seconds=8` opens a

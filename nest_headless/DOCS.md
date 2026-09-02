@@ -236,3 +236,23 @@ windowless Chrome and the audio tap delivers ~40% of real time (measured
 1.7 chunks/s instead of 4), which silently breaks keyword spotting and
 starves speech captures. Load with `launchctl bootstrap gui/$(id -u) <plist>`; the service answers on
 `http://127.0.0.1:8098/` and the consumers (Hearth) should use that address.
+
+### Whisper large-v3-turbo on the Mac (MLX)
+
+The in-process recogniser (`stt_model_dir`, sherpa-onnx Whisper small.en) is
+the fallback. For the real thing on Apple silicon run `host/whisper_server.py`
+(Apple MLX, GPU) and point `stt_url` at it; it speaks the same `POST
+/inference` multipart shape as whisper.cpp's `whisper-server`, so either
+works. large-v3-turbo transcribes a 5 s utterance in ~0.5-0.7 s on an M3 Pro.
+
+```sh
+python3 -m venv ~/.config/nest_headless/venv
+~/.config/nest_headless/venv/bin/pip install mlx-whisper
+WHISPER_MODEL=mlx-community/whisper-large-v3-turbo PORT=8178 \
+  ~/.config/nest_headless/venv/bin/python host/whisper_server.py   # first start fetches ~1.5 GB
+```
+
+Then `"stt_url": "http://127.0.0.1:8178"` in the options file and restart the
+add-on. Run it under launchd like the add-on (KeepAlive, ProcessType
+Interactive). Audio goes over loopback only and is never written to disk;
+the add-on falls back to the in-process model whenever the server is down.
