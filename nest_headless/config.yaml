@@ -1,5 +1,5 @@
 name: Nest Headless Snapshot
-version: "1.10.6"
+version: "1.11.0"
 slug: nest_headless
 description: >-
   Server-side Nest camera stills via headless Chromium — the only WebRTC
@@ -29,6 +29,10 @@ options:
   watch_cameras: ""
   watch_rois: ""
   watch_passages: ""
+  watch_classify_zones: ""
+  watch_activity_zones: ""
+  activity_pct: 1.5
+  zone_change_threshold: 10
   watch_diff_pct: 4
   watch_cooldown_seconds: 60
   watch_classify_seconds: 15
@@ -52,6 +56,10 @@ schema:
   watch_cameras: str?
   watch_rois: str?
   watch_passages: str?
+  watch_classify_zones: str?
+  watch_activity_zones: str?
+  activity_pct: float(0.1,50)?
+  zone_change_threshold: float(1,100)?
   watch_diff_pct: int(1,50)?
   watch_cooldown_seconds: int(5,3600)?
   watch_classify_seconds: int(0,3600)?

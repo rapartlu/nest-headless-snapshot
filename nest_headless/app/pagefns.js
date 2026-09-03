@@ -219,6 +219,7 @@ const startWatchLoop = ({ intervalMs = 4000, rois = [], diffPct = 4, quality = 0
       window.__watchTicks++;
       if (prev) {
         let best = null;
+        const act = {};   // activity zones: per-tick change % reported to Node, never a hit
         window.__watchMaxPct = window.__watchMaxPct || 0;
         for (const r of rois) {
           const x0 = Math.floor(r.x * W), y0 = Math.floor(r.y * H);
@@ -231,9 +232,11 @@ const startWatchLoop = ({ intervalMs = 4000, rois = [], diffPct = 4, quality = 0
             if (Math.abs(g[i] - prev[i]) > 22) changed++;
           }
           const pct = total ? (changed / total) * 100 : 0;
+          if (r.activity) { act[r.name] = Math.round(pct * 10) / 10; continue; }
           if (pct > window.__watchMaxPct) window.__watchMaxPct = Math.round(pct * 10) / 10;
           if (pct >= diffPct && (!best || pct > best.pct)) best = { roi: r.name || 'roi', pct: Math.round(pct * 10) / 10 };
         }
+        if (window.__activityNode && Object.keys(act).length) window.__activityNode(act);
         if (best) {
           // page.evaluate serializes this function WITHOUT its module scope:
           // grabFrame must be pre-installed on window by the server (it was

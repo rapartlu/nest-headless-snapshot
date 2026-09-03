@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.10.6';
+const ADDON_VERSION = '1.11.0';
 
 const http = require('http');
 const fs = require('fs');
@@ -89,6 +89,14 @@ const cfg = {
   watchRois: parseWatchRois(process.env.WATCH_ROIS || ''),
   // Passage zones (doorways): polygons + optional inside point, see passages.js
   watchPassages: parseWatchPassages(process.env.WATCH_PASSAGES || ''),
+  // Classify zones (Hearth #12): named crops with a model each
+  // (<camera>__<zone>.onnx in nest_models), e.g. washer_door / dryer_door;
+  // state-change events. Activity zones: per-tick change inside the crop,
+  // running/idle transitions (a drum turning behind glass).
+  watchClassifyZones: parseWatchRois(process.env.WATCH_CLASSIFY_ZONES || ''),
+  watchActivityZones: parseWatchRois(process.env.WATCH_ACTIVITY_ZONES || ''),
+  activityPct: Number(process.env.ACTIVITY_PCT || 1.5),
+  zoneChangeThreshold: Number(process.env.ZONE_CHANGE_THRESHOLD || 10),   // mean grey difference (0-255) on a 48x48 fingerprint
   watchDiffPct: Number(process.env.WATCH_DIFF_PCT || 4),
   watchCooldownSeconds: intEnv('WATCH_COOLDOWN_SECONDS', 60),
   // For watched cameras with a crop + trained model: score the live stream
@@ -561,6 +569,139 @@ async function passageTick(entityId, mgr, frameBuf, now) {
       postHaEvent('nest_headless_passage', { entity_id: entityId, camera: entityId.replace(/^camera\./, ''), ...ev }).catch(() => {});
     }
   } catch (e) { console.warn(`[nest_headless] passage tick ${entityId} failed: ${e.message}`); }
+}
+
+// ------------------------------------------------------------ state zones (Hearth #12, #13)
+// The senses/intelligence split: the add-on notices THAT a zone's content
+// changed (a door swung open, a fridge door, a drawer) and hands the brain
+// the before/after crops plus who was nearby; the brain decides what it
+// means (open/closed, what was taken). No per-appliance training needed.
+// A zone is compared against a reference crop taken when it was last steady
+// for STEADY_TICKS; a sustained difference (CHANGE_TICKS ticks above
+// zoneChangeThreshold) posts nest_headless_zone_change and, once the new
+// look has held for STEADY_TICKS, becomes the new reference.
+// If a trained model exists for the zone (<camera>__<zone>.onnx, classes
+// closed/open) the same tick also runs it and posts nest_headless_zone_state
+// on debounced flips - an optional accelerator, e.g. the cupboard door.
+const ZONE_TICK_MS = 2000, ZONE_DEBOUNCE_TICKS = 2, STEADY_TICKS = 3, CHANGE_TICKS = 2, ZONE_CHANGE_THRESHOLD = 10;
+let sharpMod = null;
+function getSharp() { if (sharpMod === null) { try { sharpMod = require('sharp'); } catch (e) { sharpMod = false; } } return sharpMod; }
+async function zoneCrops(sharp, jpg, W, H, z) {
+  const left = Math.max(0, Math.round(z.x * W)), top = Math.max(0, Math.round(z.y * H));
+  const width = Math.max(8, Math.min(W - left, Math.round(z.w * W))), height = Math.max(8, Math.min(H - top, Math.round(z.h * H)));
+  const base = sharp(jpg).extract({ left, top, width, height });
+  const [jpeg, grey] = await Promise.all([
+    base.clone().jpeg({ quality: 88 }).toBuffer(),
+    base.clone().resize(48, 48, { fit: 'fill' }).greyscale().raw().toBuffer(),   // fingerprint for the change test
+  ]);
+  return { jpeg, grey, rect: { x: left / W, y: top / H, w: width / W, h: height / H } };
+}
+function greyDiff(a, b) { if (!a || !b || a.length !== b.length) return 0; let s = 0; for (let i = 0; i < a.length; i++) s += Math.abs(a[i] - b[i]); return s / a.length; }
+async function peopleNear(entityId, jpg, rect) {
+  // person boxes overlapping the zone grown by half its size each way, with face matches when a face sits in the box
+  try {
+    const d = await infer.detect(jpg, { conf: 0.4, classes: [0] });
+    if (!d) return [];
+    const gx = rect.x - rect.w / 2, gy = rect.y - rect.h / 2, gw = rect.w * 2, gh = rect.h * 2;
+    const near = d.filter((p) => p.box.x < gx + gw && p.box.x + p.box.w > gx && p.box.y < gy + gh && p.box.y + p.box.h > gy);
+    if (!near.length) return [];
+    let seen = [];
+    if (faces.hasModels(FACE_MODELS_DIR())) {
+      const found = await faces.facesInJpeg(FACE_MODELS_DIR(), jpg, { minPx: 40 }).catch(() => null);
+      seen = (found || []).filter((f) => f.embedding).map((f) => ({ box: f.box, matches: matchFace(f.embedding) }));
+    }
+    return near.map((p) => {
+      const face = seen.find((f) => f.box.x + f.box.w / 2 > p.box.x && f.box.x + f.box.w / 2 < p.box.x + p.box.w && f.box.y + f.box.h / 2 > p.box.y && f.box.y + f.box.h / 2 < p.box.y + p.box.h);
+      const top = face && face.matches[0] && face.matches[0].score >= 0.4 ? face.matches[0] : null;
+      return { box: { x: r4(p.box.x), y: r4(p.box.y), w: r4(p.box.w), h: r4(p.box.h) }, height_ratio: Math.round(p.box.h * 100) / 100, name: top ? top.name : null, score: top ? top.score : null, matches: face ? face.matches : [] };
+    });
+  } catch (e) { return []; }
+}
+async function zoneClassifyTick(entityId, mgr) {
+  const zones = cfg.watchClassifyZones[entityId] || [];
+  if (!zones.length || !mgr.page || !mgr.ready) return;
+  const sharp = getSharp(); if (!sharp) return;
+  const shot = await mgr.page.evaluate(fns.grabFrame, { quality: cfg.jpegQuality, crop: null });
+  if (!shot || shot.meanLuma < 3) return;
+  const jpg = Buffer.from(shot.dataUrl.split(',')[1], 'base64');
+  const W = shot.width, H = shot.height, now = Date.now();
+  mgr.zones = mgr.zones || {};
+  for (const z of zones) {
+    const st = mgr.zones[z.name] || (mgr.zones[z.name] = { state: null, score: null, ticks: [], since: null, model: false, ref: null, refJpeg: null, refSince: null, steady: 0, changed: 0, lastChangeMs: 0, diff: 0 });
+    const c = await zoneCrops(sharp, jpg, W, H, z);
+    // --- change detection against the reference look
+    if (!st.ref) { st.steady++; if (st.steady >= STEADY_TICKS) { st.ref = c.grey; st.refJpeg = c.jpeg; st.refSince = now; } st.last = c.grey; continue; }
+    st.diff = Math.round(greyDiff(c.grey, st.ref) * 10) / 10;
+    const settled = greyDiff(c.grey, st.last) < ZONE_CHANGE_THRESHOLD / 2;   // not mid-motion
+    st.last = c.grey;
+    if (st.diff >= cfg.zoneChangeThreshold) {
+      st.changed++; st.steady = 0;
+      if (st.changed === CHANGE_TICKS) {
+        const people = await peopleNear(entityId, jpg, c.rect);
+        const recent = (mgr.recentNames || []).filter((r) => now - r.t < 60000).map((r) => r.name);
+        console.log(`[nest_headless] ZONE CHANGE ${z.name} on ${entityId}: diff ${st.diff} vs reference held ${Math.round((now - st.refSince) / 1000)}s; people ${people.length}${people.some((p) => p.name) ? ' (' + people.filter((p) => p.name).map((p) => p.name).join(',') + ')' : ''}`);
+        postHaEvent('nest_headless_zone_change', {
+          entity_id: entityId, camera: entityId.replace(/^camera\./, ''), zone: z.name, t: new Date(now).toISOString(),
+          diff: st.diff, reference_held_s: Math.round((now - st.refSince) / 1000),
+          before_jpeg_b64: st.refJpeg.toString('base64'), after_jpeg_b64: c.jpeg.toString('base64'),
+          people_nearby: people, recent_names: [...new Set(recent)],
+        }).catch(() => {});
+        st.lastChangeMs = now;
+      }
+      // adopt the new look once it has held still for STEADY_TICKS after the change
+      if (st.changed > CHANGE_TICKS && settled) { st.hold = (st.hold || 0) + 1; if (st.hold >= STEADY_TICKS) { st.ref = c.grey; st.refJpeg = c.jpeg; st.refSince = now; st.changed = 0; st.hold = 0; } } else st.hold = 0;
+    } else { st.changed = 0; st.hold = 0; st.steady++; if (settled && st.steady >= STEADY_TICKS * 5) { st.ref = c.grey; st.refJpeg = c.jpeg; } }   // slow drift (lighting) refresh
+    // --- optional trained state model
+    const key = `${entityId}__${z.name}`;
+    if (!infer.hasDoorModel(key)) { st.model = false; continue; }
+    const v = await infer.classifyDoor(key, c.jpeg, { label: z.name, threshold: 0.5 });
+    if (!v) continue;
+    st.model = true; st.score = v.score; st.ticks.push(v.positive ? 1 : 0);
+    while (st.ticks.length > ZONE_DEBOUNCE_TICKS) st.ticks.shift();
+    const sum = st.ticks.reduce((a, b) => a + b, 0);
+    let next = st.state;
+    if (st.ticks.length >= ZONE_DEBOUNCE_TICKS) { if (sum === ZONE_DEBOUNCE_TICKS) next = 'open'; else if (sum === 0) next = 'closed'; }
+    if (next && next !== st.state) {
+      const prev = st.state;
+      const prevDuration = st.since ? Math.round((now - st.since) / 1000) : null;
+      st.state = next; st.since = now;
+      console.log(`[nest_headless] ZONE ${z.name} on ${entityId}: ${prev || 'unknown'} -> ${next} (score ${v.score})`);
+      if (prev) {
+        const people = await peopleNear(entityId, jpg, c.rect);
+        postHaEvent('nest_headless_zone_state', {
+          entity_id: entityId, camera: entityId.replace(/^camera\./, ''), zone: z.name, label: z.name,
+          state: next, previous: prev, score: v.score, previous_duration_s: prevDuration, t: new Date(now).toISOString(), people_nearby: people,
+        }).catch(() => {});
+      }
+    }
+  }
+}
+// Activity zones: the page reports per-tick change % inside each zone; a
+// rolling window (20 ticks) decides running/idle with hysteresis (>= 60% of
+// ticks above activity_pct to start, < 20% to stop).
+const activityState = {}; // entityId -> zone -> { window, state, since, lastMean }
+function onActivity(entityId, pcts) {
+  const zones = cfg.watchActivityZones[entityId] || [];
+  const st = activityState[entityId] || (activityState[entityId] = {});
+  for (const z of zones) {
+    const pct = Number(pcts && pcts[z.name]);
+    if (!Number.isFinite(pct)) continue;
+    const a = st[z.name] || (st[z.name] = { window: [], state: 'idle', since: Date.now(), lastMean: 0 });
+    a.window.push(pct); while (a.window.length > 20) a.window.shift();
+    a.lastMean = Math.round(a.window.reduce((x, y) => x + y, 0) / a.window.length * 10) / 10;
+    if (a.window.length < 10) continue;
+    const above = a.window.filter((p) => p >= cfg.activityPct).length / a.window.length;
+    const next = a.state === 'running' ? (above < 0.2 ? 'idle' : 'running') : (above >= 0.6 ? 'running' : 'idle');
+    if (next !== a.state) {
+      const now = Date.now(), prev = a.state, dur = Math.round((now - a.since) / 1000);
+      a.state = next; a.since = now;
+      console.log(`[nest_headless] ACTIVITY ${z.name} on ${entityId}: ${prev} -> ${next} after ${dur}s (mean ${a.lastMean}%)`);
+      postHaEvent('nest_headless_activity', {
+        entity_id: entityId, camera: entityId.replace(/^camera\./, ''), zone: z.name,
+        state: next, previous: prev, previous_duration_s: dur, mean_pct: a.lastMean, t: new Date(now).toISOString(),
+      }).catch(() => {});
+    }
+  }
 }
 
 async function watchHit(entityId, payload) {
@@ -1325,17 +1466,22 @@ async function runWatch(entityId, intervalSec) {
   const surfaces = cfg.watchRois[entityId] || [];
   // passage zones join the page's motion mask (named "passage:<name>") so a
   // person in a doorway produces hits; they are never cat surfaces
-  const rois = surfaces.concat((cfg.watchPassages[entityId] || []).map((p) => ({ name: 'passage:' + p.name, pts: p.pts, x: p.x, y: p.y, w: p.w, h: p.h })));
+  const rois = surfaces
+    .concat((cfg.watchPassages[entityId] || []).map((p) => ({ name: 'passage:' + p.name, pts: p.pts, x: p.x, y: p.y, w: p.w, h: p.h })))
+    .concat((cfg.watchActivityZones[entityId] || []).map((z) => ({ name: z.name, pts: z.pts, x: z.x, y: z.y, w: z.w, h: z.h, activity: true })));
   // No ROIs is fine: the stream still serves instant snapshots and classify
   // ticks - there is just no surface-motion event source for this camera.
   for (;;) {
-    let page = null, session = null, classifyTimer = null, heartbeatTimer = null;
+    let page = null, session = null, classifyTimer = null, heartbeatTimer = null, zoneTimer = null;
     try {
       const browser = await getBrowser();
       page = await browser.newPage();
       await page.goto(`http://127.0.0.1:${cfg.port}/blank`);
       await page.exposeFunction('__watchHitNode', (payload) =>
         watchHit(entityId, payload).catch((e) => console.warn('[nest_headless] watch hit failed:', e.message)));
+      if ((cfg.watchActivityZones[entityId] || []).length) {
+        await page.exposeFunction('__activityNode', (pcts) => { try { onActivity(entityId, pcts); } catch (e) { /* ignore */ } });
+      }
       if (cfg.audioCameras.includes(entityId)) {
         await page.exposeFunction('__audioChunkNode', (b64, rate) => onAudioChunk(entityId, b64, rate));
       }
@@ -1393,6 +1539,9 @@ async function runWatch(entityId, intervalSec) {
           } catch (e) { /* stream hiccup; health loop handles it */ }
         }, cfg.watchClassifySeconds * 1000);
       }
+      if (cfg.watchClassifySeconds > 0 && (cfg.watchClassifyZones[entityId] || []).length) {
+        zoneTimer = setInterval(() => zoneClassifyTick(entityId, mgr).catch((e) => console.warn(`[nest_headless] zone tick ${entityId}: ${e.message}`)), ZONE_TICK_MS);
+      }
       if (cfg.samplesDir && cfg.sampleArchiveSeconds > 0) {
         // heartbeat: keep the timeline flowing at a steady cadence even when
         // nothing moves - motion-driven archives reset the clock via the
@@ -1411,6 +1560,7 @@ async function runWatch(entityId, intervalSec) {
       console.warn(`[nest_headless] watch ${entityId} down (${e.message}); retrying in 30s`);
     } finally {
       try { if (classifyTimer) clearInterval(classifyTimer); } catch (e) { /* ok */ }
+      try { if (zoneTimer) clearInterval(zoneTimer); } catch (e) { /* ok */ }
       try { if (heartbeatTimer) clearInterval(heartbeatTimer); } catch (e) { /* ok */ }
       try { if (session) session.close(); } catch (e) { /* ok */ }
       try { if (page) await page.close(); } catch (e) { /* ok */ }
@@ -1480,6 +1630,8 @@ const server = http.createServer(async (req, res) => {
           ready: m.ready, hits: m.hits, startedAt: m.startedAt, lastError: m.lastError,
           verdictWindow: (m.verdicts || []).join(''), sustainedOpen: !!m.sustainedOpen,
           passages: (cfg.watchPassages[k] || []).map((p) => p.name), tracks: m.tracker ? m.tracker.tracks.length : 0,
+          zones: Object.fromEntries(Object.entries(m.zones || {}).map(([z, s]) => [z, { state: s.state, score: s.score, model: !!s.model, diff: s.diff, reference_since: s.refSince ? new Date(s.refSince).toISOString() : null, last_change: s.lastChangeMs ? new Date(s.lastChangeMs).toISOString() : null }])),
+          activity: Object.fromEntries(Object.entries(activityState[k] || {}).map(([z, a]) => [z, { state: a.state, mean_pct: a.lastMean, since: new Date(a.since).toISOString() }])),
         }])),
       }, null, 2));
       return;

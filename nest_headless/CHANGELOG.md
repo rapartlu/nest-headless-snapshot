@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.11.0
+
+- State zones (Hearth #12, #13), the senses/intelligence split made
+  explicit: `watch_classify_zones: "camera:name@x:y:w:h;..."` names crops
+  the add-on watches every 2 s against a reference look. A sustained change
+  (2 ticks over `zone_change_threshold` on a 48x48 grey fingerprint) posts
+  `nest_headless_zone_change` {camera, zone, t, diff, reference_held_s,
+  before_jpeg_b64, after_jpeg_b64, people_nearby: [{box, height_ratio,
+  name|null, score, matches}], recent_names} - the brain decides what the
+  change means (a door opened, what was taken). No per-appliance training.
+  If a trained model exists for a zone (`<camera>__<zone>.onnx`, classes
+  closed/open) the tick also posts debounced `nest_headless_zone_state`
+  {state, previous, score, previous_duration_s, people_nearby}.
+- Activity zones: `watch_activity_zones` names crops whose per-tick change
+  is reported from the page loop; a 20-tick window with hysteresis posts
+  `nest_headless_activity` {zone, state: running|idle, previous_duration_s,
+  mean_pct} - a drum turning behind glass.
+- `GET /` shows per-zone diff/reference age/last change and activity state.
+
 ## 1.10.6
 
 - `stt_shadow_url`: a second recogniser that receives every utterance in
