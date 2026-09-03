@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.17.4';
+const ADDON_VERSION = '1.17.5';
 
 const http = require('http');
 const fs = require('fs');

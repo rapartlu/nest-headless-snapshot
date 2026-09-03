@@ -40,7 +40,11 @@ class PendingStore {
     const idx = this._load();
     for (const id of await fsp.readdir(this.dir)) {
       if (id.startsWith('_') || idx.has(id) || this.removed.has(id)) continue;
-      try { const m = JSON.parse(await fsp.readFile(path.join(this.dir, id, 'meta.json'), 'utf8')); if (m && m.id === id) idx.set(id, m); } catch (e) { /* skip */ }
+      try { const m = JSON.parse(await fsp.readFile(path.join(this.dir, id, 'meta.json'), 'utf8')); if (m && m.id === id) idx.set(id, m); }
+      catch (e) {
+        // no readable meta: a removal a restart interrupted - finish it, so no media lingers
+        if (e.code === 'ENOENT' && ID_RE.test(id)) fsp.rm(path.join(this.dir, id), { recursive: true, force: true }).catch(() => {});
+      }
     }
     this.removed.clear();
     await fsp.mkdir(this.negDir, { recursive: true });
@@ -68,7 +72,13 @@ class PendingStore {
   remove(id) {
     if (!this.get(id)) return false;
     this.index.delete(id); this.removed.add(id);
-    (this.writes.get(id) || Promise.resolve()).then(() => fsp.rm(path.join(this.dir, id), { recursive: true, force: true })).catch(() => {});
+    // meta.json goes first and synchronously (when its write has landed), so a
+    // restart in the next instant cannot bring the entry back; the media and
+    // the folder follow asynchronously
+    const dir = path.join(this.dir, id);
+    const wipe = () => { try { fs.unlinkSync(path.join(dir, 'meta.json')); } catch (e) { /* already gone */ } return fsp.rm(dir, { recursive: true, force: true }); };
+    const w = this.writes.get(id);
+    if (w) w.then(wipe).catch(() => {}); else wipe().catch(() => {});
     return true;
   }
   // Prune by age and count, oldest first.

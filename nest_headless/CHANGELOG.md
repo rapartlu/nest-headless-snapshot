@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.17.5
+
+- Backlog removals are restart-safe: the entry's metadata is unlinked
+  first and synchronously, the media and folder follow; the loader
+  finishes any removal a restart interrupted (a folder without metadata).
+  A deleted entry had come back after a restart and been labelled from a
+  stale card.
+
 ## 1.17.4
 
 - The one-face-per-camera-per-minute backlog guard is reserved before the
