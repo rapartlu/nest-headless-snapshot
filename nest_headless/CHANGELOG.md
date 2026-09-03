@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.16.2
+
+- Cat descriptor v2 (#23): the detection box's colour histogram has its
+  surroundings (the crop's margin ring) subtracted, and coat and texture
+  come from the box's inner 60 %, so a small cat on a grey worktop is
+  described by its coat rather than the worktop. v1 had named a ginger cat
+  as the black one at 0.917 because both crops were mostly kitchen. Samples
+  carry `v`; older ones are listed (`stale` on the cat summary) but never
+  matched - re-enrol them. A name is given only once at least two cats have
+  current samples: with one cat in the gallery every animal is its best
+  match.
+
+## 1.16.1
+
+- Archive retention by age (#25): heartbeat frames for `archive_days` (7),
+  frames behind events, hits, cat evidence and zone composites for
+  `evidence_days` (30); the count caps stay as a safety net sized to those
+  windows. `GET /archive/<camera>/<time>.jpg` also searches the cat and hit
+  archives (box-annotated copies), preferring a raw frame in range and
+  saying `X-Frame-Annotated: true` otherwise. Three of last night's cat
+  cards that 404'd now resolve.
+
 ## 1.16.0
 
 - The recognition corpus for review (#24): `GET /identity/<name>/samples`

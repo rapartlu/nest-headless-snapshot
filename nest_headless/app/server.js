@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.16.0';
+const ADDON_VERSION = '1.16.2';
 
 const http = require('http');
 const fs = require('fs');
@@ -79,6 +79,11 @@ const cfg = {
   // tiny door-state classifier, gathered across lighting conditions.
   samplesDir: process.env.SAMPLES_DIR || '',
   samplesMax: intEnv('SAMPLES_MAX', 2000),
+  // Retention by age (#25): heartbeat frames archive_days, frames behind
+  // events / hits / cat evidence / zone composites evidence_days. The count
+  // caps stay only as a safety net sized to those windows.
+  archiveDays: intEnv('ARCHIVE_DAYS', 7),
+  evidenceDays: intEnv('EVIDENCE_DAYS', 30),
   // Archive cadence: at most one frame per this many seconds reaches the
   // samples dir / timeline, and watched cameras also heartbeat-archive at
   // this rate even with zero motion (frames come off the live stream, so a
@@ -552,22 +557,27 @@ function noteFrame(entityId, jpg, t = Date.now()) {
 }
 function keepEventFrame(entityId, t, jpg) {
   if (!cfg.samplesDir || !jpg) return;
-  sampleIndex(entityId, '_events').put(evidence.stampOf(t) + '.jpg', jpg, { max: 600, dropN: 60 }).catch(() => {});
+  sampleIndex(entityId, '_events').put(evidence.stampOf(t) + '.jpg', jpg, EVIDENCE_KEEP()).catch(() => {});
 }
+// retention for evidence archives (events, hits, cats, zone composites): evidence_days, count cap as a safety net
+const EVIDENCE_KEEP = () => ({ max: 20000, dropN: 500, maxAgeMs: cfg.evidenceDays * 86400000, ageOf: evidence.parseStamp });
 // nearest frame to t: memory ring, then the event archive, then the heartbeat archive
 async function frameNear(entityId, t, withinMs) {
   const cands = [];
   const r = frameRings[entityId] && frameRings[entityId].nearest(t);
   if (r) cands.push({ dt: r.dt, t: r.t, source: 'memory', jpg: r.jpg });
   if (cfg.samplesDir) {
-    for (const [suffix, source] of [['_events', 'events'], ['', 'archive']]) {
+    // raw frames first (events, heartbeat); the cat and hit archives hold
+    // box-annotated copies, returned only when nothing raw is in range (#25)
+    for (const [suffix, source, raw] of [['_events', 'events', true], ['', 'archive', true], ['_cats', 'cats', false], ['_hits', 'hits', false]]) {
       const ix = sampleIndex(entityId, suffix);
-      const n = evidence.nearestName(await ix.load(), t);
-      if (n) cands.push({ dt: n.dt, t: n.t, source, file: path.join(ix.dir, n.name) });
+      const n = evidence.nearestName(await ix.load(), t, { raw });
+      if (n) cands.push({ dt: n.dt, t: n.t, source, annotated: !raw, file: path.join(ix.dir, n.name) });
     }
   }
-  const best = cands.sort((a, b) => a.dt - b.dt)[0];
-  if (!best || best.dt > withinMs) return null;
+  const inRange = cands.filter((c) => c.dt <= withinMs).sort((a, b) => a.dt - b.dt);
+  const best = inRange.find((c) => !c.annotated) || inRange[0];
+  if (!best) return null;
   if (!best.jpg) best.jpg = await require('fs/promises').readFile(best.file);
   return best;
 }
@@ -580,7 +590,9 @@ function archiveSample(entityId, buf) {
   lastArchiveMs[entityId] = now;
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   // cap the archive: drop the oldest tenth when full
-  sampleIndex(entityId).put(stamp + '.jpg', buf, { max: cfg.samplesMax, dropN: Math.ceil(cfg.samplesMax / 10) })
+  // archive_days of frames (plus their _f/_a copies), the count cap sized to that window
+  const need = Math.ceil(cfg.archiveDays * 86400 / Math.max(10, cfg.sampleArchiveSeconds)) * 3 + 100;
+  sampleIndex(entityId).put(stamp + '.jpg', buf, { max: Math.max(cfg.samplesMax, need), dropN: Math.ceil(Math.max(cfg.samplesMax, need) / 10), maxAgeMs: cfg.archiveDays * 86400000, ageOf: evidence.parseStamp })
     .catch((e) => console.warn('[nest_headless] sample archive failed:', e.message));
   return stamp + '.jpg';
 }
@@ -873,7 +885,7 @@ async function zoneClassifyTick(entityId, mgr) {
         if (cfg.samplesDir) {
           lookUrl = `/look/zones/${entityId.replace(/^camera\./, '')}/${z.name}/${evidence.stampOf(now)}.jpg`;
           zonePairComposite(sharp, st.refJpeg, c.jpeg)
-            .then((buf) => sampleIndex(entityId, '_zones/' + z.name).put(evidence.stampOf(now) + '.jpg', buf, { max: 200, dropN: 20 }))
+            .then((buf) => sampleIndex(entityId, '_zones/' + z.name).put(evidence.stampOf(now) + '.jpg', buf, EVIDENCE_KEEP()))
             .catch((e) => console.warn(`[nest_headless] zone pair ${z.name} failed: ${e.message}`));
         }
         postHaEvent('nest_headless_zone_change', {
@@ -1066,7 +1078,7 @@ function saveHitSnapshot(entityId, frameBuf, dets, roi) {
   lastHitSnapMs[entityId] = now;
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   infer.annotate(frameBuf, dets || [], cfg.watchRois[entityId] || [])
-    .then((boxed) => sampleIndex(entityId, '_hits').put(`${stamp}_${roi}.jpg`, boxed, { max: 600, dropN: 60 }))
+    .then((boxed) => sampleIndex(entityId, '_hits').put(`${stamp}_${roi}.jpg`, boxed, EVIDENCE_KEEP()))
     .catch(() => { /* evidence is best-effort */ });
 }
 
@@ -1084,7 +1096,7 @@ async function saveCatSnapshot(entityId, frameBuf, dets) {
     if (cfg.samplesDir) {
       // every cat event archived, no throttle: these are the frames questions
       // get asked about ("where was it? was that really a cat?")
-      sampleIndex(entityId, '_cats').put(new Date().toISOString().replace(/[:.]/g, '-') + '.jpg', boxed).catch(() => {});
+      sampleIndex(entityId, '_cats').put(new Date().toISOString().replace(/[:.]/g, '-') + '.jpg', boxed, EVIDENCE_KEEP()).catch(() => {});
     }
   } catch (e) {
     console.warn(`[nest_headless] cat snapshot ${entityId} failed: ${e.message}`);
@@ -1294,7 +1306,7 @@ function loadEnrolled() {
         if (!kind) continue;
         try {
           const j = JSON.parse(fs.readFileSync(path.join(d, f), 'utf8'));
-          if (Array.isArray(j.embedding)) ({ voice: items, face: fitems, cat: citems })[kind[1]].push({ ...sampleItem(f, j), sized: j.sized !== false });
+          if (Array.isArray(j.embedding)) ({ voice: items, face: fitems, cat: citems })[kind[1]].push({ ...sampleItem(f, j), sized: j.sized !== false, v: j.v || 1 });
         } catch (e) { /* skip */ }
       }
       if (items.length) enrolled[name] = items;
@@ -1320,15 +1332,21 @@ function matchFace(embedding) {
 // Descriptor cosines run high (a colour histogram dominates), so the naming
 // line is 0.9 and "decisive" needs 0.03 clear of the runner-up.
 const CAT_NAME_AT = 0.9, CAT_DECISIVE = 0.92, CAT_GAP = 0.03, CAT_MIN_PX = 60;
+// Only samples made by the current descriptor version count (older ones are
+// listed but never matched; re-enrol them). A name is given only when at
+// least two cats have current samples: with one cat in the gallery "best
+// match" is that cat for every animal, which named a ginger as the black one.
+const currentCats = () => Object.fromEntries(Object.entries(enrolledCats).map(([n, items]) => [n, items.filter((it) => it.v === catid.VERSION)]).filter(([, items]) => items.length));
 function matchCat(emb, sized = true) {
   if (!enrolled) loadEnrolled();
   const out = [];
-  for (const [name, items] of Object.entries(enrolledCats)) {
+  for (const [name, items] of Object.entries(currentCats())) {
     const best = Math.max(...items.map((it) => catid.cosine(emb, it.embedding, sized, it.sized)));
     out.push({ name, score: Math.round(best * 1000) / 1000 });
   }
   return out.sort((a, b) => b.score - a.score).slice(0, 3);
 }
+const catGalleryReady = () => Object.keys(currentCats()).length >= 2;
 const catAmbiguous = (m) => !m.length || m[0].score < CAT_DECISIVE || !!(m[1] && m[0].score - m[1].score < CAT_GAP);
 // Cats in a frame: the house detector's boxes, each described and matched.
 // dets may be passed in (the surface pass already ran the detector).
@@ -1343,7 +1361,7 @@ async function catsInJpeg(jpg, { dets = null, camera = null } = {}) {
       const desc = await catid.describeInJpeg(sharp, jpg, x.box);
       const usable = desc.size_px >= CAT_MIN_PX;
       const matches = usable ? matchCat(desc.vec, desc.sized) : [];
-      const top = matches[0] && matches[0].score >= CAT_NAME_AT ? matches[0] : null;
+      const top = matches[0] && matches[0].score >= CAT_NAME_AT && catGalleryReady() ? matches[0] : null;
       out.push({ box: x.box, conf: x.conf, roi: x.roi || null, quality: { size_px: desc.size_px, det_score: x.conf, reason: usable ? 'ok' : 'cat_too_small' },
         name: top ? top.name : null, score: matches[0] ? matches[0].score : null, matches, _emb: usable ? desc.vec : null, _sized: desc.sized, _crop: desc.crop });
     } catch (e) { /* one bad crop */ }
@@ -1378,7 +1396,7 @@ function enrolCat(name, source, found, index) {
   const CAT_MAX = 200;
   if (existing.length >= CAT_MAX) { const old = [...existing].sort((a, b) => (a.source === b.source ? (a.at < b.at ? -1 : 1) : (a.source === 'room' ? 1 : -1)))[0]; try { fs.unlinkSync(path.join(d, old.file)); } catch (e) { /* ok */ } }
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
-  const j = { at: new Date().toISOString(), camera: source, source: String(source).startsWith('camera.') ? 'room' : 'upload', quality: pick.quality, box: pick.box, sized: !!pick._sized, embedding: pick._emb };
+  const j = { at: new Date().toISOString(), camera: source, source: String(source).startsWith('camera.') ? 'room' : 'upload', quality: pick.quality, box: pick.box, sized: !!pick._sized, v: catid.VERSION, embedding: pick._emb };
   fs.writeFileSync(path.join(d, `cat-${ts}.json`), JSON.stringify(j));
   if (cfg.identityKeepSamples && pick._crop) fs.writeFileSync(path.join(d, `cat-${ts}.jpg`), pick._crop);
   loadEnrolled();
@@ -1387,7 +1405,9 @@ function enrolCat(name, source, found, index) {
 }
 function catSummary(name) {
   const c = enrolledCats[name] || [];
-  return { name, samples: c.length, room: c.filter((it) => it.source === 'room').length, upload: c.filter((it) => it.source !== 'room').length, last_seen: lastMatched[name] || null, updated_at: c.map((i) => i.at).sort().pop() || null };
+  const cur = c.filter((it) => it.v === catid.VERSION);
+  return { name, samples: c.length, current: cur.length, stale: c.length - cur.length,   // stale: made by an older descriptor, never matched - re-enrol
+    room: cur.filter((it) => it.source === 'room').length, upload: cur.filter((it) => it.source !== 'room').length, last_seen: lastMatched[name] || null, updated_at: c.map((i) => i.at).sort().pop() || null };
 }
 // Match the cats in a surface pass; park the ambiguous ones for a label (kind "cat").
 const lastPendingCatMs = {};
@@ -2528,7 +2548,7 @@ const server = http.createServer(async (req, res) => {
       const within = Math.max(1000, Math.min(3600000, Number(url.searchParams.get('within')) || 120000));
       const f = await frameNear(cameraEntity(parts[1]), t, within);
       if (!f) { res.writeHead(404); return res.end('no frame within range'); }
-      res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Content-Length': f.jpg.length, 'X-Frame-At': new Date(f.t).toISOString(), 'X-Frame-Source': f.source, 'X-Frame-Distance-Ms': String(f.dt), 'Cache-Control': 'max-age=86400' });
+      res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Content-Length': f.jpg.length, 'X-Frame-At': new Date(f.t).toISOString(), 'X-Frame-Source': f.source, 'X-Frame-Distance-Ms': String(f.dt), 'X-Frame-Annotated': f.annotated ? 'true' : 'false', 'Cache-Control': 'max-age=86400' });
       return res.end(f.jpg);
     }
     // GET /look/zones/<camera>/<zone>/<time>.jpg -> the before|after composite nearest that time

@@ -48,11 +48,21 @@ class DirIndex {
     this.names = (await fsp.readdir(this.dir)).filter((f) => f.endsWith(this.ext)).sort();
     return this.names;
   }
-  // Write name into the directory. When the listing has reached max, the
-  // oldest dropN (by name: ISO stamps sort chronologically) are unlinked first.
-  put(name, buf, { max = Infinity, dropN = 0 } = {}) {
+  // Write name into the directory. Retention by age first (maxAgeMs, with
+  // ageOf(name) -> ms or null for files that carry no stamp), then by count:
+  // when the listing has reached max, the oldest dropN (by name: ISO stamps
+  // sort chronologically) are unlinked.
+  put(name, buf, { max = Infinity, dropN = 0, maxAgeMs = 0, ageOf = null } = {}) {
     return serial(this.dir, async () => {
       const names = await this.load();
+      if (maxAgeMs > 0 && ageOf) {
+        const cutoff = Date.now() - maxAgeMs;
+        while (names.length) {
+          const t = ageOf(names[0]);
+          if (t === null || t >= cutoff) break;
+          await fsp.unlink(path.join(this.dir, names.shift())).catch(() => {});
+        }
+      }
       if (names.length >= max && dropN > 0) {
         for (const old of names.splice(0, dropN)) await fsp.unlink(path.join(this.dir, old)).catch(() => {});
       }

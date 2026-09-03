@@ -35,6 +35,8 @@ Options:
 | `identity_auto_samples` | `true` | keep an embedding-only room sample from each confident room voice match (12 per person, oldest auto sample out; consented samples never displaced) |
 | `wake_by_transcript` | `false` | transcribe every speech segment on the tapped mics (in memory) and treat a wake phrase at its head as the wake word; enables conversation windows |
 | `training_dir` | (empty) | a brain's labelled training crops (`<dir>/<camera>__<zone>/<label>/*.jpg`), served read-only with delete under `/training` |
+| `archive_days` | `7` | keep heartbeat frames this long (the count cap is sized to the window) |
+| `evidence_days` | `30` | keep frames behind events, hits, cat evidence and zone composites this long |
 | `watch_passages` | (empty) | doorway polygons with an optional `in=x,y` room-side point → `nest_headless_passage` |
 | `watch_classify_zones` | (empty) | state zones (change detection with crops; optional `<camera>__<zone>.onnx`) |
 | `watch_activity_zones` | (empty) | running/idle from motion inside a crop → `nest_headless_activity` |
@@ -511,7 +513,9 @@ are kept in the archive under `<camera>_events/`, and:
   to `time` (ISO 8601, a `2026-09-03T16-24-52-317Z` stamp, or epoch ms) from
   memory, the event archive or the heartbeat archive; `X-Frame-At`,
   `X-Frame-Source` (memory | events | archive) and `X-Frame-Distance-Ms`
-  say what you got; 404 beyond `within` (default 120 s).
+  say what you got; 404 beyond `within` (default 120 s). The cat and hit
+  archives (box-annotated copies) are searched too, after the raw ones, and
+  `X-Frame-Annotated: true` marks such a frame.
 - Events carry `frame_at` and `boxes: [{label, x, y, w, h, score?, name?}]`
   in frame fractions - the passage zone, the tracked person and faces on a
   passage; the zone and people nearby on zone events; the surface and the

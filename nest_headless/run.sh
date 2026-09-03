@@ -70,6 +70,8 @@ if [ -f "$OPTS" ]; then
   export WAKE_BY_TRANSCRIPT="$(jq -r '.wake_by_transcript // false' "$OPTS")"
   TRAINING_DIR_OPT="$(jq -r '.training_dir // ""' "$OPTS")"
   [ -n "$TRAINING_DIR_OPT" ] && export TRAINING_DIR="$TRAINING_DIR_OPT"
+  export ARCHIVE_DAYS="$(jq -r '.archive_days // 7' "$OPTS")"
+  export EVIDENCE_DAYS="$(jq -r '.evidence_days // 30' "$OPTS")"
 fi
 
 exec node "$(cd "$(dirname "$0")" && pwd)/app/server.js"

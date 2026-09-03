@@ -40,6 +40,21 @@ test('writeAtomic creates missing parent directories', async () => {
   assert.strictEqual(fs.readFileSync(f, 'utf8'), '{}');
 });
 
+test('DirIndex retires files by age before it caps by count', async () => {
+  const dir = tmp();
+  const ix = new diskq.DirIndex(dir);
+  const day = 86400000, now = Date.now();
+  const stamp = (t) => new Date(t).toISOString().replace(/[:.]/g, '-') + '.jpg';
+  const ageOf = (n) => { const m = /^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z/.exec(n); return m ? Date.parse(`${m[1]}T${m[2]}:${m[3]}:${m[4]}.${m[5]}Z`) : null; };
+  for (const t of [now - 40 * day, now - 10 * day, now - 2 * day]) await ix.put(stamp(t), Buffer.from('x'));
+  await ix.put('notes.txt', Buffer.from('n'));   // unstamped: never aged out
+  await ix.put(stamp(now), Buffer.from('x'), { maxAgeMs: 30 * day, ageOf });
+  const left = fs.readdirSync(dir).sort();
+  assert.strictEqual(left.length, 4, `expected the 40-day-old file gone, got ${left.join(',')}`);
+  assert.ok(!left.includes(stamp(now - 40 * day)));
+  assert.ok(left.includes(stamp(now - 10 * day)) && left.includes('notes.txt'));
+});
+
 test('DirIndex caps the directory from an in-memory listing', async () => {
   const dir = tmp();
   fs.writeFileSync(path.join(dir, '2026-01.jpg'), 'pre');   // present before the index is built

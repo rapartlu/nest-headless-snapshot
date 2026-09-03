@@ -26,6 +26,23 @@ test('descriptor has the documented layout and separates a black cat from a ging
   assert.ok(cosine(black.vec, black.vec) > 0.999);
 });
 
+// a margin crop: grey worktop everywhere, a cat-coloured blob filling the detection box in the centre
+function scene(w, h, cat, margin = 0.25, noise = 0, seed = 5) {
+  const buf = crop(w, h, [150, 150, 150], noise, seed);
+  const f = 1 / (1 + 2 * margin), bx0 = Math.round(w * (1 - f) / 2), by0 = Math.round(h * (1 - f) / 2), bw = Math.round(w * f), bh = Math.round(h * f);
+  for (let y = by0; y < by0 + bh; y++) for (let x = bx0; x < bx0 + bw; x++) { const i = (y * w + x) * 3; buf[i] = cat[0]; buf[i + 1] = cat[1]; buf[i + 2] = cat[2]; }
+  return buf;
+}
+
+test('the surroundings are subtracted: a small cat on a grey worktop is described by its coat', () => {
+  const black = descriptor(scene(90, 75, [25, 22, 20]), 90, 75, { w: 0.05, h: 0.04 });
+  const ginger = descriptor(scene(90, 75, [210, 120, 40]), 90, 75, { w: 0.05, h: 0.04 });
+  const c = cosine(black.vec, ginger.vec);
+  assert.ok(c < 0.6, `a black and a ginger cat on the same worktop must not look alike (${c.toFixed(3)})`);
+  assert.ok(black.vec[HIST] > 0.5 && ginger.vec[HIST + 1] > 0.5, 'coat fractions come from the box, not the worktop');
+  assert.strictEqual(black.v, 2);
+});
+
 test('size and fluff tell two ginger cats apart; an unsized sample compares on colour only', () => {
   const big = descriptor(crop(200, 160, [210, 120, 40], 10, 3), 200, 160, { w: 0.30, h: 0.25 });
   const small = descriptor(crop(200, 160, [210, 120, 40], 10, 3), 200, 160, { w: 0.10, h: 0.08 });
