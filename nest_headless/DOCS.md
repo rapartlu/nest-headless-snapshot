@@ -114,8 +114,15 @@ person's feet (box bottom-centre). When someone walks into the doorway and
 disappears (the room is out of view) that counts as going `in`; someone who
 appears in the doorway and walks away counts as coming `out`; stepping into
 the doorway and turning back posts nothing. Event: `nest_headless_passage`
-{camera, passage, direction, track_id, t, person.matches, attributes
-{height_ratio, carrying}}. A zone editor draws these
+{camera, passage, direction, track_id, t, person {matches, name, score,
+size_px}, faces [{box, size_px, det_score, matches, name, score}], attributes
+{height_ratio, carrying}}. `faces` lists every face in the frame, matched or
+not, so a small unidentified face still says "someone was there". A
+passage can also name a camera to look from after a crossing, `look:
+{camera, delay_ms}` (zones.json / `PUT /zones`), for a doorway where the
+face is small from the hall but large from the room's own camera: that
+camera's faces follow as `nest_headless_passage_look` with the same
+`track_id`. A zone editor draws these
 the same way it draws surface zones.
 
 ## Camera framing tripwire

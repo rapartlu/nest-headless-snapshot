@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.13.4
+
+- Passage events carry `faces`: every face in the frame (>= 40 px) with
+  `box`, `size_px`, `det_score`, `matches` (when large enough to embed) and
+  `name`/`score` at >= 0.4, matched or not; `person` gains `name`, `score`,
+  `size_px` (#7).
+- Second look: a passage may name a camera to look from after a crossing,
+  `look: {camera, delay_ms?}` in `zones.json` (settable through `PUT
+  /zones`), for doorways where the face is small from the watching camera
+  but large from the room's own. Its faces go out as
+  `nest_headless_passage_look` with the same `track_id` (#7).
+
 ## 1.13.3
 
 - Transcript wake path: a segment must carry the full wake phrase ("hey"

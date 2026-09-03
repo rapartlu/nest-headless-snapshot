@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.13.3';
+const ADDON_VERSION = '1.13.4';
 
 const http = require('http');
 const fs = require('fs');
@@ -169,6 +169,11 @@ function zoneFromJson(z, kind) {
   if (kind === 'passages') {
     out.inside = Array.isArray(z.inside) && z.inside.length === 2 ? [f(z.inside[0]), f(z.inside[1])] : null;
     if (!out.pts) out.pts = [[out.x, out.y], [out.x + out.w, out.y], [out.x + out.w, out.y + out.h], [out.x, out.y + out.h]];   // the tracker needs a polygon
+    // look: {camera, delay_ms?} - after a crossing, take a frame from this
+    // camera (where the person appears larger) and report its faces against
+    // the same track id (#7)
+    out.look = z.look && typeof z.look === 'object' && /^[a-z0-9_.-]{1,64}$/i.test(String(z.look.camera || ''))
+      ? { camera: cameraEntity(String(z.look.camera)), delay_ms: Math.max(300, Math.min(5000, Number(z.look.delay_ms) || 1500)) } : null;
   }
   if (typeof z.description === 'string' && z.description.trim()) out.description = z.description.trim().slice(0, 160);   // for the brain ("the sideboard by the window")
   return out;
@@ -177,7 +182,7 @@ function zoneToJson(z, kind) {
   const o = { name: z.name };
   if (z.pts) o.pts = z.pts.map((p) => [Math.round(p[0] * 10000) / 10000, Math.round(p[1] * 10000) / 10000]);
   else { o.x = z.x; o.y = z.y; o.w = z.w; o.h = z.h; }
-  if (kind === 'passages') o.inside = z.inside || null;
+  if (kind === 'passages') { o.inside = z.inside || null; if (z.look) o.look = { camera: z.look.camera.replace(/^camera\./, ''), delay_ms: z.look.delay_ms }; }
   if (z.description) o.description = z.description;
   return o;
 }
@@ -644,18 +649,52 @@ async function passageTick(entityId, mgr, frameBuf, now) {
       try {
         const found = await faces.facesInJpeg(FACE_MODELS_DIR(), frameBuf, { minPx: 40 });
         considerFacesForPending(entityId, frameBuf, found).catch(() => {});
-        seen = (found || []).filter((f) => f.embedding).map((f) => ({ box: f.box, matches: matchFace(f.embedding) }));
+        // every face, matched or not (#7): a doorway face seen from down the
+        // hall is often under the 60 px identification floor - the brain
+        // still wants to know a face was there and how big
+        seen = (found || []).map(faceSummary);
       } catch (e) { /* faces are a bonus */ }
     }
     for (const ev of events) {
       const t = mgr.tracker.tracks.find((x) => x.id === ev.track_id);
       const inBox = (f) => t && f.box.x + f.box.w / 2 > t.box.x && f.box.x + f.box.w / 2 < t.box.x + t.box.w && f.box.y + f.box.h / 2 > t.box.y && f.box.y + f.box.h / 2 < t.box.y + t.box.h;
       const face = seen.find(inBox) || (seen.length === 1 && persons.length === 1 ? seen[0] : null);
-      if (face) ev.person = { matches: face.matches };
-      console.log(`[nest_headless] PASSAGE ${ev.direction} ${ev.passage} on ${entityId} track ${ev.track_id} h=${ev.attributes.height_ratio} carrying=${ev.attributes.carrying} who=${ev.person.matches[0] ? ev.person.matches[0].name + ':' + ev.person.matches[0].score : '-'}`);
+      if (face) ev.person = { ...ev.person, matches: face.matches, name: face.name, score: face.score, size_px: face.size_px };
+      ev.faces = seen;
+      console.log(`[nest_headless] PASSAGE ${ev.direction} ${ev.passage} on ${entityId} track ${ev.track_id} h=${ev.attributes.height_ratio} carrying=${ev.attributes.carrying} who=${ev.person.matches[0] ? ev.person.matches[0].name + ':' + ev.person.matches[0].score : '-'} faces=${seen.length}`);
       postHaEvent('nest_headless_passage', { entity_id: entityId, camera: entityId.replace(/^camera\./, ''), ...ev }).catch(() => {});
+      scheduleSecondLook(entityId, ev, passages.find((p) => p.name === ev.passage));
     }
   } catch (e) { console.warn(`[nest_headless] passage tick ${entityId} failed: ${e.message}`); }
+}
+
+// A face as the brain sees it on passage events: box, size, detector score,
+// the top matches when it was large enough to embed, and the name at >= 0.4.
+function faceSummary(f) {
+  const m = f.matches || (f.embedding ? matchFace(f.embedding) : []);
+  return { box: f.box, size_px: f.quality.size_px, det_score: f.quality.det_score, matches: m,
+    name: m[0] && m[0].score >= 0.4 ? m[0].name : null, score: m[0] ? m[0].score : null };
+}
+// Second look (#7): a passage may name a camera to look from after a
+// crossing (`look: {camera, delay_ms}` in zones.json) - the person appears
+// larger there a moment later. Its faces go out as nest_headless_passage_look
+// against the same track id so the brain can stitch the two.
+function scheduleSecondLook(fromEntity, ev, zone) {
+  if (!zone || !zone.look || !faces.hasModels(FACE_MODELS_DIR())) return;
+  const { camera, delay_ms } = zone.look;
+  setTimeout(async () => {
+    try {
+      const r = await facesForCamera(camera);
+      const list = (r.faces || []).map(faceSummary);
+      const best = list.filter((f) => f.matches.length).sort((a, b) => b.score - a.score)[0] || null;
+      console.log(`[nest_headless] PASSAGE look ${ev.passage} from ${camera} for track ${ev.track_id}: ${list.length} face(s)${best ? ', best ' + (best.name || '?') + ':' + best.score + ' ' + best.size_px + 'px' : ''}${r.ok ? '' : ' (' + r.reason + ')'}`);
+      postHaEvent('nest_headless_passage_look', {
+        entity_id: camera, camera: camera.replace(/^camera\./, ''), from_camera: fromEntity.replace(/^camera\./, ''),
+        passage: ev.passage, direction: ev.direction, track_id: ev.track_id, delay_ms, ok: r.ok, reason: r.reason || null,
+        faces: list, person: best ? { name: best.name, score: best.score, size_px: best.size_px, matches: best.matches } : null,
+      }).catch(() => {});
+    } catch (e) { console.warn(`[nest_headless] passage look ${camera} failed: ${e.message}`); }
+  }, delay_ms).unref();
 }
 
 // ------------------------------------------------------------ state zones (Hearth #12, #13)
