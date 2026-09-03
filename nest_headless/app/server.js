@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.11.4';
+const ADDON_VERSION = '1.11.5';
 
 const http = require('http');
 const fs = require('fs');
@@ -1443,13 +1443,23 @@ async function finishSpeechCapture(entityId, c, reason) {
   const kept = c.chunks.slice(Math.min(c.keepFrom || 0, Math.max(0, c.chunks.length - 1)));
   const all = samplesFromChunks(kept);
   let text = '', stt = null, sttMs = 0, speculative = false;
-  if (reason !== 'no_speech') {
+  // Quiet speech (Hearth #15): a child across the kitchen speaks at rms
+  // 0.01-0.02, around the end-pointer's floor, so "has spoken" never accrues
+  // and the capture ends as no_speech although two seconds were voiced. If
+  // the post-wake audio carries faint energy for >= 600 ms, let the
+  // recogniser decide instead of the floor - one extra call on captures
+  // that would otherwise be dropped unheard.
+  const post = c.chunks.slice(Math.max(c.keepFrom || 0, 0));
+  const faintMs = post.filter((ch) => rmsOf(ch) > c.floor * 0.6).reduce((a, ch) => a + ch.length / 16, 0);
+  const faint = reason === 'no_speech' && faintMs >= 600;
+  if (reason !== 'no_speech' || faint) {
     // Speculative pass: transcription started at 350 ms of closing silence
     // (feedSpeechCapture); if nobody spoke again before the window closed, the
     // result is already here and the event goes out ~0.5 s sooner.
     const r = (c.spec && !c.specStale) ? await c.spec.then((x) => { speculative = true; return x; }).catch(() => null) : null;
     const t = r || await transcribeSamples(all);
     text = t.text; stt = { engine: t.engine }; sttMs = t.sttMs;
+    if (faint) reason = 'quiet_speech';   // resolved to "" below if the recogniser also heard nothing
   }
   // The spotter is deliberately eager (threshold 0.12) and fires on ordinary
   // talk now and then; Whisper hearing the wake phrase in the pre-roll is
@@ -1461,6 +1471,7 @@ async function finishSpeechCapture(entityId, c, reason) {
   // Whisper's stage directions - "(baby crying)", "[inaudible]", "(background
   // noise drowns out speaker)" - are not something the brain should parse.
   if (text && /^[\s(\[][^A-Za-z0-9]*[^()\[\]]*[)\]]\W*$/.test(text) && !/[a-z]{2,}\s+[a-z]{2,}.*[a-z]/i.test(text.replace(/[(\[][^)\]]*[)\]]/g, ''))) { text = ''; reason = 'unclear'; }
+  if (reason === 'quiet_speech' && !text) reason = 'no_speech';   // the recogniser agreed with the floor: nothing there
   if (c.followUp && !text) {   // a follow-up window that caught only noise is the same as nobody replying (Hearth #4)
     console.log(`[nest_headless] follow-up window on ${entityId} closed: nothing intelligible (${reason})`);
     return;

@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.11.5
+
+- Quiet speech (Hearth #15): when the end-pointer would report `no_speech`
+  but the post-wake audio carried faint energy (> 0.6x the floor) for at
+  least 600 ms, the recogniser is run anyway; words found are posted with
+  `reason: "quiet_speech"`, nothing found stays `no_speech`. A child across
+  the kitchen speaks at rms 0.01-0.02, right at the floor, and was getting
+  "didn't catch that" four times out of six.
+- 1.11.4: wake-phrase stripping only at the head of the transcript.
+
 ## 1.11.3
 
 - `concurrent_cameras` on `nest_headless_speech`: other cameras whose capture
