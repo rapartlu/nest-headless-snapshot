@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.14.0';
+const ADDON_VERSION = '1.14.1';
 
 const http = require('http');
 const fs = require('fs');
@@ -1868,7 +1868,7 @@ async function transcribeSamples(all) {
     remote = await whisperServer(all).catch((e) => { console.warn(`[nest_headless] stt server ${cfg.sttUrl} failed: ${e.message}`); return null; });
     // the backup server (a different engine kept warm) before the in-process recogniser
     if (!remote && cfg.sttFallbackUrl) remote = await whisperServer(all, cfg.sttFallbackUrl).catch((e) => { console.warn(`[nest_headless] fallback stt ${cfg.sttFallbackUrl} failed too: ${e.message}`); return null; });
-    if (!remote) console.warn('[nest_headless] using the local recogniser');
+    if (!remote) { sttFailStreak++; console.warn(`[nest_headless] using the local recogniser (${sttFailStreak} remote failures in a row)`); } else sttFailStreak = 0;
   }
   if (remote) {
     text = remote.text; stt = { engine: remote.engine };
@@ -2009,12 +2009,33 @@ const audioStats = {};   // per camera: chunks, lastRms, rate, resampledLen, hit
 // spotter/listen capture resets the tracker, so each utterance is reported once.
 const segTrackers = {}, segPending = {}, convo = {};
 function segStat(entityId, key) { const s = audioStats[entityId]; if (s) s[key] = (s[key] || 0) + 1; }
+// Two brakes (1.14.1), after a noisy hour produced 767 segments and every
+// one a recogniser call: at most SEG_RATE_MAX transcriptions per camera per
+// minute outside a reply window, and a pause of SEG_PAUSE_MS whenever the
+// recogniser servers have failed SEG_FAIL_STREAK times in a row (they were
+// timing out under memory pressure and the segments kept coming).
+const SEG_RATE_MAX = 8, SEG_PAUSE_MS = 60000, SEG_FAIL_STREAK = 3;
+const segRecent = {}, segPausedUntil = {}, segLastBrakeLog = {};
+let sttFailStreak = 0;
+function segBrake(entityId, key, why) {
+  segStat(entityId, key);
+  const now = Date.now();
+  if (now - (segLastBrakeLog[entityId] || 0) > 300000) { segLastBrakeLog[entityId] = now; console.warn(`[nest_headless] segment path on ${entityId} ${why}`); }
+}
 function segFeed(entityId, chunk, rms) {
   const tr = segTrackers[entityId] || (segTrackers[entityId] = new SegmentTracker({ gapChunks: Math.max(2, Math.ceil(cfg.speechSilenceMs / 250)), maxChunks: cfg.speechMaxSeconds * 4 }));
   if (speechCap[entityId]) { tr.reset(); return; }   // a spotter or /listen capture owns the audio
   const seg = tr.feed(chunk, rms);
   if (!seg) return;
-  const w = convo[entityId] && convo[entityId].until > Date.now() ? convo[entityId] : null;
+  const now = Date.now();
+  const w = convo[entityId] && convo[entityId].until > now ? convo[entityId] : null;
+  if (!w) {
+    if (sttFailStreak >= SEG_FAIL_STREAK && !(segPausedUntil[entityId] > now)) segPausedUntil[entityId] = now + SEG_PAUSE_MS;
+    if (segPausedUntil[entityId] > now) return segBrake(entityId, 'segments_paused', `paused ${SEG_PAUSE_MS / 1000}s: recogniser servers failing`);
+    const recent = (segRecent[entityId] || []).filter((t) => now - t < 60000);
+    if (recent.length >= SEG_RATE_MAX) { segRecent[entityId] = recent; return segBrake(entityId, 'segments_throttled', `throttled: over ${SEG_RATE_MAX} segments a minute (a noisy room?)`); }
+    recent.push(now); segRecent[entityId] = recent;
+  }
   // The same sentence reaching two microphones: whichever camera is already
   // capturing or deciding on it (started within 1.5 s) owns it; this copy is
   // dropped unheard rather than spending a second recogniser call.

@@ -44,6 +44,21 @@ test('quiet is judged relative to the speech peak once speaking', () => {
   assert.strictEqual(segs[0].voicedMs, 6 * 250);
 });
 
+test('a room that is never quiet raises the floor above the ambient', () => {
+  const tr = new SegmentTracker({ noiseWindow: 40 });
+  // a dishwasher: 0.03 RMS, steady, well above the clamped floor (0.015)
+  const hum = new Array(60).fill(0.03).map((v, i) => v + (i % 3) * 0.001);
+  const segs = feedMany(tr, hum);
+  const f = tr.floor();   // the flag is set when the floor is computed
+  assert.ok(f > 0.04, `floor should rise above the hum (got ${f})`);
+  assert.ok(tr.noisy, 'should recognise continuous sound as noise');
+  // only the first, pre-adaptation window may have produced a segment; nothing after it adapts
+  assert.ok(segs.length <= 1, `segments during steady noise: ${segs.length}`);
+  // speech that stands clear of the hum still starts a segment
+  const speech = feedMany(tr, [...new Array(8).fill(0.2), ...new Array(6).fill(0.03)], 2000000);
+  assert.strictEqual(speech.length, 1);
+});
+
 test('long speech ends at the cap and reset() drops an open segment', () => {
   const tr = new SegmentTracker({ maxChunks: 12 });
   const segs = feedMany(tr, [...new Array(10).fill(0.003), ...new Array(30).fill(0.1)]);

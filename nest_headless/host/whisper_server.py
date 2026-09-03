@@ -52,7 +52,19 @@ def make_backend(engine, model):
 
 def worker_main(conn, model, engine='mlx-whisper'):
     """One model copy in its own process: warm, then loop transcribing what the parent sends."""
+    # MLX keeps freed Metal buffers in a cache keyed by size; with audio of
+    # ever-varying length that cache only grows (three Parakeet workers
+    # reached 8 GB each and pushed the Mac 25 GB into swap). Cap it and drop
+    # it after every request: the model weights stay resident, the scratch
+    # buffers do not.
+    try:
+        import mlx.core as _mx
+        _mx.set_cache_limit(int(os.environ.get('MLX_CACHE_LIMIT_MB', '256')) * 1024 * 1024)
+        _clear = _mx.clear_cache
+    except Exception:  # noqa: BLE001
+        _clear = lambda: None  # noqa: E731
     run = make_backend(engine, model)
+    _clear()
     conn.send(('ready', os.getpid()))
     while True:
         audio = conn.recv()
@@ -62,6 +74,8 @@ def worker_main(conn, model, engine='mlx-whisper'):
             conn.send(('ok', run(audio)))
         except Exception as e:  # noqa: BLE001
             conn.send(('err', str(e)))
+        finally:
+            _clear()
 
 
 def transcribe(audio):

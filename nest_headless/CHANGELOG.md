@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.14.1
+
+- Memory: the MLX recogniser workers cap their Metal buffer cache
+  (`MLX_CACHE_LIMIT_MB`, default 256) and clear it after every request.
+  Three Parakeet workers had grown to 8 GB each on an hour of
+  varying-length audio and pushed the Mac 25 GB into swap, at which point
+  both recogniser servers timed out and captures fell to the in-process
+  model. Two Parakeet workers and one Whisper worker now.
+- Segment path brakes: a room that is never quiet (an appliance, a TV)
+  raises the segment floor to 1.6x the minute's median level instead of
+  being chopped into an endless stream of segments; outside a reply window
+  at most 8 segments a minute per camera are transcribed
+  (`segments_throttled`), and after 3 consecutive recogniser failures the
+  path pauses for a minute (`segments_paused`). One warning per 5 minutes.
+
 ## 1.14.0
 
 - Evidence by reference (#21). Every frame the add-on judges is noted in a

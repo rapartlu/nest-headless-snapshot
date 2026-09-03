@@ -19,20 +19,40 @@ const DEFAULTS = {
   floorMin: 0.006, floorMax: 0.015, floorMul: 3,   // as the wake-word capture: 3x the quietest tenth, clamped
   relQuiet: 0.18,        // once speaking, quiet is relative to the running peak
   history: 40,           // chunks of RMS history for the floor (10 s)
+  noiseWindow: 240,      // chunks (60 s) watched for continuous sound
+  noiseFraction: 0.5,    // if more than this of the window sat above the floor, it is noise, not speech
+  noiseMul: 1.6,         // ...and the floor becomes this times the window's median RMS
 };
 
 class SegmentTracker {
-  constructor(opts = {}) { this.o = { ...DEFAULTS, ...opts }; this.rmsHist = []; this.reset(); }
+  constructor(opts = {}) { this.o = { ...DEFAULTS, ...opts }; this.rmsHist = []; this.longHist = []; this.reset(); }
   reset() { this.active = null; this.pre = []; this.run = 0; }
+  // The wake-word capture's floor (3x the quietest tenth, clamped), plus an
+  // adaptation for a room that is never quiet: a running appliance, a TV or
+  // music sits above the clamped floor for minutes and would otherwise be
+  // chopped into an endless stream of "segments" (767 in an hour, every
+  // one a recogniser call). If most of the last minute was above the floor
+  // the floor rises to noiseMul x the minute's median, so only sound that
+  // stands clear of the ambient starts a segment.
   floor() {
     const s = [...this.rmsHist].sort((a, b) => a - b);
     const q = s[Math.floor(s.length * 0.1)] || this.o.floorMin;
-    return Math.min(this.o.floorMax, Math.max(this.o.floorMin, q * this.o.floorMul));
+    let f = Math.min(this.o.floorMax, Math.max(this.o.floorMin, q * this.o.floorMul));
+    if (this.longHist.length >= this.o.noiseWindow / 2) {
+      const above = this.longHist.filter((r) => r > f).length / this.longHist.length;
+      if (above > this.o.noiseFraction) {
+        const l = [...this.longHist].sort((a, b) => a - b);
+        f = Math.max(f, l[Math.floor(l.length / 2)] * this.o.noiseMul);
+        this.noisy = true;
+      } else this.noisy = false;
+    }
+    return f;
   }
   // chunk: Float32Array (16 kHz), rms: its RMS. Returns a finished segment
   // {chunks, floor, startedMs, voicedMs, peak} or null.
   feed(chunk, rms, now = Date.now()) {
     this.rmsHist.push(rms); if (this.rmsHist.length > this.o.history) this.rmsHist.shift();
+    this.longHist.push(rms); if (this.longHist.length > this.o.noiseWindow) this.longHist.shift();
     if (!this.active) {
       this.pre.push(chunk); if (this.pre.length > this.o.preChunks + this.o.startChunks) this.pre.shift();
       const floor = this.floor();

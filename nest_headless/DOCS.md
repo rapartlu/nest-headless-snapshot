@@ -249,6 +249,7 @@ Environment (a launchd plist is the natural home; see the example below):
 | `TOKEN_FILE` | local file holding a long-lived HA token (mode 600) |
 | `LOG_FILE` | local log path (keeps `sh` off the share) |
 | `UV_THREADPOOL_SIZE` | `8`: headroom for the async disk I/O against the share (Node's default pool is 4) |
+| `MLX_CACHE_LIMIT_MB` (on the recogniser/TTS servers) | `256`: cap on each MLX worker's buffer cache, cleared after every request; without it a worker grows by gigabytes an hour |
 
 Start with `sh nest_headless/run.sh`. Samples, `latest`, the timeline and
 models still live on the HA config share, so dashboards keep working. Run
@@ -421,7 +422,11 @@ conversation window is the reply; anything else is discarded without being
 kept, logged or sent. The spotter keeps running and the two paths never
 report the same utterance twice (`wake_source` on the speech event says
 which caught it). Cost: one recogniser call per spoken sentence in range of
-the microphones, ~0.2 s each on the Mac. Why: the 3 MB spotter decoded a
+the microphones, ~0.2 s each on the Mac, bounded: a room that is never
+quiet raises the segment floor above its ambient level, at most 8 segments
+a minute per camera are transcribed outside a reply window, and the path
+pauses for a minute after three recogniser failures in a row (`GET /`
+counts `segments_throttled` / `segments_paused`). Why: the 3 MB spotter decoded a
 loud, close "Hey Claude" as "I glob" and no threshold could match it, while
 the recogniser transcribed it perfectly.
 
