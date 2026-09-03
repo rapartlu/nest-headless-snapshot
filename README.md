@@ -58,11 +58,14 @@ choosing who to tell — belongs to a separate brain that consumes the events
 
 ## Privacy stance
 
-- Audio is processed in memory only. Nothing is recorded unless you enable
-  `identity_keep_samples` for enrolment samples. Utterance audio is held for
-  90 s so a brain can fetch it, then gone.
+- Audio is processed in memory. Utterance audio is held for 90 s so a brain
+  can fetch it, then gone. Nothing is kept on disk except: enrolment samples
+  if you enable `identity_keep_samples`, and — if you use the verification
+  backlog — short clips and face crops the add-on could not attribute, kept
+  for at most 7 days for an admin to label or drop.
 - Identity is opt-in per person through the enrolment endpoints; the add-on
-  never decides who someone is or enrols on its own — it reports scores.
+  never decides who someone is or enrols on its own — it reports scores and
+  parks ambiguous samples for a human.
 - Everything runs on your hardware. No cloud, no Google credentials: it only
   talks to your Home Assistant.
 - The routes that open a microphone window, touch identity or serve raw audio
