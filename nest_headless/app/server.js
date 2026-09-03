@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.17.3';
+const ADDON_VERSION = '1.17.4';
 
 const http = require('http');
 const fs = require('fs');
@@ -1598,6 +1598,12 @@ async function considerFacesForPending(entityId, jpg, found) {
     const now = Date.now();
     if (now - (lastPendingFaceMs[entityId] || 0) < 60000) return;
     const sharp = getSharp(); if (!sharp) return;
+    // reserve the minute before the awaits below: two detection paths on the
+    // same frame both passed the check and parked the same face twice
+    const before = lastPendingFaceMs[entityId] || 0;
+    lastPendingFaceMs[entityId] = now;
+    let added = false;
+    try {
     for (const f of found || []) {
       if (!f.embedding || f.quality.size_px < 60) continue;
       const matches = matchFace(f.embedding);
@@ -1611,11 +1617,12 @@ async function considerFacesForPending(entityId, jpg, found) {
       const crop = await sharp(jpg).extract({ left, top, width: Math.min(m.width - left, side), height: Math.min(m.height - top, side) }).jpeg({ quality: 88 }).toBuffer();
       const meta = pending.add({ kind: 'face', camera: entityId.replace(/^camera\./, ''), t: new Date().toISOString(),
         quality: f.quality, matches, embedding: f.embedding, size_px: f.quality.size_px, media: { buf: crop, ext: 'jpg' } });
-      lastPendingFaceMs[entityId] = now;
+      added = true;
       console.log(`[nest_headless] IDENTITY pending face ${meta.id} (${f.quality.size_px}px, best ${matches[0] ? matches[0].name + ':' + matches[0].score : 'none'})`);
       notePendingCount({ id: meta.id, kind: 'face', camera: meta.camera, t: meta.t });
       break;
     }
+    } finally { if (!added) lastPendingFaceMs[entityId] = before; }
   } catch (e) { console.warn('[nest_headless] pending face failed:', e.message); }
 }
 function writePersonSample(name, kind, record, mediaSrc) {

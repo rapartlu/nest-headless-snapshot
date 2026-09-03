@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.17.4
+
+- The one-face-per-camera-per-minute backlog guard is reserved before the
+  crop is cut, so two detection paths on the same frame no longer park the
+  same face twice.
+
 ## 1.17.3
 
 - `POST /training/<set>/<label>/<file>/move {label}` relabels a training
