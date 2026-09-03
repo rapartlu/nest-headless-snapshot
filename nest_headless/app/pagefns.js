@@ -234,7 +234,7 @@ const startWatchLoop = ({ intervalMs = 4000, rois = [], diffPct = 4, quality = 0
           const pct = total ? (changed / total) * 100 : 0;
           if (r.activity) { act[r.name] = Math.round(pct * 10) / 10; continue; }
           if (pct > window.__watchMaxPct) window.__watchMaxPct = Math.round(pct * 10) / 10;
-          if (pct >= diffPct && (!best || pct > best.pct)) best = { roi: r.name || 'roi', pct: Math.round(pct * 10) / 10 };
+          if (pct >= (r.minPct || diffPct) && (!best || pct > best.pct)) best = { roi: r.name || 'roi', pct: Math.round(pct * 10) / 10 };
         }
         if (window.__activityNode && Object.keys(act).length) window.__activityNode(act);
         if (best) {

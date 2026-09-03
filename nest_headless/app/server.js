@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.11.5';
+const ADDON_VERSION = '1.11.6';
 
 const http = require('http');
 const fs = require('fs');
@@ -1575,8 +1575,15 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // The page's motion mask: cat surfaces, passage zones (named "passage:<name>",
 // never cat surfaces) and activity zones (reported per tick, never a hit).
 function roisFor(entityId) {
+  const passages = cfg.watchPassages[entityId] || [];
   return (cfg.watchRois[entityId] || [])
-    .concat((cfg.watchPassages[entityId] || []).map((p) => ({ name: 'passage:' + p.name, pts: p.pts, x: p.x, y: p.y, w: p.w, h: p.h })))
+    .concat(passages.map((p) => ({ name: 'passage:' + p.name, pts: p.pts, x: p.x, y: p.y, w: p.w, h: p.h })))
+    // With passages, ANY motion in the frame must reach the tracker, or a
+    // person walking between doorways goes unseen, their track expires and
+    // they reappear inside the next threshold as a new track "emerging from
+    // the room" (three toilet "out"s in ten minutes on 3 Sept). Low threshold:
+    // a distant person is ~1-2% of the frame.
+    .concat(passages.length ? [{ name: 'passage:_frame', x: 0, y: 0, w: 1, h: 1, minPct: 1.2 }] : [])
     .concat((cfg.watchActivityZones[entityId] || []).map((z) => ({ name: z.name, pts: z.pts, x: z.x, y: z.y, w: z.w, h: z.h, activity: true })));
 }
 // Hot-apply a zone change on a live watch: restart the page loop with the new
