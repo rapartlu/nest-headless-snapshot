@@ -130,7 +130,7 @@ class PassageTracker {
             if (z.entrySide === null || z.entrySide !== side) dir = side > 0 ? 'in' : 'out';   // came through, or emerged from the doorway
           } else if (z.entrySide === null || true) dir = 'across';
           // 'across' zones (no inside point) chatter while someone hovers in an opening: longer guard
-          if (dir && now - z.lastEventMs >= (dir === 'across' ? 10000 : REPEAT_MS)) { z.lastEventMs = now; events.push(this.event(pz, dir, t, now)); }
+          if (dir && (!z.lastEventMs || now - z.lastEventMs >= (dir === 'across' ? 10000 : REPEAT_MS))) { z.lastEventMs = now; events.push(this.event(pz, dir, t, now)); }
         }
         if (!inside) z.lastSide = side;
       }
@@ -145,7 +145,7 @@ class PassageTracker {
         let dir = null;
         if (pz.inside) { if (z.entrySide !== null) dir = z.entrySide < 0 ? 'in' : 'out'; }
         else dir = 'across';
-        if (dir && now - z.lastEventMs >= REPEAT_MS) events.push(this.event(pz, dir, t, t.lastSeen));
+        if (dir && (!z.lastEventMs || now - z.lastEventMs >= REPEAT_MS)) events.push(this.event(pz, dir, t, t.lastSeen));
       }
     }
     this.tracks = keep;
