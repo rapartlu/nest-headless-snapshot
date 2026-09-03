@@ -1,7 +1,8 @@
 # Nest Headless Snapshot
 
-Get real still images from your Google Nest cameras in Home Assistant, even
-though Google only offers them over WebRTC.
+Real stills, live watching, and local perception for WebRTC-only Google Nest
+cameras in Home Assistant — with no Google credentials and nothing leaving the
+house.
 
 [![Open your Home Assistant instance and show the add add-on repository dialog with this repository URL pre-filled.](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Frapartlu%2Fnest-headless-snapshot)
 
@@ -13,60 +14,86 @@ though Google only offers them over WebRTC.
 - The go2rtc, Frigate and aiortc workarounds never gave you a working
   snapshot either.
 
-If that sounds familiar, you have a WebRTC-only Nest camera. That covers the
-battery models and most newer ones. There is no RTSP or HLS for these.
+If that sounds familiar, you have a WebRTC-only Nest camera (the battery
+models and most newer ones). There is no RTSP or HLS for these. Home Assistant
+relays the WebRTC handshake but never terminates the media, so anything that
+needs a still gets a placeholder.
 
-## Why the snapshot is black
+## What it does
 
-Home Assistant streams these cameras to your browser live, but it never grabs
-a frame itself. For WebRTC-only Nest cameras, `camera.snapshot` just returns a
-hardcoded placeholder image, which is the black frame you see. Home Assistant
-relays the WebRTC handshake but does not terminate the media on the server, so
-there is no frame for the snapshot to capture.
+It runs a real browser (headless Chromium) that opens the camera stream the
+same way your dashboard does, and works on the frames and the microphone
+audio locally:
 
-The frame is not impossible to capture. Server-side tools can pull one from
-these cameras. Home Assistant simply does not wire snapshots through them for
-these models yet, so anything that needs a still gets the placeholder. This
-add-on fills that gap.
+- **Stills** on demand: `GET /snapshot/<camera>` (archived) and
+  `GET /frame/<camera>` (instant, no side effects), plus `/latest/<camera>.jpg`.
+- **Watch mode**: persistent streams, motion in named zones, an archive with a
+  timeline, and a stream of Home Assistant events the rest of your automation
+  can react to.
+- **Perception primitives**, all local ONNX / sherpa / MLX models:
+  - cat-on-surface zones (a house-trained detector plus COCO veto) →
+    `nest_headless_surface_activity`
+  - per-camera door-state classifiers → `nest_headless_classifier_positive`
+  - **passages**: a person crossing a doorway, with direction and a track id →
+    `nest_headless_passage`
+  - **state zones**: "this zone's look changed", with before/after crops and
+    who was nearby → `nest_headless_zone_change` (an optional trained model
+    adds `nest_headless_zone_state`)
+  - **activity zones**: running/idle from motion inside a crop (a drum behind
+    glass) → `nest_headless_activity`
+  - **wake word + speech**: a keyword spotter on the camera microphone, a
+    speech capture with careful end-pointing, and a transcript from Whisper
+    (or Parakeet) → `nest_headless_keyword`, `nest_headless_speech`; a
+    follow-up window for conversations (`POST /listen`)
+  - **identity**: speaker embeddings and face embeddings, matched against
+    people enrolled by consent → `nest_headless_identity`
+- **Zone editor API** (`GET/PUT /zones`): every zone kind, polygons or
+  rects, hot-applied without a restart, persisted in `zones.json`.
 
-## What this add-on does
+The design line is deliberate: this add-on is the *senses*. It notices that
+something happened and hands over crops, transcripts, embeddings and events.
+Deciding what it means — answering a question, keeping a household ledger,
+choosing who to tell — belongs to a separate brain that consumes the events
+(the authors run one; any automation or agent works).
 
-It runs a real browser (headless Chromium) on your Home Assistant machine.
-When you ask for a snapshot, it opens the camera stream the same way your
-dashboard does, waits a few seconds for full 1080p, grabs a frame, and gives
-you a normal JPEG.
+## Privacy stance
 
-It only talks to Home Assistant. No Google credentials, no cloud, no extra
-setup. If a camera streams in your dashboard, it will work here.
+- Audio is processed in memory only. Nothing is recorded unless you enable
+  `identity_keep_samples` for enrolment samples. Utterance audio is held for
+  90 s so a brain can fetch it, then gone.
+- Identity is opt-in per person through the enrolment endpoints; the add-on
+  never decides who someone is or enrols on its own — it reports scores.
+- Everything runs on your hardware. No cloud, no Google credentials: it only
+  talks to your Home Assistant.
+- The routes that open a microphone window, touch identity or serve raw audio
+  are loopback-only unless the caller presents a bearer token.
 
 ## Install
 
-1. Click the blue button above. Or go to **Settings > Add-ons > Add-on
-   Store**, open the menu in the top right, choose **Repositories**, and add
-   `https://github.com/rapartlu/nest-headless-snapshot`
-2. Find **Nest Headless Snapshot** in the store and click **Install**. The
-   build takes around 5 minutes.
-3. Click **Start**, then check the log for a line like
-   `receiver video codecs: ... video/H264 ...`
+1. Click the blue button above, or add
+   `https://github.com/rapartlu/nest-headless-snapshot` under **Settings >
+   Add-ons > Add-on Store > Repositories**.
+2. Install **Nest Headless Snapshot** (the build takes a few minutes) and
+   start it. The log should show a line like
+   `receiver video codecs: ... video/H264 ...`.
 
-The add-on route needs Home Assistant OS or a Supervised install. Running
-Home Assistant Container or Core instead? See
-[Plain Docker](#no-supervisor-plain-docker-works-too) below.
+The add-on route needs Home Assistant OS or a Supervised install. Container
+and Core installs can run it with [plain Docker](#no-supervisor-plain-docker-works-too),
+and it also runs directly on a Mac — see [Running on a Mac](nest_headless/DOCS.md#running-on-a-mac-outside-the-supervisor)
+in the docs, which is the setup to use if you want the heavier models
+(Whisper, faces) at low latency.
 
 ## Use it
 
-No camera setup needed. Just use the camera's entity id without the
-`camera.` prefix:
+Stills need no setup; use the camera's entity id without the `camera.` prefix:
 
 ```bash
 curl "http://homeassistant.local:8098/snapshot/front_door?fresh=1" -o still.jpg
 ```
 
-If that gives you a real photo, you're done. The same frame is also saved to
-`/config/www/nest/front_door.jpg` so automations can use it as a file.
-
-Here is the usual wiring. The `rest_command` only returns once a fresh frame
-is saved, so the next step always sees a current image:
+The same frame is saved to `/config/www/nest/front_door.jpg` so automations
+can use it as a file. The usual wiring, which only returns once a fresh frame
+is saved:
 
 ```yaml
 rest_command:
@@ -77,29 +104,27 @@ rest_command:
 ```
 
 ```yaml
-# in an automation
 - action: rest_command.capture_front_door
   response_variable: capture
 - condition: template   # skip black frames
   value_template: "{{ (capture.content.meanLuma | default(255)) | float > 3 }}"
-- action: llmvision.image_analyzer   # or a notification with the image, etc.
+- action: llmvision.image_analyzer
   data:
     image_file: /config/www/nest/front_door.jpg
-    ...
 ```
 
-The [examples folder](examples/) has complete real-world automations,
-including an AI cat deterrent and a door-left-open alert. The
-[add-on docs](nest_headless/DOCS.md) cover every option and endpoint.
+Watch mode, zones, speech and identity are configured through the add-on
+options (or a `zones.json` written by the zones API). The
+[add-on docs](nest_headless/DOCS.md) cover every option, endpoint and event;
+the [examples](examples/) folder has complete automations.
 
 ## No Supervisor? Plain Docker works too
 
-The add-on is really just a Docker container that talks to Home Assistant
-with an access token, so Container and Core installs can run it directly:
+The add-on is a Docker container that talks to Home Assistant with an access
+token:
 
 1. Clone this repo on the machine that runs Docker.
-2. In Home Assistant, create a long-lived access token (your profile >
-   Security).
+2. In Home Assistant, create a long-lived access token (profile > Security).
 3. Edit [`docker-compose.yml`](docker-compose.yml): set your HA address and
    point the volume at your HA config's `www/nest` folder. Then:
 
@@ -109,39 +134,39 @@ with an access token, so Container and Core installs can run it directly:
    curl "http://localhost:8098/snapshot/<your_camera>?fresh=1" -o still.jpg
    ```
 
-Every add-on option is available as an environment variable. The compose
-file lists them all. Everything else in this README works the same way.
+Every add-on option is available as an environment variable.
 
 ## Mind the quota
 
 Each fresh capture counts as one command against Google's limit of 100
-commands per hour per camera. Repeat requests within 10 seconds (adjustable)
-get the cached frame instead, and simultaneous requests for the same camera
-share one capture. A check every 5 minutes uses 12 per hour, which leaves
-plenty of headroom. Just don't poll in a tight loop.
+commands per hour per camera. Repeat requests within 10 seconds get the cached
+frame, and simultaneous requests share one capture. Watch mode holds one
+stream per camera instead of polling, which is far cheaper on the quota.
 
 ## Troubleshooting
 
-- **Empty add-on log, or the add-on can't reach HA** on a Supervised
-  install: see "Broken supervised installs" in the
-  [add-on docs](nest_headless/DOCS.md). Both problems have built-in
-  workarounds.
+- **Empty add-on log, or the add-on can't reach HA** on a Supervised install:
+  see "Broken supervised installs" in the [docs](nest_headless/DOCS.md).
 - **"no answer from HA within timeout"**: check the camera streams in your
   dashboard first. The add-on can only capture what HA can stream.
-- **Frames come back 640x360**: the stream takes a few seconds to reach
-  1080p and the add-on waits up to 5 seconds for it. On slow hardware, raise
-  `capture_timeout_seconds`.
+- **Frames come back 640x360**: the stream takes a few seconds to reach 1080p.
+  On slow hardware, raise `capture_timeout_seconds`.
 - **Snapshot is black and `meanLuma` is under 3**: the camera really sent a
-  black frame (privacy mode, switched off, or still starting up). That's
-  what the guard in the automation example is for.
+  black frame (privacy mode, switched off, or still starting up).
+- **Audio arrives gapped, wake words stop firing**: the host is starving the
+  browser. On a small NAS the add-on lowers its own priority behind Chromium;
+  on a Mac, run it under launchd with `ProcessType: Interactive` (App Nap
+  otherwise throttles a windowless Chrome). Details in the docs.
 
 ## What's in the repo
 
 | Path | What |
 |---|---|
-| `nest_headless/` | The add-on (Node plus headless Chromium) |
+| `nest_headless/` | The add-on (Node plus headless Chromium): `app/` code, `host/` servers for running the speech models on a Mac |
+| `nest_headless/DOCS.md` | Options, endpoints, events, zones, identity, Mac mode |
+| `nest_headless/CHANGELOG.md` | Every release, with the reasoning behind each change |
 | `tools/train_door_model.py` | Trainer for the optional per-camera state classifiers |
-| `examples/` | Ready-to-adapt automations and hard-won prompting advice |
+| `examples/` | Ready-to-adapt automations and a timeline dashboard card |
 
 ## License
 

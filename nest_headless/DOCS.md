@@ -22,6 +22,20 @@ Options:
 | `watch_diff_pct` | `4` | percent of a region's pixels that must change to count as a hit |
 | `watch_cooldown_seconds` | `60` | minimum gap between fired events per camera |
 | `watch_classify_seconds` | `15` | score the live stream with the camera's trained model every N seconds (0 disables) |
+| `watch_classify_persist_ticks` | `16` | classifier ticks that must agree before `nest_headless_classifier_positive` fires |
+| `sample_archive_seconds` | `120` | heartbeat archive cadence per camera (frames + `timeline.json` under `samples_dir`) |
+| `audio_cameras` | (empty) | cameras whose microphone is tapped for the wake word (space-separated) |
+| `speech_silence_ms` | `800` | quiet after speech that closes a capture (judged relative to the speech level) |
+| `speech_max_seconds` | `15` | hard stop for a capture |
+| `stt_model_dir` | (empty) | in-process recogniser: a sherpa-onnx transducer or Whisper directory; empty = the spotter's own transducer |
+| `stt_url` | (empty) | external recogniser (`host/whisper_server.py` or whisper.cpp `whisper-server`), used ahead of the in-process one |
+| `stt_shadow_url` | (empty) | second recogniser for bake-offs; its text is only logged |
+| `identity_keep_samples` | `false` | keep raw enrolment audio / aligned face crops on disk |
+| `watch_passages` | (empty) | doorway polygons with an optional `in=x,y` room-side point → `nest_headless_passage` |
+| `watch_classify_zones` | (empty) | state zones (change detection with crops; optional `<camera>__<zone>.onnx`) |
+| `watch_activity_zones` | (empty) | running/idle from motion inside a crop → `nest_headless_activity` |
+| `activity_pct` | `1.5` | per-tick change (%) inside an activity zone that counts as motion |
+| `zone_change_threshold` | `10` | mean grey difference (0-255) on a state zone's fingerprint that counts as a change |
 
 What you get:
 
@@ -87,7 +101,7 @@ Two kinds of model run in-process (native onnxruntime, no cloud, no quota):
 polygon syntax as `watch_rois` plus an optional inside point after `|`:
 
 ```
-watch_passages: "downstairs_hallway_camera:downstairs_toilet@0.62,0.55:0.70,0.55:0.72,0.72:0.60,0.72|in=0.66,0.40;front_door@...;  upstairs_hallway_camera:upstairs_bathroom@...|in=..."
+watch_passages: "hall_camera:bathroom@0.62,0.55:0.70,0.55:0.72,0.72:0.60,0.72|in=0.66,0.40;front_door@...;  landing_camera:bedroom@...|in=..."
 ```
 
 `in=x,y` is any point on the room side of the door (it may lie outside the
@@ -98,7 +112,7 @@ disappears (the room is out of view) that counts as going `in`; someone who
 appears in the doorway and walks away counts as coming `out`; stepping into
 the doorway and turning back posts nothing. Event: `nest_headless_passage`
 {camera, passage, direction, track_id, t, person.matches, attributes
-{height_ratio, carrying}}. The zone editor in the training kit draws these
+{height_ratio, carrying}}. A zone editor draws these
 the same way it draws surface zones.
 
 ## Camera framing tripwire
@@ -215,7 +229,7 @@ Environment (a launchd plist is the natural home; see the example below):
 
 | variable | value |
 |---|---|
-| `HA_CONFIG_DIR` | the mounted HA config dir, e.g. `/Volumes/docker/homeassistant/homeassistant` |
+| `HA_CONFIG_DIR` | the mounted HA config dir, e.g. `/Volumes/<share>/homeassistant` |
 | `OPTIONS_FILE` | a JSON copy of the add-on options (same keys as `config.yaml`) |
 | `HA_WS_URL` | `ws://<ha-host>:8123/api/websocket` |
 | `TOKEN_FILE` | local file holding a long-lived HA token (mode 600) |
@@ -240,9 +254,9 @@ Example `~/Library/LaunchAgents/com.example.nest-headless.plist`:
   <key>ProgramArguments</key><array><string>/bin/sh</string><string>/path/to/nest_headless/run.sh</string></array>
   <key>EnvironmentVariables</key><dict>
     <key>PATH</key><string>/path/to/node/bin:/usr/bin:/bin</string>
-    <key>HA_CONFIG_DIR</key><string>/Volumes/docker/homeassistant/homeassistant</string>
+    <key>HA_CONFIG_DIR</key><string>/Volumes/<share>/homeassistant</string>
     <key>OPTIONS_FILE</key><string>/Users/you/.config/nest_headless/options.json</string>
-    <key>HA_WS_URL</key><string>ws://192.168.0.69:8123/api/websocket</string>
+    <key>HA_WS_URL</key><string>ws://homeassistant.local:8123/api/websocket</string>
     <key>TOKEN_FILE</key><string>/Users/you/.config/nest_headless/token</string>
     <key>LOG_FILE</key><string>/Users/you/Library/Logs/nest_headless.log</string>
   </dict>
@@ -315,8 +329,8 @@ Faces: `nest_models/identity/models/{scrfd_10g.onnx, arcface_w600k_r50.onnx}`
 (InsightFace buffalo_l). Faces are sampled at the wake moment and 1 s later;
 each is `{name|null, score, box, quality: {size_px, det_score, reason},
 matches}`. `name` is set at cosine >= 0.4. Faces under 60 px are detected
-but not identified: at this kitchen camera a face at the far worktop is
-~30 px, at the table or under the hallway camera 60-120 px.
+but not identified: with a camera high on a wall a face at the far end of the room is
+~30 px; at a table below the camera 60-120 px.
 
 Endpoints (loopback, or `Authorization: Bearer <API_TOKEN>` from the LAN):
 

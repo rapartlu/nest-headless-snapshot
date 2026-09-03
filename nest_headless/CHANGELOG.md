@@ -15,16 +15,16 @@
 - Quiet speech (Hearth #15): when the end-pointer would report `no_speech`
   but the post-wake audio carried faint energy (> 0.6x the floor) for at
   least 600 ms, the recogniser is run anyway; words found are posted with
-  `reason: "quiet_speech"`, nothing found stays `no_speech`. A child across
-  the kitchen speaks at rms 0.01-0.02, right at the floor, and was getting
-  "didn't catch that" four times out of six.
+  `reason: "quiet_speech"`, nothing found stays `no_speech`. A quiet voice across
+  a large room speaks at rms 0.01-0.02, right at the floor, and was getting
+  "didn't catch that" most of the time.
 - 1.11.4: wake-phrase stripping only at the head of the transcript.
 
 ## 1.11.3
 
 - `concurrent_cameras` on `nest_headless_speech`: other cameras whose capture
   started within 1.5 s of this one - the same voice reaching two microphones
-  (kitchen and hallway both heard the first wake word of the morning). The
+  (two rooms' microphones both heard the same wake word). The
   brain dedupes on it.
 - `host/whisper_server.py` keeps its model workers warm (a silent decode
   every `KEEP_WARM_S`, default 240 s): after seven idle hours the first
@@ -197,7 +197,7 @@
 ## 1.8.7
 
 - Once speech has been heard, "quiet" is judged relative to that speech
-  (18% of the utterance's running peak rms, never below the floor). Kitchen
+  (18% of the utterance's running peak rms, never below the floor). Room
   bustle at 0.01-0.06 rms sat above the fixed floor and kept captures open
   to the 8 s hard stop for a 3.5 s question (Hearth #3, instrumented). The
   absolute floor still decides whether anything was said at all.
@@ -237,7 +237,7 @@
   `<name>-tokens.txt`; e.g. `sherpa-onnx-whisper-small.en`) and the add-on
   transcribes with it in-process: small.en int8 takes ~0.6 s per utterance
   on an M3 Pro and turned tonight's far-field captures into "Hey kitchen, is
-  the understair cupboard open?" where the transducers gave fragments.
+  the cupboard open?" where the transducers gave fragments.
   Transcripts stay authoritative in the add-on (Hearth #3). Hosts without a
   Whisper dir keep the transducer fallback. `nest_headless_speech` gains
   `engine`, `stt_ms` and `final: true`; Whisper text keeps its casing and
@@ -409,7 +409,7 @@
 - Cat detector v2, trained on every frame in the archive: both day and
   night, all poses (including curled-up eating - a raid pose v1's val split
   had never taught it), with human-verified labels. A v1 label turned out to
-  be a NIGHT REFLECTION on the patio glass mislabelled as a cat (identical
+  be a NIGHT REFLECTION on a glass door mislabelled as a cat (identical
   pixels for 3+ hours of frames proved it) - v2 trains against it as a hard
   negative. Acid suite: 14/14, cats 0.92-0.96, all confusers silent.
 - Annotated evidence frames (burned-in ROI rectangles) are excluded from

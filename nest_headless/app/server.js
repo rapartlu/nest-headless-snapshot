@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.11.8';
+const ADDON_VERSION = '1.11.9';
 
 const http = require('http');
 const fs = require('fs');
@@ -1363,7 +1363,7 @@ function feedSpeechCapture(entityId, chunk) {
 }
 // Drop the wake phrase (and anything before it) from a transcript that
 // includes the pre-roll. Spellings cover how the recognisers render "Claude"
-// for the voices in this house ("Claws", "God", "Cloud", ...).
+// for different voices ("Claws", "God", "Cloud", ...).
 // whisper.cpp `whisper-server` (POST /inference, multipart "file" = 16 kHz
 // mono WAV). Audio goes over loopback and is never written to disk.
 function wavBuffer(samples) {
@@ -1403,12 +1403,15 @@ function whisperServer(samples, base = cfg.sttUrl) {
     req.end(body);
   });
 }
-const WAKE_NAMES = 'claude|claud|clawed|claws|clause|cloud|cloudy|clod|clawd|klaud|klaus|clyde|cord|god|kitchen';
+// Names the recognisers render the wake word as ("Claude" comes back as
+// Claws, God, Cloud... depending on the voice). WAKE_NAMES overrides the
+// whole list (pipe-separated, lower case) for other wake words.
+const WAKE_NAMES = (process.env.WAKE_NAMES || 'claude|claud|clawed|claws|clause|cloud|cloudy|clod|clawd|klaud|klaus|clyde|cord|god|kitchen').toLowerCase();
 // The wake phrase sits at the START of the transcript (the pre-roll is 1.5 s,
 // so at most a few words of junk precede it - hence {0,40}); a wake phrase
-// further in is someone quoting it ("...say hey Claude, it's Rafe" was
-// Hearth's own reply, and an unbounded prefix once cut everything before it).
-// a quiet "hey" transcribes as "a" or "eh" ("a kitchen, send a note to my dad…", 3 Sept)
+// further in is someone quoting it (a spoken reply that contained "say hey
+// Claude" once had everything before it stripped by an unbounded prefix).
+// A quiet "hey" transcribes as "a" or "eh".
 const WAKE_WORDS = 'hey|hi|ok|okay|a|eh|hay';
 const WAKE_RE = new RegExp(`^[\\s\\S]{0,40}?\\b(?:${WAKE_WORDS})[,.!?]?\\s+(?:${WAKE_NAMES})\\b[,.!?]*\\s*`, 'i');
 // pre-roll cut mid-phrase: transcript starts with the bare name ("clawed, is the...")
@@ -1429,7 +1432,7 @@ function samplesFromChunks(chunks) {
   const all = new Float32Array(total); let o = 0;
   for (const ch of chunks) { all.set(ch, o); o += ch.length; }
   // Normalise for the recogniser (peak to -3 dBFS, at most x20): the mic sits
-  // above the patio doors and speech from the far side of the kitchen arrives
+  // high on a wall and speech from the far side of a large room arrives
   // at rms 0.01-0.08, which Whisper reads as noise; scaled, it reads it fine.
   let peak = 0;
   for (let i = 0; i < all.length; i++) { const a = Math.abs(all[i]); if (a > peak) peak = a; }

@@ -40,8 +40,8 @@ automation:
           image_file: /config/www/nest/kitchen_camera.jpg
           # ... existing provider/model/prompt settings unchanged ...
 
-  - alias: "Understairs cupboard door open alert (Nest still)"
-    id: understairs_cupboard_door_open_alert_v2
+  - alias: "Cupboard door open alert (Nest still)"
+    id: cupboard_door_open_alert_v2
     mode: single
     trigger:
       - platform: state

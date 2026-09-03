@@ -197,8 +197,8 @@ async function detect(jpegBuf, { conf = CONF_DEFAULT, classes = null, region = n
 // Classify a door-zone crop JPEG with the camera's fine-tuned model.
 // Returns { label, score, positive } or null when no model / failure.
 // Threshold 0.30: the v11 laser-slice CNN scores closed at 0.00-0.03 and
-// settled opens 0.98+, but in-between door ANGLES (live test 2026-09-01,
-// Paul: "i opened it to see if you'd catch it") sit at 0.5-0.8 and flapped
+// settled opens 0.98+, but in-between door ANGLES (a live test where the
+// owner opened the door part-way to see if it was caught) sit at 0.5-0.8 and flapped
 // across the old 0.6 line - the persistence gate then never fired. 0.30
 // keeps 10x margin over closed while making every open angle a solid tick
 // ways - and catches barely-ajar states a 0.9 threshold would miss.
@@ -269,7 +269,7 @@ function annotate(jpegBuf, dets, rois = [], { quality = 85 } = {}) {
 // Cat detection via the house-trained model when available, COCO otherwise.
 // COCO classes that small household objects on surfaces get detected as.
 // Used to veto house-model cat calls: the fine-tuned single-class model is
-// sharp on THIS house's cats but treats any novel compact object as
+// sharp on the cats it was trained on but treats any novel compact object as
 // cat-until-proven-otherwise (wipes tub 0.71, saucepan 0.20, a head 0.42).
 // Stock COCO knows what those objects ARE - so if it sees a container-ish
 // object in the same spot and no cat, the default knowledge wins.

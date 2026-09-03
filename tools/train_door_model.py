@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train the tiny understairs-door classifier for the nest_headless add-on.
+"""Train the tiny door-state classifier for the nest_headless add-on.
 
 Input: two directories of door-zone crop JPEGs (as archived by the add-on's
 samples_dir option):
