@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.13.4';
+const ADDON_VERSION = '1.13.5';
 
 const http = require('http');
 const fs = require('fs');
@@ -169,11 +169,17 @@ function zoneFromJson(z, kind) {
   if (kind === 'passages') {
     out.inside = Array.isArray(z.inside) && z.inside.length === 2 ? [f(z.inside[0]), f(z.inside[1])] : null;
     if (!out.pts) out.pts = [[out.x, out.y], [out.x + out.w, out.y], [out.x + out.w, out.y + out.h], [out.x, out.y + out.h]];   // the tracker needs a polygon
-    // look: {camera, delay_ms?} - after a crossing, take a frame from this
-    // camera (where the person appears larger) and report its faces against
-    // the same track id (#7)
-    out.look = z.look && typeof z.look === 'object' && /^[a-z0-9_.-]{1,64}$/i.test(String(z.look.camera || ''))
-      ? { camera: cameraEntity(String(z.look.camera)), delay_ms: Math.max(300, Math.min(5000, Number(z.look.delay_ms) || 1500)) } : null;
+    // look: {camera, delay_ms?, until_ms?, every_ms?, min_face_px?} - after a
+    // crossing, take frames from this camera (where the person appears
+    // larger) from delay_ms to until_ms, every every_ms, stopping at the
+    // first face big enough to identify; one report against the track (#7)
+    if (z.look && typeof z.look === 'object' && /^[a-z0-9_.-]{1,64}$/i.test(String(z.look.camera || ''))) {
+      const delay = Math.max(300, Math.min(8000, Number(z.look.delay_ms) || 1500));
+      out.look = { camera: cameraEntity(String(z.look.camera)), delay_ms: delay,
+        until_ms: Math.max(delay, Math.min(8000, Number(z.look.until_ms) || delay)),
+        every_ms: Math.max(500, Math.min(4000, Number(z.look.every_ms) || 1000)),
+        min_face_px: Math.max(40, Math.min(200, Number(z.look.min_face_px) || 60)) };
+    } else out.look = null;
   }
   if (typeof z.description === 'string' && z.description.trim()) out.description = z.description.trim().slice(0, 160);   // for the brain ("the sideboard by the window")
   return out;
@@ -182,7 +188,7 @@ function zoneToJson(z, kind) {
   const o = { name: z.name };
   if (z.pts) o.pts = z.pts.map((p) => [Math.round(p[0] * 10000) / 10000, Math.round(p[1] * 10000) / 10000]);
   else { o.x = z.x; o.y = z.y; o.w = z.w; o.h = z.h; }
-  if (kind === 'passages') { o.inside = z.inside || null; if (z.look) o.look = { camera: z.look.camera.replace(/^camera\./, ''), delay_ms: z.look.delay_ms }; }
+  if (kind === 'passages') { o.inside = z.inside || null; if (z.look) o.look = { ...z.look, camera: z.look.camera.replace(/^camera\./, '') }; }
   if (z.description) o.description = z.description;
   return o;
 }
@@ -681,20 +687,38 @@ function faceSummary(f) {
 // against the same track id so the brain can stitch the two.
 function scheduleSecondLook(fromEntity, ev, zone) {
   if (!zone || !zone.look || !faces.hasModels(FACE_MODELS_DIR())) return;
-  const { camera, delay_ms } = zone.look;
-  setTimeout(async () => {
+  const { camera, delay_ms, until_ms, every_ms, min_face_px } = zone.look;
+  const t0 = Date.now();
+  (async () => {
+    // A series, not one frame: at 1.5 s the person is still by the door and
+    // the face is ~30 px; it reaches the identification floor a few seconds
+    // in. Frames are the held stream's own (no vendor command). Stop at the
+    // first face large enough to embed; otherwise report the largest seen.
+    let attempts = 0, bestEmbedded = null, largest = null, lastList = [], lastReason = null, atMs = delay_ms;
     try {
-      const r = await facesForCamera(camera);
-      const list = (r.faces || []).map(faceSummary);
-      const best = list.filter((f) => f.matches.length).sort((a, b) => b.score - a.score)[0] || null;
-      console.log(`[nest_headless] PASSAGE look ${ev.passage} from ${camera} for track ${ev.track_id}: ${list.length} face(s)${best ? ', best ' + (best.name || '?') + ':' + best.score + ' ' + best.size_px + 'px' : ''}${r.ok ? '' : ' (' + r.reason + ')'}`);
+      for (let t = delay_ms; t <= until_ms; t += every_ms) {
+        await sleep(Math.max(0, t0 + t - Date.now()));
+        attempts++;
+        const r = await facesForCamera(camera);
+        lastReason = r.ok ? null : (r.reason || 'no_frame');
+        lastList = (r.faces || []).map(faceSummary);
+        for (const f of lastList) if (!largest || f.size_px > largest.size_px) largest = f;
+        const embedded = lastList.filter((f) => f.matches.length && f.size_px >= min_face_px).sort((a, b) => b.score - a.score)[0];
+        if (embedded) { bestEmbedded = embedded; atMs = t; break; }
+        atMs = t;
+      }
+      const best = bestEmbedded;
+      const reason = best ? null : (largest ? 'face_too_small' : (lastReason || 'no_face'));
+      console.log(`[nest_headless] PASSAGE look ${ev.passage} from ${camera} for track ${ev.track_id}: ${attempts} frame(s) to ${atMs} ms, ${best ? 'best ' + (best.name || '?') + ':' + best.score + ' ' + best.size_px + 'px' : (largest ? 'largest face ' + largest.size_px + 'px, ' + reason : reason)}`);
       postHaEvent('nest_headless_passage_look', {
         entity_id: camera, camera: camera.replace(/^camera\./, ''), from_camera: fromEntity.replace(/^camera\./, ''),
-        passage: ev.passage, direction: ev.direction, track_id: ev.track_id, delay_ms, ok: r.ok, reason: r.reason || null,
-        faces: list, person: best ? { name: best.name, score: best.score, size_px: best.size_px, matches: best.matches } : null,
+        passage: ev.passage, direction: ev.direction, track_id: ev.track_id,
+        delay_ms, until_ms, every_ms, min_face_px, attempts, at_ms: atMs, ok: !!best, reason,
+        faces: best ? lastList : (largest ? [largest] : lastList),
+        person: best ? { name: best.name, score: best.score, size_px: best.size_px, matches: best.matches } : null,
       }).catch(() => {});
     } catch (e) { console.warn(`[nest_headless] passage look ${camera} failed: ${e.message}`); }
-  }, delay_ms).unref();
+  })();
 }
 
 // ------------------------------------------------------------ state zones (Hearth #12, #13)

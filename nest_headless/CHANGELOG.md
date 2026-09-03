@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.13.5
+
+- Second look as a series (#7): `look: {camera, delay_ms, until_ms (<= 8 s),
+  every_ms (>= 500), min_face_px (60)}` takes frames from the held stream
+  between `delay_ms` and `until_ms` and stops at the first face large
+  enough to identify; one `nest_headless_passage_look` reports the best
+  result, or the largest face seen with `reason: face_too_small`, or
+  `no_face`, plus `attempts` and `at_ms`. First live look found a 28 px
+  face at 1.5 s: the person is still by the door then.
+
 ## 1.13.4
 
 - Passage events carry `faces`: every face in the frame (>= 40 px) with
