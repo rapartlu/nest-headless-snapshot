@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.12.5';
+const ADDON_VERSION = '1.12.6';
 
 const http = require('http');
 const fs = require('fs');
@@ -1135,6 +1135,7 @@ const FACE_MODELS_DIR = () => path.join(cfg.identityDir, 'models');
 const pending = new PendingStore(path.join(cfg.identityDir, 'pending'));   // verification backlog (#16)
 function matchFace(embedding) {
   if (!enrolled) loadEnrolled();
+  if (pending.negativeScore('face', embedding, faces.cosine) >= FACE_DECISIVE) return [];   // a known "not a person" (#18)
   const out = [];
   for (const [name, items] of Object.entries(enrolledFaces)) {
     const best = Math.max(...items.map((it) => faces.cosine(embedding, it.embedding)));
@@ -1202,6 +1203,7 @@ function considerVoiceForPending(entityId, u, matches, utteranceId) {
       autoSample(matches[0].name, 'voice', { camera: entityId, quality: u.quality, embedding: u.embedding, utterance_id: utteranceId, matches });
       return;
     }
+    if (pending.negativeScore('voice', u.embedding, cosine) >= VOICE_DECISIVE) return;   // a known non-speech source (#18)
     if (pending.unknownScore('voice', u.embedding, cosine) >= VOICE_DECISIVE) return;   // a visitor already marked unknown
     const clip = u.samples.length > 160000 ? u.samples.subarray(0, 160000) : u.samples;  // <= 10 s
     const meta = pending.add({ kind: 'voice', camera: entityId.replace(/^camera\./, ''), t: new Date().toISOString(), utterance_id: utteranceId,
@@ -1220,6 +1222,7 @@ async function considerFacesForPending(entityId, jpg, found) {
       if (!f.embedding || f.quality.size_px < 60) continue;
       const matches = matchFace(f.embedding);
       if (!ambiguous(matches, FACE_DECISIVE)) { lastMatched[matches[0].name] = new Date().toISOString(); continue; }
+      if (pending.negativeScore('face', f.embedding, faces.cosine) >= FACE_DECISIVE) continue;   // a known "not a person" (#18)
       if (pending.unknownScore('face', f.embedding, faces.cosine) >= FACE_DECISIVE) continue;
       // a human-readable crop: the face box with 2.5x context
       const m = await sharp(jpg).metadata();
@@ -1378,6 +1381,7 @@ function enrolFace(name, entityId, found, index, pose) {
 // bandwidth differ), and this lets the brain see that rather than guess (#16).
 function matchVoice(embedding) {
   if (!enrolled) loadEnrolled();
+  if (pending.negativeScore('voice', embedding, cosine) >= VOICE_DECISIVE) return [];   // a known non-speech source (#18)
   const r3 = (v) => Math.round(v * 1000) / 1000;
   const out = [];
   for (const [name, items] of Object.entries(enrolled)) {
@@ -1453,7 +1457,7 @@ function identitySummary() {
   return { people: [...names].map((name) => ({
     name, voice_samples: (enrolled[name] || []).length, face_samples: (enrolledFaces[name] || []).length,
     updated_at: [...(enrolled[name] || []), ...(enrolledFaces[name] || [])].map((i) => i.at).sort().pop() || null,
-  })), face_models: faces.hasModels(FACE_MODELS_DIR()), pending: pending.count() };
+  })), face_models: faces.hasModels(FACE_MODELS_DIR()), pending: pending.count(), negatives: pending.negativeCount() };
 }
 function readJsonBody(req) {
   return new Promise((resolve) => {
@@ -2132,12 +2136,29 @@ const server = http.createServer(async (req, res) => {
           if (ok) { console.log(`[nest_headless] IDENTITY pending ${parts[2]} marked not-household`); notePendingCount(); }
           res.writeHead(ok ? 200 : 404, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok, pending: pending.count() }));
         }
+        if (req.method === 'POST' && parts[2] && parts[3] === 'not_person') {
+          // a false face (poster, reflection, the cat) or non-speech (TV, a dog): kept as a hard negative (#18)
+          const ok = pending.markNotPerson(parts[2]);
+          if (ok) { console.log(`[nest_headless] IDENTITY pending ${parts[2]} marked not a person (${pending.negativeCount()} negatives)`); notePendingCount(); }
+          res.writeHead(ok ? 200 : 404, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok, pending: pending.count(), negatives: pending.negativeCount() }));
+        }
         if (req.method === 'DELETE' && parts[2]) {
           const ok = pending.remove(parts[2]);
           if (ok) notePendingCount();
           res.writeHead(ok ? 200 : 404, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok, pending: pending.count() }));
         }
         res.writeHead(404); return res.end('unknown pending route');
+      }
+      // ---- hard negatives (#18): "not a person" samples, kept until deleted
+      if (parts[1] === 'negatives') {
+        if (req.method === 'GET' && !parts[2]) {
+          res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ count: pending.negativeCount(), samples: pending.listNegatives() }));
+        }
+        if (req.method === 'DELETE' && parts[2]) {
+          const ok = pending.removeNegative(parts[2]);
+          res.writeHead(ok ? 200 : 404, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok, negatives: pending.negativeCount() }));
+        }
+        res.writeHead(404); return res.end('unknown negatives route');
       }
       if (req.method === 'GET' && parts[1] === 'who' && parts[2]) {
         // who is in view right now: one frame, faces matched against enrolled people

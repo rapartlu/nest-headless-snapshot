@@ -373,6 +373,12 @@ for an admin (never under `www/`): `GET /identity/pending` lists them with a
 `media_url` (clip or crop), `POST /identity/pending/<id>/label {name}`
 enrols one, `POST /identity/pending/<id>/unknown` marks a visitor (kept as a
 negative for 30 days so they are not queued again), `DELETE` drops one.
+`POST /identity/pending/<id>/not_person` marks a false face (a poster, a
+reflection, the cat) or a non-speech clip (the TV, a dog): the sample moves
+to `nest_models/identity/negatives/not_person/` as a hard negative, later
+candidates that resemble it are dropped before the backlog and never matched
+to a person, and `GET /identity/negatives` / `DELETE /identity/negatives/<id>`
+manage the set (kept until deleted, cap 500).
 `nest_headless_identity_pending` {count, newest?} keeps a badge honest.
 Retention: 7 days or 200 samples. Onboarding from a phone: voice enrol with
 `{name, audio_b64, phrase?}` (16-bit WAV, 3-10 s) several times per person;

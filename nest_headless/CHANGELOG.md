@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.12.6
+
+- "Not a person" label for the backlog (#18): `POST
+  /identity/pending/<id>/not_person` moves a false face (poster, reflection,
+  the cat) or non-speech clip (TV, a dog) into a hard-negative set under
+  `nest_models/identity/negatives/not_person/` and answers `{ok, pending,
+  negatives}`. A new candidate whose embedding is within the decisive margin
+  of a stored negative is dropped before it reaches the backlog and is never
+  matched to a person. `GET /identity/negatives` lists the set, `DELETE
+  /identity/negatives/<id>` removes one; `GET /identity` carries the count.
+  Kept until deleted (cap 500); the crops are there for a detector retune.
+
 ## 1.12.5
 
 - Backlog and auto room samples only from speech addressed to the house:
