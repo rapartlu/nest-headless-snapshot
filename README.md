@@ -64,8 +64,11 @@ choosing who to tell — belongs to a separate brain that consumes the events
   backlog — short clips and face crops the add-on could not attribute, kept
   for at most 7 days for an admin to label or drop.
 - Identity is opt-in per person through the enrolment endpoints; the add-on
-  never decides who someone is or enrols on its own — it reports scores and
-  parks ambiguous samples for a human.
+  never decides who someone is or enrols a new person on its own — it
+  reports scores and parks ambiguous samples for a human. For people already
+  enrolled, a confident room voice match keeps its embedding as an extra
+  room sample (never audio; a small per-person cap; `identity_auto_samples:
+  false` turns this off).
 - Everything runs on your hardware. No cloud, no Google credentials: it only
   talks to your Home Assistant.
 - The routes that open a microphone window, touch identity or serve raw audio

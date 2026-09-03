@@ -64,6 +64,7 @@ if [ -f "$OPTS" ]; then
   STT_SHADOW_OPT="$(jq -r '.stt_shadow_url // ""' "$OPTS")"
   [ -n "$STT_SHADOW_OPT" ] && export STT_SHADOW_URL="$STT_SHADOW_OPT"
   export IDENTITY_KEEP_SAMPLES="$(jq -r '.identity_keep_samples // false' "$OPTS")"
+  export IDENTITY_AUTO_SAMPLES="$(jq -r '.identity_auto_samples // true' "$OPTS")"
 fi
 
 exec node "$(cd "$(dirname "$0")" && pwd)/app/server.js"

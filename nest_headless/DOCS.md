@@ -31,6 +31,7 @@ Options:
 | `stt_url` | (empty) | external recogniser (`host/whisper_server.py` or whisper.cpp `whisper-server`), used ahead of the in-process one |
 | `stt_shadow_url` | (empty) | second recogniser for bake-offs; its text is only logged |
 | `identity_keep_samples` | `false` | keep raw enrolment audio / aligned face crops on disk |
+| `identity_auto_samples` | `true` | keep an embedding-only room sample from each confident room voice match (12 per person, oldest auto sample out; consented samples never displaced) |
 | `watch_passages` | (empty) | doorway polygons with an optional `in=x,y` room-side point → `nest_headless_passage` |
 | `watch_classify_zones` | (empty) | state zones (change detection with crops; optional `<camera>__<zone>.onnx`) |
 | `watch_activity_zones` | (empty) | running/idle from motion inside a crop → `nest_headless_activity` |
@@ -378,7 +379,10 @@ Retention: 7 days or 200 samples. Onboarding from a phone: voice enrol with
 face enrol with `pose`; `GET /identity/<name>` shows what is held, including
 `voice_sources` / `face_sources` {room, upload} so an admin can see when a
 person has no room-channel samples yet. Every sample file carries `source`
-(`room` or `upload`); backlog labels are always `room`.
+(`room` or `upload`); backlog labels are always `room`. With
+`identity_auto_samples` (default on) a confident room voice match also keeps
+its embedding as a room sample flagged `auto`, so the room channel fills in
+on its own after the first couple of labels.
 
 ## Follow-up window and the API token
 

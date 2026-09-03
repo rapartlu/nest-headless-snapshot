@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.12.3';
+const ADDON_VERSION = '1.12.4';
 
 const http = require('http');
 const fs = require('fs');
@@ -133,6 +133,8 @@ const cfg = {
   // Raw enrolment WAVs are kept only when identity_keep_samples is on.
   identityDir: path.join(CONFIG_DIR, 'nest_models/identity'),
   identityKeepSamples: (process.env.IDENTITY_KEEP_SAMPLES || 'false') === 'true',
+  // confident room voice matches keep an embedding-only room sample (#16; approved by the household admin 2026-09-03)
+  identityAutoSamples: (process.env.IDENTITY_AUTO_SAMPLES || 'true') === 'true',
 };
 
 // ------------------------------------------------------------ zones file (the app's zone editor)
@@ -1108,7 +1110,7 @@ let enrolled = null, enrolledFaces = {};
 // or frame) or 'upload' (a phone recording or photo) - older files carry
 // only `camera`, so it is derived from that.
 function sampleItem(file, j) {
-  return { embedding: j.embedding, file, at: j.at, pose: j.pose || null,
+  return { embedding: j.embedding, file, at: j.at, pose: j.pose || null, auto: !!j.auto,
     source: j.source || (String(j.camera || '').startsWith('camera.') ? 'room' : 'upload') };
 }
 function loadEnrolled() {
@@ -1195,7 +1197,11 @@ function notePendingCount(newest) {
 function considerVoiceForPending(entityId, u, matches, utteranceId) {
   try {
     if (!u.embedding || !u.quality || u.quality.reason !== 'ok') return;
-    if (!ambiguous(matches, VOICE_DECISIVE)) { lastMatched[matches[0].name] = new Date().toISOString(); return; }
+    if (!ambiguous(matches, VOICE_DECISIVE)) {
+      lastMatched[matches[0].name] = new Date().toISOString();
+      autoSample(matches[0].name, 'voice', { camera: entityId, quality: u.quality, embedding: u.embedding, utterance_id: utteranceId, matches });
+      return;
+    }
     if (pending.unknownScore('voice', u.embedding, cosine) >= VOICE_DECISIVE) return;   // a visitor already marked unknown
     const clip = u.samples.length > 160000 ? u.samples.subarray(0, 160000) : u.samples;  // <= 10 s
     const meta = pending.add({ kind: 'voice', camera: entityId.replace(/^camera\./, ''), t: new Date().toISOString(), utterance_id: utteranceId,
@@ -1230,12 +1236,43 @@ async function considerFacesForPending(entityId, jpg, found) {
   } catch (e) { console.warn('[nest_headless] pending face failed:', e.message); }
 }
 function writePersonSample(name, kind, record, mediaSrc) {
-  const d = path.join(cfg.identityDir, name.toLowerCase());
+  name = name.toLowerCase();
+  const d = path.join(cfg.identityDir, name);
   fs.mkdirSync(d, { recursive: true });
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
-  fs.writeFileSync(path.join(d, `${kind}-${ts}.json`), JSON.stringify({ at: new Date().toISOString(), ...record }));
+  const file = `${kind}-${ts}.json`, j = { at: new Date().toISOString(), ...record };
+  diskq.writeAtomic(path.join(d, file), Buffer.from(JSON.stringify(j))).catch((e) => console.warn('[nest_headless] identity sample write failed:', e.message));
   if (cfg.identityKeepSamples && mediaSrc) try { fs.copyFileSync(mediaSrc, path.join(d, `${kind}-${ts}.${mediaSrc.endsWith('.wav') ? 'wav' : 'jpg'}`)); } catch (e) { /* optional */ }
-  loadEnrolled();
+  // keep the in-memory index current without re-reading the identity dir (a share)
+  if (!enrolled) loadEnrolled();
+  const map = kind === 'voice' ? enrolled : enrolledFaces;
+  (map[name] = map[name] || []).push(sampleItem(file, j));
+}
+// Confident room matches feed the room channel (#16): someone enrolled from
+// phone recordings scores lower on a ceiling microphone (level, reverb and
+// bandwidth differ), so a decisive room capture is kept as a room sample.
+// Embeddings only - never audio - at most AUTO_MAX per person with the
+// oldest auto sample displaced, one per person per AUTO_GAP_MS. Explicit
+// enrolments and admin labels are never displaced. identity_auto_samples
+// turns it off.
+const AUTO_MAX = 12, AUTO_GAP_MS = 10 * 60000;
+const lastAutoMs = {};
+function autoSample(name, kind, record) {
+  try {
+    if (!cfg.identityAutoSamples || !record.embedding) return;
+    const key = `${kind}:${name}`, now = Date.now();
+    if (now - (lastAutoMs[key] || 0) < AUTO_GAP_MS) return;
+    lastAutoMs[key] = now;
+    const map = kind === 'voice' ? enrolled : enrolledFaces;
+    const items = map[name] || [];
+    const autos = items.filter((it) => it.auto).sort((a, b) => (a.at < b.at ? -1 : 1));
+    for (const old of autos.slice(0, Math.max(0, autos.length + 1 - AUTO_MAX))) {
+      items.splice(items.indexOf(old), 1);
+      fs.promises.unlink(path.join(cfg.identityDir, name, old.file)).catch(() => {});
+    }
+    writePersonSample(name, kind, { ...record, source: 'room', auto: true });
+    console.log(`[nest_headless] IDENTITY room ${kind} sample kept for ${name} (auto ${Math.min(AUTO_MAX, autos.length + 1)}/${AUTO_MAX})`);
+  } catch (e) { console.warn('[nest_headless] auto sample failed:', e.message); }
 }
 function enrolPending(id, name) {
   if (!/^[a-z0-9_-]{1,32}$/i.test(name)) return { ok: false, accepted: false, reason: 'bad_name' };
@@ -1252,7 +1289,7 @@ function personSummary(name) {
   if (!enrolled) loadEnrolled();
   const v = enrolled[name] || [], f = enrolledFaces[name] || [];
   const poses = [...new Set(f.map((it) => it.pose).filter(Boolean))];
-  const bySource = (arr) => ({ room: arr.filter((it) => it.source === 'room').length, upload: arr.filter((it) => it.source !== 'room').length });
+  const bySource = (arr) => ({ room: arr.filter((it) => it.source === 'room').length, upload: arr.filter((it) => it.source !== 'room').length, auto: arr.filter((it) => it.auto).length });
   return { name, voice_samples: v.length, face_samples: f.length, poses_held: poses, last_matched: lastMatched[name] || null,
     voice_sources: bySource(v), face_sources: bySource(f),
     updated_at: [...v, ...f].map((i) => i.at).sort().pop() || null };

@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.12.4
+
+- Confident room voice matches keep a room sample (#16 follow-up, approved
+  by the household admin): when a capture scores >= 0.6 with a clear margin,
+  its embedding is stored as `source: room, auto: true`. Embeddings only,
+  never audio; at most 12 auto samples per person, one per ten minutes,
+  oldest auto sample displaced first, explicit enrolments and admin labels
+  never displaced. `identity_auto_samples: false` turns it off.
+  `GET /identity/<name>` reports the count under `voice_sources.auto`.
+- Identity sample writes are async and update the in-memory index directly
+  instead of re-reading the identity directory (a share) each time.
+
 ## 1.12.3
 
 - The real cause behind #17: synchronous disk I/O on a network share. The
