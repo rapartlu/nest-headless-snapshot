@@ -34,6 +34,7 @@ Options:
 | `identity_keep_samples` | `false` | keep raw enrolment audio / aligned face crops on disk |
 | `identity_auto_samples` | `true` | keep an embedding-only room sample from each confident room voice match (12 per person, oldest auto sample out; consented samples never displaced) |
 | `wake_by_transcript` | `false` | transcribe every speech segment on the tapped mics (in memory) and treat a wake phrase at its head as the wake word; enables conversation windows |
+| `training_dir` | (empty) | a brain's labelled training crops (`<dir>/<camera>__<zone>/<label>/*.jpg`), served read-only with delete under `/training` |
 | `watch_passages` | (empty) | doorway polygons with an optional `in=x,y` room-side point → `nest_headless_passage` |
 | `watch_classify_zones` | (empty) | state zones (change detection with crops; optional `<camera>__<zone>.onnx`) |
 | `watch_activity_zones` | (empty) | running/idle from motion inside a crop → `nest_headless_activity` |
@@ -397,9 +398,20 @@ Endpoints (loopback, or `Authorization: Bearer <API_TOKEN>` from the LAN):
   side); a photo sample has no frame and matches on colour and texture
   only, so enrol from the camera (or label backlog crops) for size to count.
 
-Embeddings are JSON under `nest_models/identity/<name>/`; raw audio or the
-aligned 112x112 face crop are kept only with `identity_keep_samples`. The
-add-on never decides who someone is or enrols on its own.
+Embeddings are JSON under `nest_models/identity/<name>/`; the voice clip,
+a context crop of the face, or the cat crop are kept beside them only with
+`identity_keep_samples`. The add-on never decides who someone is or enrols
+on its own.
+
+Reviewing the corpus: `GET /identity/<name>/samples` (people) and
+`GET /identity/cat/<name>/samples` (cats) list every sample with `kind`,
+`t`, `source` (room | upload | auto), `camera`, `size_px` or `speech_ms`,
+`quality`, `pose` and `media_url` (null when the media was not kept);
+`GET .../samples/<id>/media` serves it; `DELETE .../samples/<id>` removes the
+sample and its embedding. A brain's labelled training crops can be reviewed
+the same way when `training_dir` points at them: `GET /training` (sets and
+counts), `GET /training/<set>/<label>` (files), `GET` a file, `DELETE` a
+file. All under the identity token rule.
 
 ### Verification backlog and onboarding
 

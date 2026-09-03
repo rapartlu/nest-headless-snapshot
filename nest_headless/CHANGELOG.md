@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.16.0
+
+- The recognition corpus for review (#24): `GET /identity/<name>/samples`
+  (and `/identity/cat/<name>/samples`) lists every enrolled sample with
+  kind, time, source, camera, size or speech length, quality, pose and a
+  `media_url` when its media is kept; `GET .../samples/<id>/media` serves
+  the JPEG or WAV; `DELETE .../samples/<id>` removes the sample and its
+  embedding and re-indexes. With `identity_keep_samples` on, face samples
+  now keep a context crop (the face box with 2.5x margin) rather than the
+  aligned 112 px thumbnail, so a person can judge them.
+- `training_dir`: a brain's labelled training crops
+  (`<dir>/<camera>__<zone>/<label>/*.jpg`) are served read-only under
+  `/training` (listing, per-label listing, files) with `DELETE` of a single
+  crop, so a wrong label can be dropped before the nightly retrain. Token
+  rule as for identity; the add-on never writes there.
+
 ## 1.15.1
 
 - Cat enrolment refuses a near-identical sample (`reason: duplicate`, cosine

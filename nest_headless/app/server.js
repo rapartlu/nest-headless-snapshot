@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.15.1';
+const ADDON_VERSION = '1.16.0';
 
 const http = require('http');
 const fs = require('fs');
@@ -143,6 +143,8 @@ const cfg = {
   // transcribed (in memory) and kept only if it starts with the wake phrase or
   // falls inside an open conversation window. Off by default.
   wakeByTranscript: (process.env.WAKE_BY_TRANSCRIPT || 'false') === 'true',
+  // A brain's labelled training crops (<dir>/<camera>__<zone>/<label>/*.jpg), served read-only with delete for review (#24)
+  trainingDir: process.env.TRAINING_DIR || '',
 };
 
 // ------------------------------------------------------------ zones file (the app's zone editor)
@@ -1567,6 +1569,49 @@ function personSummary(name) {
     voice_sources: bySource(v), face_sources: bySource(f),
     updated_at: [...v, ...f].map((i) => i.at).sort().pop() || null };
 }
+// ---- the recognition corpus for review (#24): every enrolled sample per
+// name (people and cats alike), its media when kept, and deletion.
+async function contextCrop(sharp, jpg, box, factor = 2.5) {
+  const m = await sharp(jpg).metadata();
+  const side = Math.round(Math.max(box.w * m.width, box.h * m.height) * factor);
+  const left = Math.max(0, Math.round((box.x + box.w / 2) * m.width - side / 2)), top = Math.max(0, Math.round((box.y + box.h / 2) * m.height - side / 2));
+  return sharp(jpg).extract({ left, top, width: Math.min(m.width - left, side), height: Math.min(m.height - top, side) }).jpeg({ quality: 88 }).toBuffer();
+}
+const SAMPLE_ID = /^(voice|face|cat)-[0-9TZ-]{20,40}$/;
+function listSamples(name) {
+  const d = path.join(cfg.identityDir, name);
+  if (!/^[a-z0-9_-]{1,32}$/i.test(name) || !fs.existsSync(d)) return null;
+  const files = new Set(fs.readdirSync(d));
+  const out = [];
+  for (const f of [...files].filter((x) => /^(voice|face|cat)-.*\.json$/.test(x)).sort()) {
+    const id = f.replace(/\.json$/, '');
+    let j; try { j = JSON.parse(fs.readFileSync(path.join(d, f), 'utf8')); } catch (e) { continue; }
+    const kind = id.split('-')[0];
+    const media = files.has(id + '.jpg') ? id + '.jpg' : (files.has(id + '.wav') ? id + '.wav' : null);
+    out.push({ id, kind, t: j.at || null, source: j.auto ? 'auto' : (j.source || (String(j.camera || '').startsWith('camera.') ? 'room' : 'upload')),
+      camera: j.camera || null, size_px: j.quality && j.quality.size_px != null ? j.quality.size_px : undefined, speech_ms: j.quality && j.quality.speech_ms != null ? j.quality.speech_ms : undefined,
+      quality: j.quality || null, pose: j.pose || null, phrase: j.phrase || null, from_pending: j.from_pending || null,
+      media_url: media ? `/identity/${kind === 'cat' ? 'cat/' : ''}${name}/samples/${id}/media` : null, used: true });
+  }
+  return out;
+}
+function sampleMedia(name, id) {
+  if (!/^[a-z0-9_-]{1,32}$/i.test(name) || !SAMPLE_ID.test(id)) return null;
+  const d = path.join(cfg.identityDir, name);
+  for (const [ext, type] of [['.jpg', 'image/jpeg'], ['.wav', 'audio/wav']]) { const f = path.join(d, id + ext); if (fs.existsSync(f)) return { file: f, type }; }
+  return null;
+}
+function deleteSample(name, id) {
+  if (!/^[a-z0-9_-]{1,32}$/i.test(name) || !SAMPLE_ID.test(id)) return { ok: false, reason: 'bad_id' };
+  const d = path.join(cfg.identityDir, name);
+  if (!fs.existsSync(path.join(d, id + '.json'))) return { ok: false, reason: 'unknown_sample' };
+  for (const ext of ['.json', '.jpg', '.wav']) { try { fs.unlinkSync(path.join(d, id + ext)); } catch (e) { /* ok */ } }
+  loadEnrolled();
+  const kind = id.split('-')[0];
+  const left = (kind === 'cat' ? enrolledCats[name] : kind === 'voice' ? enrolled[name] : enrolledFaces[name]) || [];
+  console.log(`[nest_headless] IDENTITY dropped sample ${id} of ${name} (${left.length} ${kind} left)`);
+  return { ok: true, samples: left.length, kind };
+}
 // Uploaded WAV (RIFF, 16-bit PCM, any rate/channels) -> 16 kHz float32 mono.
 function wavToFloat16k(buf) {
   if (buf.length < 44 || buf.toString('ascii', 0, 4) !== 'RIFF') throw new Error('not a WAV');
@@ -1669,10 +1714,17 @@ function enrolFace(name, entityId, found, index, pose) {
   const POSES = ['front', 'left', 'right', 'up', 'down'];
   const p = POSES.includes(String(pose || '').toLowerCase()) ? String(pose).toLowerCase() : null;
   fs.writeFileSync(path.join(d, `face-${ts}.json`), JSON.stringify({ at: new Date().toISOString(), camera: entityId, source: String(entityId).startsWith('camera.') ? 'room' : 'upload', quality: pick.quality, box: pick.box, pose: p, embedding: pick._emb }));
-  if (cfg.identityKeepSamples && pick._aligned) {
-    const rgba = Buffer.alloc(faces.ALIGN * faces.ALIGN * 4);
-    for (let i = 0; i < faces.ALIGN * faces.ALIGN; i++) { rgba[i * 4] = pick._aligned[i * 3]; rgba[i * 4 + 1] = pick._aligned[i * 3 + 1]; rgba[i * 4 + 2] = pick._aligned[i * 3 + 2]; rgba[i * 4 + 3] = 255; }
-    fs.writeFileSync(path.join(d, `face-${ts}.jpg`), require('jpeg-js').encode({ data: rgba, width: faces.ALIGN, height: faces.ALIGN }, 90).data);
+  if (cfg.identityKeepSamples) {
+    // for review (#24): a context crop (the face box with 2.5x margin) from the
+    // source frame when we have it, else the aligned 112 px crop
+    const sharpM = getSharp();
+    if (found.jpg && sharpM) {
+      contextCrop(sharpM, found.jpg, pick.box).then((crop) => diskq.writeAtomic(path.join(d, `face-${ts}.jpg`), crop)).catch(() => {});
+    } else if (pick._aligned) {
+      const rgba = Buffer.alloc(faces.ALIGN * faces.ALIGN * 4);
+      for (let i = 0; i < faces.ALIGN * faces.ALIGN; i++) { rgba[i * 4] = pick._aligned[i * 3]; rgba[i * 4 + 1] = pick._aligned[i * 3 + 1]; rgba[i * 4 + 2] = pick._aligned[i * 3 + 2]; rgba[i * 4 + 3] = 255; }
+      fs.writeFileSync(path.join(d, `face-${ts}.jpg`), require('jpeg-js').encode({ data: rgba, width: faces.ALIGN, height: faces.ALIGN }, 90).data);
+    }
   }
   loadEnrolled();
   console.log(`[nest_headless] IDENTITY enrolled face for ${name.toLowerCase()} (${enrolledFaces[name.toLowerCase()].length} samples, ${pick.quality.size_px}px${p ? ', ' + p : ''})`);
@@ -2423,7 +2475,7 @@ const server = http.createServer(async (req, res) => {
   // Snapshots, frames, detection and status stay LAN-open for HA.
   const ip = (req.socket.remoteAddress || '').replace(/^::ffff:/, '');
   const loopback = ip === '127.0.0.1' || ip === '::1';
-  const sensitive = parts[0] === 'listen' || parts[0] === 'identity' || parts[0] === 'utterance' || parts[0] === 'audiodebug' || (parts[0] === 'zones' && req.method !== 'GET');
+  const sensitive = parts[0] === 'listen' || parts[0] === 'identity' || parts[0] === 'utterance' || parts[0] === 'audiodebug' || parts[0] === 'training' || (parts[0] === 'zones' && req.method !== 'GET');
   if (sensitive && !loopback) {
     const auth = req.headers.authorization || '';
     if (!cfg.apiToken || auth !== `Bearer ${cfg.apiToken}`) {
@@ -2603,6 +2655,41 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ ok: true, camera: entityId.replace(/^camera\./, ''), seconds }));
     }
+    // ---- a brain's training crops, for review (#24): read-only listing and
+    // files, plus DELETE of a single crop so a wrong label is gone before the
+    // next retrain. The brain writes them; the add-on never does.
+    if (parts[0] === 'training') {
+      const root = cfg.trainingDir;
+      const safe = (s) => typeof s === 'string' && /^[A-Za-z0-9_.-]{1,80}$/.test(s) && !s.startsWith('.');
+      if (!root || !fs.existsSync(root)) { res.writeHead(404, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, reason: 'no_training_dir' })); }
+      const fsp = require('fs/promises');
+      if (req.method === 'GET' && !parts[1]) {
+        const sets = {};
+        for (const key of (await fsp.readdir(root)).filter(safe)) {
+          const kd = path.join(root, key); if (!(await fsp.stat(kd)).isDirectory()) continue;
+          sets[key] = {};
+          for (const label of (await fsp.readdir(kd)).filter(safe)) {
+            const ld = path.join(kd, label); if (!(await fsp.stat(ld)).isDirectory()) continue;
+            sets[key][label] = (await fsp.readdir(ld)).filter((f) => /\.jpe?g$/i.test(f)).length;
+          }
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ root, sets }));
+      }
+      if (!safe(parts[1]) || (parts[2] && !safe(parts[2])) || (parts[3] && !safe(parts[3]))) { res.writeHead(400); return res.end('bad path'); }
+      if (req.method === 'GET' && parts[1] && parts[2] && !parts[3]) {
+        const ld = path.join(root, parts[1], parts[2]);
+        if (!fs.existsSync(ld)) { res.writeHead(404); return res.end('no such label'); }
+        const files = (await fsp.readdir(ld)).filter((f) => /\.jpe?g$/i.test(f)).sort();
+        res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ key: parts[1], label: parts[2], files: files.map((f) => ({ file: f, url: `/training/${parts[1]}/${parts[2]}/${f}` })) }));
+      }
+      if (parts[1] && parts[2] && parts[3] && /\.jpe?g$/i.test(parts[3])) {
+        const f = path.join(root, parts[1], parts[2], parts[3]);
+        if (!fs.existsSync(f)) { res.writeHead(404); return res.end('no such crop'); }
+        if (req.method === 'GET') { const buf = await fsp.readFile(f); res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Content-Length': buf.length, 'Cache-Control': 'private, max-age=86400' }); return res.end(buf); }
+        if (req.method === 'DELETE') { await fsp.unlink(f); console.log(`[nest_headless] TRAINING crop dropped ${parts[1]}/${parts[2]}/${parts[3]} from ${ip}`); res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: true })); }
+      }
+      res.writeHead(404); return res.end('unknown training route');
+    }
     if (parts[0] === 'identity') {
       if (req.method === 'GET' && !parts[1]) {
         res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(identitySummary()));
@@ -2653,6 +2740,33 @@ const server = http.createServer(async (req, res) => {
           res.writeHead(ok ? 200 : 404, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok, negatives: pending.negativeCount() }));
         }
         res.writeHead(404); return res.end('unknown negatives route');
+      }
+      // ---- the corpus for review (#24): /identity/<name>/samples[/<id>[/media]] and /identity/cat/<name>/samples...
+      {
+        const isCat = parts[1] === 'cat' && parts[2] && parts[3] === 'samples';
+        const reserved = ['pending', 'negatives', 'voice', 'face', 'cat', 'who'];
+        const isPerson = parts[1] && !reserved.includes(parts[1]) && parts[2] === 'samples';
+        if (isCat || isPerson) {
+          const name = String(isCat ? parts[2] : parts[1]).toLowerCase();
+          const id = isCat ? parts[4] : parts[3], tail = isCat ? parts[5] : parts[4];
+          if (req.method === 'GET' && !id) {
+            const list = listSamples(name);
+            if (!list) { res.writeHead(404, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, reason: 'unknown' })); }
+            const wanted = isCat ? list.filter((s) => s.kind === 'cat') : list.filter((s) => s.kind !== 'cat');
+            res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ name, samples: wanted, kept_media: cfg.identityKeepSamples }));
+          }
+          if (req.method === 'GET' && id && tail === 'media') {
+            const m = sampleMedia(name, id);
+            if (!m) { res.writeHead(404); return res.end('no media for this sample'); }
+            const buf = await require('fs/promises').readFile(m.file);
+            res.writeHead(200, { 'Content-Type': m.type, 'Content-Length': buf.length, 'Cache-Control': 'private, max-age=86400' }); return res.end(buf);
+          }
+          if (req.method === 'DELETE' && id && !tail) {
+            const r = deleteSample(name, id);
+            res.writeHead(r.ok ? 200 : 404, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(r));
+          }
+          res.writeHead(404); return res.end('unknown samples route');
+        }
       }
       if (req.method === 'GET' && parts[1] === 'who' && parts[2]) {
         // who is in view right now: one frame, faces matched against enrolled people
@@ -2715,6 +2829,7 @@ const server = http.createServer(async (req, res) => {
           const sharpM = getSharp();
           if (sharpM) jpg = await sharpM(jpg).rotate().resize({ width: 1600, height: 1600, fit: 'inside', withoutEnlargement: true }).jpeg({ quality: 92 }).toBuffer().catch(() => jpg);
           found = await facesInBuffer(jpg, { minPx: 40 }).catch((e) => ({ ok: false, reason: 'bad_image: ' + e.message, faces: [] }));
+          found.jpg = jpg;   // for the kept context crop (#24)
         } else if (cam) {
           found = await facesForCamera(cam, { minPx: 40 });
         } else { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, accepted: false, reason: 'no_camera_or_image' })); }

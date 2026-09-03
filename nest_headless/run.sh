@@ -68,6 +68,8 @@ if [ -f "$OPTS" ]; then
   export IDENTITY_KEEP_SAMPLES="$(jq -r '.identity_keep_samples // false' "$OPTS")"
   export IDENTITY_AUTO_SAMPLES="$(jq -r '.identity_auto_samples // true' "$OPTS")"
   export WAKE_BY_TRANSCRIPT="$(jq -r '.wake_by_transcript // false' "$OPTS")"
+  TRAINING_DIR_OPT="$(jq -r '.training_dir // ""' "$OPTS")"
+  [ -n "$TRAINING_DIR_OPT" ] && export TRAINING_DIR="$TRAINING_DIR_OPT"
 fi
 
 exec node "$(cd "$(dirname "$0")" && pwd)/app/server.js"
