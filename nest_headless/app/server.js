@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.14.2';
+const ADDON_VERSION = '1.14.3';
 
 const http = require('http');
 const fs = require('fs');
@@ -838,6 +838,7 @@ async function peopleNear(entityId, jpg, rect) {
     });
   } catch (e) { return []; }
 }
+const ZONE_MODEL_MIN_LOO = 0.8;   // a zone model announces state only from this leave-one-out accuracy up
 async function zoneClassifyTick(entityId, mgr) {
   const zones = cfg.watchClassifyZones[entityId] || [];
   if (!zones.length || !mgr.page || !mgr.ready || loopBusy()) return;
@@ -906,8 +907,12 @@ async function zoneClassifyTick(entityId, mgr) {
       const prev = st.state;
       const prevDuration = st.since ? Math.round((now - st.since) / 1000) : null;
       st.state = next; st.since = now;
-      console.log(`[nest_headless] ZONE ${z.name} on ${entityId}: ${prev || 'unknown'} -> ${next} (score ${v.score})`);
-      if (prev) {
+      // A model that scored under ZONE_MODEL_MIN_LOO on its own training frames
+      // keeps its view on zone_change (`model`) but does not announce state
+      // flips: a coin-flip verdict is noise, not a sense (#22).
+      const trusted = !(st.modelMeta && st.modelMeta.loo_acc != null && st.modelMeta.loo_acc < ZONE_MODEL_MIN_LOO);
+      console.log(`[nest_headless] ZONE ${z.name} on ${entityId}: ${prev || 'unknown'} -> ${next} (score ${v.score}${trusted ? '' : ', model below trust floor - not announced'})`);
+      if (prev && trusted) {
         const people = await peopleNear(entityId, jpg, c.rect);
         postHaEvent('nest_headless_zone_state', {
           entity_id: entityId, camera: entityId.replace(/^camera\./, ''), zone: z.name, label: z.name,

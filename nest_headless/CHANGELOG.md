@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.14.3
+
+- A zone model whose leave-one-out accuracy is under 0.8 keeps reporting its
+  view on `nest_headless_zone_change` (`model`) but no longer announces
+  state flips as `nest_headless_zone_state`: a coin-flip verdict is noise,
+  not a sense. The log says "model below trust floor - not announced".
+
 ## 1.14.2
 
 - Per-zone state models without a CNN (#22): where no `<camera>__<zone>.onnx`
