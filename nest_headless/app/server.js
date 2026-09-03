@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.11.1';
+const ADDON_VERSION = '1.11.2';
 
 const http = require('http');
 const fs = require('fs');
@@ -160,6 +160,7 @@ function zoneFromJson(z, kind) {
     out.inside = Array.isArray(z.inside) && z.inside.length === 2 ? [f(z.inside[0]), f(z.inside[1])] : null;
     if (!out.pts) out.pts = [[out.x, out.y], [out.x + out.w, out.y], [out.x + out.w, out.y + out.h], [out.x, out.y + out.h]];   // the tracker needs a polygon
   }
+  if (typeof z.description === 'string' && z.description.trim()) out.description = z.description.trim().slice(0, 160);   // for the brain ("the sideboard by the window")
   return out;
 }
 function zoneToJson(z, kind) {
@@ -167,6 +168,7 @@ function zoneToJson(z, kind) {
   if (z.pts) o.pts = z.pts.map((p) => [Math.round(p[0] * 10000) / 10000, Math.round(p[1] * 10000) / 10000]);
   else { o.x = z.x; o.y = z.y; o.w = z.w; o.h = z.h; }
   if (kind === 'passages') o.inside = z.inside || null;
+  if (z.description) o.description = z.description;
   return o;
 }
 function zonesToJson() {
