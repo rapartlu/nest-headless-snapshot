@@ -33,6 +33,7 @@ Options:
 | `stt_fallback_url` | (empty) | second server tried when `stt_url` fails, before the in-process recogniser (keep a different engine warm as the backup) |
 | `identity_keep_samples` | `false` | keep raw enrolment audio / aligned face crops on disk |
 | `identity_auto_samples` | `true` | keep an embedding-only room sample from each confident room voice match (12 per person, oldest auto sample out; consented samples never displaced) |
+| `wake_by_transcript` | `false` | transcribe every speech segment on the tapped mics (in memory) and treat a wake phrase at its head as the wake word; enables conversation windows |
 | `watch_passages` | (empty) | doorway polygons with an optional `in=x,y` room-side point → `nest_headless_passage` |
 | `watch_classify_zones` | (empty) | state zones (change detection with crops; optional `<camera>__<zone>.onnx`) |
 | `watch_activity_zones` | (empty) | running/idle from motion inside a crop → `nest_headless_activity` |
@@ -392,6 +393,29 @@ its embedding as a room sample flagged `auto`, so the room channel fills in
 on its own after the first couple of labels.
 
 ## Follow-up window and the API token
+
+### Transcript wake path and conversation windows
+
+With `wake_by_transcript` on, the add-on does not rely on the small spotter
+alone. Each speech segment on a tapped microphone (onset above the noise
+floor, 0.5 s pre-roll, closed by 3 chunks of relative quiet, 15 s cap) is
+sent to the recogniser, and the transcript decides: a wake phrase at the
+head is a keyword hit (`nest_headless_keyword` with `source: transcript`)
+followed by the usual speech and identity events; a segment inside an open
+conversation window is the reply; anything else is discarded without being
+kept, logged or sent. The spotter keeps running and the two paths never
+report the same utterance twice (`wake_source` on the speech event says
+which caught it). Cost: one recogniser call per spoken sentence in range of
+the microphones, ~0.2 s each on the Mac. Why: the 3 MB spotter decoded a
+loud, close "Hey Claude" as "I glob" and no threshold could match it, while
+the recogniser transcribed it perfectly.
+
+`POST /listen/<camera>?mode=conversation&seconds=10&reason=...` opens a
+window (up to 60 s) in which the next speech segment is the reply, so the
+person can pause, cough and start again with no wake phrase. One reply
+closes it; `DELETE /listen/<camera>` closes it early, which the brain should
+do before it plays a reply on the speaker, or the house will hear itself.
+`GET /` lists open windows under `conversations`.
 
 `POST /listen/<camera>?seconds=8&reason=after_tts` opens a speech capture
 without a wake word (for the brain, right after it has spoken): same

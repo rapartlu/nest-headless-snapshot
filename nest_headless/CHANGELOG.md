@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.13.0
+
+- Transcript wake path (`wake_by_transcript`, off by default): every speech
+  segment on a tapped microphone (`segments.js`: onset above the noise
+  floor, short pre-roll, closed by relative quiet, 15 s cap) is transcribed
+  in memory and judged on its text. A wake phrase at the head makes it a
+  keyword hit (`nest_headless_keyword` with `source: transcript`) and the
+  speech event in one go, with the transcript already in hand; anything
+  else is dropped with nothing kept, logged or sent. Motivation: the 3 MB
+  spotter decoded a loud, close "Hey Claude" as "I glob" and could never
+  match it, while the recogniser heard it perfectly. The spotter still runs
+  (it is faster on the phrases it does catch); the two paths never report
+  the same utterance twice. Speech events carry `wake_source`.
+- Conversation windows: `POST /listen/<camera>?mode=conversation&seconds=N`
+  (needs the option; up to 60 s) makes the next speech segment on that
+  microphone the reply, so a person can pause and start again without a
+  wake phrase. One reply closes the window; `DELETE /listen/<camera>`
+  closes it early (do that before the speaker plays). The plain `/listen`
+  capture is unchanged. `GET /` shows open windows under `conversations`
+  and per-camera counters `segments`, `segment_wakes`,
+  `segment_follow_ups`, `segments_dropped`.
+
 ## 1.12.9
 
 - Spotter diagnostics on `GET /` under `audio.<camera>`: `decodes`,

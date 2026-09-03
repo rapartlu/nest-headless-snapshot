@@ -67,6 +67,7 @@ if [ -f "$OPTS" ]; then
   [ -n "$STT_FALLBACK_OPT" ] && export STT_FALLBACK_URL="$STT_FALLBACK_OPT"
   export IDENTITY_KEEP_SAMPLES="$(jq -r '.identity_keep_samples // false' "$OPTS")"
   export IDENTITY_AUTO_SAMPLES="$(jq -r '.identity_auto_samples // true' "$OPTS")"
+  export WAKE_BY_TRANSCRIPT="$(jq -r '.wake_by_transcript // false' "$OPTS")"
 fi
 
 exec node "$(cd "$(dirname "$0")" && pwd)/app/server.js"

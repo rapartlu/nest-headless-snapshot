@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.12.9';
+const ADDON_VERSION = '1.13.0';
 
 const http = require('http');
 const fs = require('fs');
@@ -43,6 +43,7 @@ const { parseWatchPassages, PassageTracker } = require('./passages');
 const faces = require('./faces');
 const { PendingStore } = require('./pending');
 const diskq = require('./diskq');
+const { SegmentTracker } = require('./segments');
 
 // ------------------------------------------------------------ configuration
 // HA config root: the supervisor mounts it at /homeassistant (or /config on
@@ -136,6 +137,10 @@ const cfg = {
   identityKeepSamples: (process.env.IDENTITY_KEEP_SAMPLES || 'false') === 'true',
   // confident room voice matches keep an embedding-only room sample (#16; approved by the household admin 2026-09-03)
   identityAutoSamples: (process.env.IDENTITY_AUTO_SAMPLES || 'true') === 'true',
+  // Transcript wake path: every speech segment on a tapped microphone is
+  // transcribed (in memory) and kept only if it starts with the wake phrase or
+  // falls inside an open conversation window. Off by default.
+  wakeByTranscript: (process.env.WAKE_BY_TRANSCRIPT || 'false') === 'true',
 };
 
 // ------------------------------------------------------------ zones file (the app's zone editor)
@@ -1476,6 +1481,7 @@ const recentCaptureStart = {}; // entityId -> t0 of the latest capture (for conc
 // after it has spoken - no wake phrase, so no tail phase; a short pre-roll;
 // gives up silently after opts.giveUpMs if nobody speaks.
 function startSpeechCapture(entityId, keyword, ring, opts = {}) {
+  if (segTrackers[entityId]) segTrackers[entityId].reset();   // the capture owns this audio now; no duplicate from the segment path
   // ~1.5 s pre-roll: the spotter fires 0.3-0.7 s after the phrase, so someone
   // who runs straight on ("hey claude is the...") has already said the start
   // of the question. Whisper gets the wake phrase too; it is stripped from
@@ -1700,12 +1706,31 @@ async function finishSpeechCapture(entityId, c, reason) {
   // the second opinion. Unconfirmed captures are still sent - the brain
   // decides - but flagged, so an 8 s ramble after a false wake is cheap to
   // discard.
+  const text0 = text;
   const wakeConfirmed = !!text && (WAKE_RE.test(text) || WAKE_HEAD_RE.test(text));
   text = stripWakePhrase(text);
   // Whisper's stage directions - "(baby crying)", "[inaudible]", "(background
   // noise drowns out speaker)" - are not something the brain should parse.
   if (text && /^[\s(\[][^A-Za-z0-9]*[^()\[\]]*[)\]]\W*$/.test(text) && !/[a-z]{2,}\s+[a-z]{2,}.*[a-z]/i.test(text.replace(/[(\[][^)\]]*[)\]]/g, ''))) { text = ''; reason = 'unclear'; }
   if (reason === 'quiet_speech' && !text) reason = 'no_speech';   // the recogniser agreed with the floor: nothing there
+  // Transcript wake path (wake_by_transcript): a segment nobody addressed to
+  // the house - no wake phrase at its head, no open conversation window -
+  // ends here. Nothing is kept, logged or sent. A wake phrase makes it a
+  // keyword hit with the transcript already in hand; an open window makes
+  // it the reply the brain was waiting for (one reply closes the window).
+  if (c.fromSegment) {
+    if (!wakeConfirmed && !c.followUp) { segStat(entityId, 'segments_dropped'); return; }
+    if (wakeConfirmed && !c.followUp) {
+      const wm = WAKE_RE.exec(text0) || WAKE_HEAD_RE.exec(text0);
+      c.keyword = (wm ? wm[0] : 'wake').replace(/[^A-Za-z ]/g, ' ').replace(/\s+/g, ' ').trim().toUpperCase().split(' ').slice(-2).join(' ');
+      lastKeywordMs[entityId] = Date.now();
+      segStat(entityId, 'segment_wakes');
+      console.log(`[nest_headless] KEYWORD "${c.keyword}" on ${entityId} (transcript) at ${new Date().toISOString()}`);
+      postHaEvent('nest_headless_keyword', { entity_id: entityId, camera: entityId.replace(/^camera\./, ''), keyword: c.keyword, source: 'transcript' }).catch(() => {});
+    } else if (text) { segStat(entityId, 'segment_follow_ups'); if (convo[entityId] && convo[entityId].openedAt === c.windowOpenedAt) delete convo[entityId]; }
+    // faces only now, once the segment is known to be addressed to the house
+    if (!c.facesPromise && faces.hasModels(FACE_MODELS_DIR())) c.facesPromise = sampleFacesForCapture(entityId);
+  }
   if (c.followUp && !text) {   // a follow-up window that caught only noise is the same as nobody replying (Hearth #4)
     console.log(`[nest_headless] follow-up window on ${entityId} closed: nothing intelligible (${reason})`);
     return;
@@ -1721,6 +1746,7 @@ async function finishSpeechCapture(entityId, c, reason) {
     reason: text ? reason : (reason === 'no_speech' ? 'no_speech' : reason),
     engine: stt ? stt.engine : null, stt_ms: sttMs, final: true, speculative, close_to_event_ms: closeToEventMs,
     wake_confirmed: wakeConfirmed,   // Whisper heard the wake phrase in the pre-roll (false = likely a spotter false alarm)
+    wake_source: c.fromSegment ? 'transcript' : 'spotter',
     ...(c.followUp ? { opened_by: c.openedBy || null, open_reason: c.openReason || null } : {}),
     // other cameras that captured within 1.5 s of this one: the same voice reaching two mics
     // (kitchen + hallway both heard "hey kitchen" at 08:19); the brain dedupes on this
@@ -1749,6 +1775,38 @@ async function finishSpeechCapture(entityId, c, reason) {
 
 const lastKeywordMs = {};
 const audioStats = {};   // per camera: chunks, lastRms, rate, resampledLen, hits, lastError
+
+// ---- transcript wake path (wake_by_transcript). Speech segments from the
+// microphone (segments.js) become captures judged on their transcript in
+// finishSpeechCapture: wake phrase at the head -> keyword + speech events;
+// inside an open conversation window (POST /listen ... mode=conversation)
+// -> the reply; otherwise dropped, nothing kept or logged. While a segment's
+// transcript is pending the spotter stays quiet for that camera, and a
+// spotter/listen capture resets the tracker, so each utterance is reported once.
+const segTrackers = {}, segPending = {}, convo = {};
+function segStat(entityId, key) { const s = audioStats[entityId]; if (s) s[key] = (s[key] || 0) + 1; }
+function segFeed(entityId, chunk, rms) {
+  const tr = segTrackers[entityId] || (segTrackers[entityId] = new SegmentTracker({ gapChunks: Math.max(2, Math.ceil(cfg.speechSilenceMs / 250)), maxChunks: cfg.speechMaxSeconds * 4 }));
+  if (speechCap[entityId]) { tr.reset(); return; }   // a spotter or /listen capture owns the audio
+  const seg = tr.feed(chunk, rms);
+  if (!seg) return;
+  const w = convo[entityId] && convo[entityId].until > Date.now() ? convo[entityId] : null;
+  segStat(entityId, 'segments');
+  recentCaptureStart[entityId] = seg.startedMs;
+  segPending[entityId] = true;
+  const c = { keyword: w ? 'follow-up' : null, chunks: seg.chunks, keepFrom: 0, startedAt: new Date(seg.startedMs), t0: seg.startedMs, floor: seg.floor,
+    followUp: !!w, openedBy: w ? w.openedBy : null, openReason: w ? w.reason : null, windowOpenedAt: w ? w.openedAt : null,
+    fromSegment: true, voicedMs: seg.voicedMs, spoke: true, facesPromise: null };
+  finishSpeechCapture(entityId, c, 'silence')
+    .catch((e) => console.warn('[nest_headless] segment failed:', e.message))
+    .finally(() => { segPending[entityId] = false; });
+}
+function openConversation(entityId, seconds, openedBy, reason) {
+  const w = { openedAt: Date.now(), until: Date.now() + seconds * 1000, openedBy, reason };
+  convo[entityId] = w;
+  setTimeout(() => { if (convo[entityId] === w) { delete convo[entityId]; console.log(`[nest_headless] conversation window on ${entityId} closed: nobody spoke`); } }, seconds * 1000 + 250).unref();
+  return w;
+}
 function onAudioChunk(entityId, b64, sampleRate) {
   const st0 = audioStats[entityId] || (audioStats[entityId] = { chunks: 0, lastRms: 0, rate: sampleRate, resampledLen: 0, hits: 0, lastError: null });
   st0.chunks++; st0.rate = sampleRate;
@@ -1776,6 +1834,7 @@ function onAudioChunk(entityId, b64, sampleRate) {
     st.ring.push(Float32Array.from(f32));
     while (st.ring.length > 32) st.ring.shift();   // ~8s at 250ms chunks
     feedSpeechCapture(entityId, f32);
+    if (cfg.wakeByTranscript) segFeed(entityId, f32, st0.lastRms);
     // Light AGC for the spotter only (the ring keeps raw audio; utterances
     // are normalised separately for the recogniser): a wake phrase from the
     // far side of the kitchen arrives at peak 0.05-0.1 and the small model
@@ -1807,6 +1866,7 @@ function onAudioChunk(entityId, b64, sampleRate) {
         st0.lastKeyword = r.keyword; st0.lastKeywordAt = new Date().toISOString();
         const now = Date.now();
         if (speechCap[entityId]) continue;                       // capture in progress: no re-trigger
+        if (segPending[entityId]) continue;                      // a transcript decision on this audio is in flight
         if (now - (lastKeywordMs[entityId] || 0) < 2500) continue;
         lastKeywordMs[entityId] = now; st0.hits++;
         console.log(`[nest_headless] KEYWORD "${r.keyword}" on ${entityId} at ${new Date().toISOString()}`);
@@ -2021,6 +2081,8 @@ const server = http.createServer(async (req, res) => {
         addon: 'nest_headless', version: ADDON_VERSION,
         cpus: os.cpus().length, nice: os.getPriority(), load: os.loadavg().map((v) => +v.toFixed(2)), loop_lag_ms: loopLagMs,
         audio: audioStats, capturing: Object.keys(speechCap),
+        conversations: Object.fromEntries(Object.entries(convo).filter(([, w]) => w.until > Date.now()).map(([k, w]) => [k.replace(/^camera\./, ''), new Date(w.until).toISOString()])),
+        wake_by_transcript: cfg.wakeByTranscript,
         watches: Object.fromEntries(Object.entries(watchMgr).map(([k, m]) => [k, {
           ready: m.ready, hits: m.hits, startedAt: m.startedAt, lastError: m.lastError,
           verdictWindow: (m.verdicts || []).join(''), sustainedOpen: !!m.sustainedOpen,
@@ -2111,6 +2173,11 @@ const server = http.createServer(async (req, res) => {
       }
       res.writeHead(405); return res.end('method not allowed');
     }
+    if (parts[0] === 'listen' && parts[1] && req.method === 'DELETE') {
+      const entityId = cameraEntity(parts[1]);
+      const had = !!convo[entityId]; delete convo[entityId];
+      res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: true, camera: entityId.replace(/^camera\./, ''), closed: had }));
+    }
     if (parts[0] === 'listen' && parts[1] && req.method === 'POST') {
       // Follow-up window (Hearth #4): the brain has just spoken on this
       // camera's speaker and invites a reply. Same end-pointing and the same
@@ -2120,6 +2187,19 @@ const server = http.createServer(async (req, res) => {
       const st = kwsCtx && kwsCtx.streams && kwsCtx.streams[entityId];
       if (!st) { res.writeHead(404, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, reason: 'no_audio_stream' })); }
       if (speechCap[entityId]) { res.writeHead(409, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, reason: 'capture_in_progress' })); }
+      // mode=conversation (needs wake_by_transcript): instead of one capture
+      // with its own end-pointing, open a window (up to 60 s) in which the
+      // next speech segment on this microphone is the reply - the person can
+      // pause, cough, start again. One reply closes it; DELETE closes it early
+      // (do that before the speaker plays, or the house hears itself).
+      if (url.searchParams.get('mode') === 'conversation') {
+        if (!cfg.wakeByTranscript) { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, reason: 'wake_by_transcript_off' })); }
+        const secs = Math.max(1, Math.min(60, parseFloat(url.searchParams.get('seconds')) || 10));
+        openConversation(entityId, secs, ip, (url.searchParams.get('reason') || '').slice(0, 60) || null);
+        console.log(`[nest_headless] LISTEN conversation window ${secs}s on ${entityId} from ${ip}${url.searchParams.get('reason') ? ' reason=' + url.searchParams.get('reason').slice(0, 60) : ''} at ${new Date().toISOString()}`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ok: true, camera: entityId.replace(/^camera\./, ''), seconds: secs, mode: 'conversation' }));
+      }
       const seconds = Math.max(1, Math.min(30, parseFloat(url.searchParams.get('seconds')) || 8));
       startSpeechCapture(entityId, 'follow-up', st.ring || [], { followUp: true, giveUpMs: seconds * 1000 });
       speechCap[entityId].openedBy = ip;   // carried on the event as opened_by so the brain can verify the source per capture (Hearth #10)
