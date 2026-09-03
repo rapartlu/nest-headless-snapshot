@@ -302,3 +302,57 @@ TTS_VOICE=bf_emma PORT=8179 ~/.config/nest_headless/venv/bin/python host/tts_ser
 Note for both host servers: launchd reads `EnvironmentVariables` only at
 `bootstrap`; after editing the plist do `launchctl bootout` then `bootstrap`
 (a `kickstart -k` restarts the process with the old environment).
+
+## Identity: who is talking, who is in view
+
+Voice: every `nest_headless_speech` is followed by `nest_headless_identity`
+{utterance_id, speaker: {quality: {speech_ms, rms, reason}, matches: [{name,
+score}]}, faces: [...]}. Speaker embeddings come from
+`nest_models/identity/models/speaker.onnx` (3D-Speaker ERes2Net); same
+person on these mics scores ~0.6+, strangers ~0.4-.
+
+Faces: `nest_models/identity/models/{scrfd_10g.onnx, arcface_w600k_r50.onnx}`
+(InsightFace buffalo_l). Faces are sampled at the wake moment and 1 s later;
+each is `{name|null, score, box, quality: {size_px, det_score, reason},
+matches}`. `name` is set at cosine >= 0.4. Faces under 60 px are detected
+but not identified: at this kitchen camera a face at the far worktop is
+~30 px, at the table or under the hallway camera 60-120 px.
+
+Endpoints (loopback, or `Authorization: Bearer <API_TOKEN>` from the LAN):
+
+- `GET /identity` -> people with voice/face sample counts, `face_models`.
+- `POST /identity/voice/enrol` {camera, name, utterance_id?} -> enrols the
+  latest (or given) utterance; refusals carry `speech_ms`, `rms`,
+  `needed_speech_ms`.
+- `POST /identity/face/enrol` {camera, name, index?} or {name, image_b64,
+  index?} -> enrols the face in view / in the image; refusals `no_face`,
+  `face_too_small` (`size_px`, `needed_px`), `multiple_faces` (candidates
+  with `index`), `bad_image`.
+- `GET /identity/who/<camera>` -> faces in one fresh frame.
+- `DELETE /identity/<name>` -> forgets voice and face.
+
+Embeddings are JSON under `nest_models/identity/<name>/`; raw audio or the
+aligned 112x112 face crop are kept only with `identity_keep_samples`. The
+add-on never decides who someone is or enrols on its own.
+
+## Follow-up window and the API token
+
+`POST /listen/<camera>?seconds=8&reason=after_tts` opens a speech capture
+without a wake word (for the brain, right after it has spoken): same
+end-pointing, same `nest_headless_speech` with `keyword: "follow-up"`,
+`opened_by` (caller address) and `open_reason`; no event at all if nobody
+says anything intelligible. 409 while a capture is open, 404 without an
+audio tap. Every call is logged with the caller.
+
+`/listen`, `/identity`, `/utterance` and `/audiodebug` are loopback-only
+unless the caller sends `Authorization: Bearer <token>` (`API_TOKEN` or
+`API_TOKEN_FILE`). Snapshot, frame, detect and status stay LAN-open for Home
+Assistant. Denials are logged with the address.
+
+## Recogniser bake-offs
+
+`stt_shadow_url` sends every utterance to a second recogniser in parallel
+and logs its text as `SHADOW` lines next to the `SPEECH` line, without using
+or posting it. `host/whisper_server.py` serves either `STT_ENGINE=mlx-whisper`
+(default, whisper-large-v3-turbo) or `STT_ENGINE=parakeet-mlx`
+(Parakeet-TDT 0.6B v3), always from worker processes (`WHISPER_WORKERS`).
