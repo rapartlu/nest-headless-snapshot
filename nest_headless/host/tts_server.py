@@ -18,6 +18,15 @@ import io, json, os, struct, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
+
+# Cap and clear the MLX buffer cache (see whisper_server.py): a worker's cache
+# grows without bound on varying input lengths.
+try:
+    import mlx.core as _mx
+    _mx.set_cache_limit(int(os.environ.get('MLX_CACHE_LIMIT_MB', '256')) * 1024 * 1024)
+    _clear_cache = _mx.clear_cache
+except Exception:  # noqa: BLE001
+    _clear_cache = lambda: None  # noqa: E731
 from mlx_audio.tts.utils import load_model
 
 MODEL = os.environ.get('KOKORO_MODEL', 'mlx-community/Kokoro-82M-bf16')
@@ -52,6 +61,14 @@ def synth(text: str, voice: str, speed: float) -> tuple[bytes, int]:
     pcm = (np.clip(audio, -1, 1) * 32767).astype('<i2').tobytes()
     hdr = b'RIFF' + struct.pack('<I', 36 + len(pcm)) + b'WAVE' + b'fmt ' + struct.pack('<IHHIIHH', 16, 1, 1, sr, sr * 2, 2, 16) + b'data' + struct.pack('<I', len(pcm))
     return hdr + pcm, sr
+
+
+_synth_impl = synth
+def synth(text, voice, speed):
+    try:
+        return _synth_impl(text, voice, speed)
+    finally:
+        _clear_cache()
 
 
 class H(BaseHTTPRequestHandler):
