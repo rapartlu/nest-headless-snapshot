@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.12.6';
+const ADDON_VERSION = '1.12.7';
 
 const http = require('http');
 const fs = require('fs');
@@ -1933,7 +1933,11 @@ async function runWatch(entityId, intervalSec) {
       }
     } catch (e) {
       mgr.ready = false; mgr.page = null; mgr.lastError = e.message;
-      console.warn(`[nest_headless] watch ${entityId} down (${e.message}); retrying in 30s`);
+      // A camera switched off in the vendor app answers FAILED_PRECONDITION to
+      // every offer; each retry is a Google command against that camera's
+      // quota and a log line, so back off to 5 minutes for that case.
+      mgr.retryMs = /not available for streaming|FAILED_PRECONDITION/.test(e.message) ? 300000 : 30000;
+      console.warn(`[nest_headless] watch ${entityId} down (${e.message}); retrying in ${mgr.retryMs / 1000}s`);
     } finally {
       try { if (classifyTimer) clearInterval(classifyTimer); } catch (e) { /* ok */ }
       try { if (zoneTimer) clearInterval(zoneTimer); } catch (e) { /* ok */ }
@@ -1941,7 +1945,7 @@ async function runWatch(entityId, intervalSec) {
       try { if (session) session.close(); } catch (e) { /* ok */ }
       try { if (page) await page.close(); } catch (e) { /* ok */ }
     }
-    await sleep(30000);
+    await sleep(mgr.retryMs || 30000);
   }
 }
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.12.7
+
+- A watched camera that the vendor app has switched off (every offer answers
+  `FAILED_PRECONDITION: not available for streaming`) is retried every
+  5 minutes instead of every 30 s: each retry was a Google command against
+  that camera's hourly quota and a warning line.
+
 ## 1.12.6
 
 - "Not a person" label for the backlog (#18): `POST
