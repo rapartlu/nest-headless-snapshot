@@ -109,15 +109,26 @@ function classify(camera, jpegBuf) {
     if (model.reference) {
       for (let i = 0; i < g.length; i++) g[i] -= model.reference[i];
     }
-    let z = model.bias;
-    for (let i = 0; i < g.length; i++) {
-      const v = model.std[i] > 1e-6 ? (g[i] - model.mean[i]) / model.std[i] : 0;
-      z += v * model.weights[i];
-    }
-    const score = 1 / (1 + Math.exp(-z));
-    const out = { label: model.label, score: Math.round(score * 1000) / 1000, positive: score >= (model.threshold || 0.5), engine: 'linear',
+    const meta = { engine: 'linear',
       // what the model is worth, for a consumer deciding how far to trust it
       trained: model.trained || null, samples: model.samples || null, loo_acc: model.loo_acc == null ? null : model.loo_acc, holdout_acc: model.holdout_acc == null ? null : model.holdout_acc };
+    let out;
+    if (Array.isArray(model.labels) && Array.isArray(model.weights[0])) {
+      // multi-class (tools/train_zone_model.py): one linear score per label, softmax
+      const zs = model.labels.map((_, k) => { let z = model.bias[k]; const w = model.weights[k]; for (let i = 0; i < g.length; i++) { const v = model.std[i] > 1e-6 ? (g[i] - model.mean[i]) / model.std[i] : 0; z += v * w[i]; } return z; });
+      const mx = Math.max(...zs); const ex = zs.map((z) => Math.exp(z - mx)); const sum = ex.reduce((a, b) => a + b, 0);
+      const scores = {}; model.labels.forEach((l, k) => { scores[l] = Math.round(ex[k] / sum * 1000) / 1000; });
+      const best = model.labels[ex.indexOf(Math.max(...ex))];
+      out = { label: best, score: scores[best], scores, labels: model.labels, positive: best !== 'closed', ...meta };
+    } else {
+      let z = model.bias;
+      for (let i = 0; i < g.length; i++) {
+        const v = model.std[i] > 1e-6 ? (g[i] - model.mean[i]) / model.std[i] : 0;
+        z += v * model.weights[i];
+      }
+      const score = 1 / (1 + Math.exp(-z));
+      out = { label: model.label, score: Math.round(score * 1000) / 1000, positive: score >= (model.threshold || 0.5), ...meta };
+    }
     if (refCorr !== null) {
       out.refCorr = Math.round(refCorr * 1000) / 1000;
       out.framingOk = refCorr >= 0.45;

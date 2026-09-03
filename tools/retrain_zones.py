@@ -41,6 +41,42 @@ def main():
     models.mkdir(parents=True, exist_ok=True)
     done = 0
     for d in sorted(p for p in root.iterdir() if p.is_dir() and "__" in p.name):
+        if d.name.endswith("__cats"):
+            continue   # cats are enrolled through /identity/cat, not trained here
+        # three or more label folders: a multi-class model (open / vent / closed ...) via train_zone_model.py
+        classes = sorted(p for p in d.iterdir() if p.is_dir() and not p.name.startswith("."))
+        if len(classes) >= 3:
+            counts = {p.name: count(p) for p in classes}
+            stamp = models / f".{d.name}.trained.json"
+            prev = {}
+            try:
+                prev = json.loads(stamp.read_text())
+            except Exception:  # noqa: BLE001
+                pass
+            thin = {k: v for k, v in counts.items() if v < args.min}
+            if thin:
+                print(f"{d.name}: {counts} - waiting for at least {args.min} in {', '.join(thin)}")
+                continue
+            out = models / f"{d.name}.json"
+            if not args.force and out.exists() and prev.get("counts") == counts:
+                print(f"{d.name}: unchanged {counts}, trained {prev.get('trained')}")
+                continue
+            print(f"{d.name}: training {len(classes)} states {counts}")
+            r = subprocess.run([args.python, str(HERE / "train_zone_model.py"), "--labels", str(d), "--out", str(out) + ".tmp",
+                                "--min", str(args.min), "--loo", "--C", str(1 / max(args.l2, 1e-6) / 100)], capture_output=True, text=True)
+            print(r.stdout.strip())
+            if r.returncode != 0:
+                print(r.stderr.strip())
+                continue
+            Path(str(out) + ".tmp").replace(out)
+            try:
+                m = json.loads(out.read_text())
+            except Exception:  # noqa: BLE001
+                m = {}
+            stamp.write_text(json.dumps({"counts": counts, "labels": m.get("labels"), "trained": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                                         "holdout_acc": m.get("holdout_acc"), "loo_acc": m.get("loo_acc")}))
+            done += 1
+            continue
         pos = d / "open" if (d / "open").is_dir() else d / "pos"
         neg = d / "closed" if (d / "closed").is_dir() else d / "neg"
         if not pos.is_dir() or not neg.is_dir():

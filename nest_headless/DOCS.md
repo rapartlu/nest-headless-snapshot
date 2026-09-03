@@ -109,6 +109,10 @@ Two kinds of model run in-process (native onnxruntime, no cloud, no quota):
    ways, and records a leave-one-out accuracy that the zone events carry as
    `loo_acc` (treat verdicts as authoritative from about 0.9). Label from
    the frame that shows the state, not from when a visit happened.
+   A zone may have more than two states: with three or more label folders
+   (`open`, `vent`, `closed`) the retrainer builds a multi-class model
+   (`tools/train_zone_model.py`) and `nest_headless_zone_state.state` is the
+   label name, with `scores` per label and `labels` on the event.
 
 ## Passage zones (doorways)
 

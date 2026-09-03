@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.16.3';
+const ADDON_VERSION = '1.17.0';
 
 const http = require('http');
 const fs = require('fs');
@@ -895,7 +895,7 @@ async function zoneClassifyTick(entityId, mgr) {
           people_nearby: people, recent_names: [...new Set(recent)],
           frame_at: new Date(now).toISOString(), look_url: lookUrl,
           // the trained model's current view of this zone, when one exists (#22)
-          model: st.model ? { state: st.state, score: st.score, engine: st.engine, ...(st.modelMeta || {}) } : null,
+          model: st.model ? { state: st.state, score: st.score, scores: st.scores || null, engine: st.engine, ...(st.modelMeta || {}) } : null,
           boxes: [{ label: 'zone:' + z.name, ...boxOf(c.rect) }, ...people.map((p) => ({ label: 'person', name: p.name, score: p.score, ...boxOf(p.box) }))],
         }).catch(() => {});
         st.lastChangeMs = now;
@@ -912,12 +912,19 @@ async function zoneClassifyTick(entityId, mgr) {
     if (infer.hasDoorModel(key)) v = await infer.classifyDoor(key, c.jpeg, { label: z.name, threshold: 0.5 });
     else { const lin = classify(key, c.jpeg); if (lin) v = { ...lin, engine: 'linear' }; }
     if (!v) { st.model = false; continue; }
-    st.engine = v.engine || 'onnx'; st.modelMeta = { trained: v.trained || null, samples: v.samples || null, loo_acc: v.loo_acc == null ? null : v.loo_acc, holdout_acc: v.holdout_acc == null ? null : v.holdout_acc };
-    st.model = true; st.score = v.score; st.ticks.push(v.positive ? 1 : 0);
+    // States come from the model's labels (#26): a multi-class model names
+    // its verdict (open / vent / closed ...); a binary one is open/closed by
+    // `positive`. A flip needs ZONE_DEBOUNCE_TICKS consecutive agreeing ticks.
+    const labels = v.labels || ['open', 'closed'];
+    const verdict = v.labels && v.scores ? v.label : (v.positive ? 'open' : 'closed');
+    st.engine = v.engine || 'onnx';
+    st.modelMeta = { trained: v.trained || null, samples: v.samples || null, loo_acc: v.loo_acc == null ? null : v.loo_acc, holdout_acc: v.holdout_acc == null ? null : v.holdout_acc, labels };
+    st.model = true; st.score = v.score;
+    st.scores = v.scores || { open: Math.round((v.positive ? v.score : 1 - v.score) * 1000) / 1000, closed: Math.round((v.positive ? 1 - v.score : v.score) * 1000) / 1000 };
+    st.ticks.push(verdict);
     while (st.ticks.length > ZONE_DEBOUNCE_TICKS) st.ticks.shift();
-    const sum = st.ticks.reduce((a, b) => a + b, 0);
     let next = st.state;
-    if (st.ticks.length >= ZONE_DEBOUNCE_TICKS) { if (sum === ZONE_DEBOUNCE_TICKS) next = 'open'; else if (sum === 0) next = 'closed'; }
+    if (st.ticks.length >= ZONE_DEBOUNCE_TICKS && st.ticks.every((t) => t === st.ticks[0])) next = st.ticks[0];
     if (next && next !== st.state) {
       const prev = st.state;
       const prevDuration = st.since ? Math.round((now - st.since) / 1000) : null;
@@ -932,7 +939,7 @@ async function zoneClassifyTick(entityId, mgr) {
         postHaEvent('nest_headless_zone_state', {
           entity_id: entityId, camera: entityId.replace(/^camera\./, ''), zone: z.name, label: z.name,
           state: next, previous: prev, score: v.score, previous_duration_s: prevDuration, t: new Date(now).toISOString(), people_nearby: people,
-          model: true, engine: st.engine, ...st.modelMeta,   // loo_acc: leave-one-out accuracy over the originals it was trained on - trust it from ~0.9 up
+          model: true, engine: st.engine, ...st.modelMeta, scores: st.scores,   // loo_acc: leave-one-out accuracy over the originals it was trained on - trust it from ~0.9 up; scores: per label
           frame_at: new Date(now).toISOString(),
           boxes: [{ label: 'zone:' + z.name, ...boxOf(c.rect) }, ...people.map((p) => ({ label: 'person', name: p.name, score: p.score, ...boxOf(p.box) }))],
         }).catch(() => {});

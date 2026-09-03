@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.17.0
+
+- Zone states from the model's labels (#26): a zone model may have any
+  number of states (`open`, `vent`, `closed` for a dishwasher whose door is
+  left ajar to steam off). `tools/train_zone_model.py` trains a
+  multinomial version of the linear template matcher from one folder per
+  label (leave-one-out over the originals as before), `retrain_zones.py`
+  uses it for any zone with three or more label folders, and
+  `classifier.js` answers with `label`, `scores` per label and `labels`.
+  `nest_headless_zone_state.state` is the label name, `scores` and
+  `labels` ride on the event and on `zone_change.model`; a flip still needs
+  consecutive agreeing ticks. Binary models are unchanged.
+
 ## 1.16.3
 
 - Cat enrolment's duplicate guard ignores stale (older-descriptor) samples,
