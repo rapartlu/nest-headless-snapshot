@@ -173,4 +173,15 @@ if __name__ == '__main__':
     else:
         single_backend = make_backend(ENGINE, MODEL)   # warms the model so the first real utterance is not slow
         sys.stdout.write(f'model {MODEL} ready in {time.time()-t0:.1f}s; listening on {BIND}:{PORT} (token {"on" if TOKEN else "off"})\n'); sys.stdout.flush()
+    # keep-warm: after hours idle the weights get paged out and the first real
+    # utterance of the morning took 5-8 s; a 1 s silent decode every few
+    # minutes keeps them resident for ~0.1 s of GPU time.
+    def keep_warm():
+        while True:
+            time.sleep(int(os.environ.get('KEEP_WARM_S', '240')))
+            try:
+                transcribe(np.zeros(16000, dtype=np.float32))
+            except Exception:  # noqa: BLE001
+                pass
+    threading.Thread(target=keep_warm, daemon=True).start()
     ThreadingHTTPServer((BIND, PORT), H).serve_forever()

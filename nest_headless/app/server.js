@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.11.2';
+const ADDON_VERSION = '1.11.3';
 
 const http = require('http');
 const fs = require('fs');
@@ -1245,6 +1245,7 @@ function readJsonBody(req) {
 // silence-after-speech or the max window, then recognise and post ONE event.
 const speechCap = {};
 function rmsOf(a) { let acc = 0; for (let i = 0; i < a.length; i++) acc += a[i] * a[i]; return Math.sqrt(acc / Math.max(1, a.length)); }
+const recentCaptureStart = {}; // entityId -> t0 of the latest capture (for concurrent_cameras)
 // opts.followUp (Hearth #4): a listening window opened by the brain right
 // after it has spoken - no wake phrase, so no tail phase; a short pre-roll;
 // gives up silently after opts.giveUpMs if nobody speaks.
@@ -1262,8 +1263,10 @@ function startSpeechCapture(entityId, keyword, ring, opts = {}) {
   // kitchen's ambient 0.003-0.005.
   const rmses = ring.map(rmsOf).sort((a, b) => a - b);
   const floor = Math.min(0.015, Math.max(0.006, (rmses[Math.floor(rmses.length * 0.1)] || 0.006) * 3));
+  const t0 = Date.now();
+  recentCaptureStart[entityId] = t0;
   speechCap[entityId] = {
-    keyword, chunks: [...pre], startedAt: new Date(), t0: Date.now(),
+    keyword, chunks: [...pre], startedAt: new Date(), t0,
     floor, phase: opts.followUp ? 'listen' : 'tail', tailQuietMs: 0, keepFrom: opts.followUp ? 0 : pre.length,
     listenT0: opts.followUp ? Date.now() : null, voicedMs: 0, silenceMs: 0,
     followUp: !!opts.followUp, giveUpMs: opts.giveUpMs || 0,
@@ -1469,6 +1472,9 @@ async function finishSpeechCapture(entityId, c, reason) {
     engine: stt ? stt.engine : null, stt_ms: sttMs, final: true, speculative, close_to_event_ms: closeToEventMs,
     wake_confirmed: wakeConfirmed,   // Whisper heard the wake phrase in the pre-roll (false = likely a spotter false alarm)
     ...(c.followUp ? { opened_by: c.openedBy || null, open_reason: c.openReason || null } : {}),
+    // other cameras that captured within 1.5 s of this one: the same voice reaching two mics
+    // (kitchen + hallway both heard "hey kitchen" at 08:19); the brain dedupes on this
+    concurrent_cameras: Object.entries(recentCaptureStart).filter(([cam, t0]) => cam !== entityId && Math.abs(t0 - c.t0) < 1500).map(([cam]) => cam.replace(/^camera\./, '')),
     // raw 16 kHz mono WAV, memory-held for 90 s, for a stronger recogniser on the brain
     audio_path: `/utterance/${utteranceId}.wav`, audio_ttl_s: 90,
   });

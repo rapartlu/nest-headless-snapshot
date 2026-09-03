@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.11.3
+
+- `concurrent_cameras` on `nest_headless_speech`: other cameras whose capture
+  started within 1.5 s of this one - the same voice reaching two microphones
+  (kitchen and hallway both heard the first wake word of the morning). The
+  brain dedupes on it.
+- `host/whisper_server.py` keeps its model workers warm (a silent decode
+  every `KEEP_WARM_S`, default 240 s): after seven idle hours the first
+  utterance of the day took 5-8 s while weights paged back in.
+- 1.11.2: optional zone `description` kept in `zones.json` and returned by
+  `GET /zones`.
+
 ## 1.11.1
 
 - Zone editor API for the app. `GET /zones` returns every zone of every kind
