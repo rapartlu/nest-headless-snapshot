@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.13.0';
+const ADDON_VERSION = '1.13.1';
 
 const http = require('http');
 const fs = require('fs');
@@ -1325,22 +1325,55 @@ function wavToFloat16k(buf) {
   }
   return mono;
 }
-function enrolVoiceFromAudio(name, wavBuf, phrase, camera) {
-  if (!/^[a-z0-9_-]{1,32}$/i.test(name)) return { ok: false, accepted: false, reason: 'bad_name' };
-  let samples;
-  try { samples = wavToFloat16k(wavBuf); } catch (e) { return { ok: false, accepted: false, reason: 'bad_audio: ' + e.message }; }
-  if (samples.length > 16000 * 12) samples = samples.subarray(0, 16000 * 12);
-  // Peak-normalise first (to -3 dBFS, at most x20), as utterances are: a phone
-  // recording raw at arm's length sat under an absolute floor although speech
-  // was there. Then voiced = a 250 ms chunk over 3% of full scale; >= 2 s needed.
+// Uploaded audio (#16, #19): WAV is parsed here; m4a/caf/aac/mp3 go through
+// the host's converter (afconvert on macOS, else ffmpeg) via a private temp
+// file removed at once. Returns 16 kHz mono float samples.
+async function decodeUploadedAudio(buf, format) {
+  const f = String(format || 'wav').toLowerCase().replace(/^audio\//, '').replace(/^x-/, '');
+  if (f === 'wav' || f === 'wave' || buf.toString('ascii', 0, 4) === 'RIFF') return wavToFloat16k(buf);
+  if (!['m4a', 'caf', 'aac', 'mp4', 'aiff', 'aif', 'mp3', 'flac'].includes(f)) throw new Error('unsupported_format');
+  const fsp = require('fs/promises'); const { execFile } = require('child_process');
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'nh-'));
+  const src = path.join(dir, 'in.' + f), dst = path.join(dir, 'out.wav');
+  const run = (cmd, args) => new Promise((resolve, reject) => execFile(cmd, args, { timeout: 20000 }, (e) => (e ? reject(e) : resolve())));
+  try {
+    await fsp.writeFile(src, buf, { mode: 0o600 });
+    try { await run('afconvert', ['-f', 'WAVE', '-d', 'LEI16@16000', '-c', '1', src, dst]); }
+    catch (e) { await run('ffmpeg', ['-v', 'error', '-y', '-i', src, '-ac', '1', '-ar', '16000', '-f', 'wav', dst]).catch(() => { throw new Error('no_converter'); }); }
+    return wavToFloat16k(await fsp.readFile(dst));
+  } finally { await fsp.rm(dir, { recursive: true, force: true }).catch(() => {}); }
+}
+// Peak-normalise first (to -3 dBFS, at most x20), as utterances are: a phone
+// recording raw at arm's length sat under an absolute floor although speech
+// was there. Then voiced = a 250 ms chunk over 3% of full scale.
+function prepareUploadedVoice(samples, maxSeconds = 12) {
+  if (samples.length > 16000 * maxSeconds) samples = samples.subarray(0, 16000 * maxSeconds);
   let peak = 0;
   for (let i = 0; i < samples.length; i++) { const a = Math.abs(samples[i]); if (a > peak) peak = a; }
   const gain = peak > 0 ? Math.min(20, 0.7 / peak) : 1;
   if (gain > 1.05) { const n = new Float32Array(samples.length); for (let i = 0; i < samples.length; i++) n[i] = Math.max(-1, Math.min(1, samples[i] * gain)); samples = n; }
   let voicedMs = 0, acc = 0;
   for (let i = 0; i + 4000 <= samples.length; i += 4000) { const r = rmsOf(samples.subarray(i, i + 4000)); if (r > 0.02) voicedMs += 250; acc += r; }
-  const quality = { speech_ms: voicedMs, rms: Math.round(acc / Math.max(1, Math.floor(samples.length / 4000)) * 10000) / 10000, reason: voicedMs < 2000 ? 'too_short' : 'ok' };
-  if (quality.reason !== 'ok') return { ok: true, accepted: false, reason: quality.reason, quality, speech_ms: voicedMs, needed_speech_ms: 2000, samples: (enrolled && enrolled[name.toLowerCase()] || []).length };
+  return { samples, quality: { speech_ms: voicedMs, rms: Math.round(acc / Math.max(1, Math.floor(samples.length / 4000)) * 10000) / 10000 } };
+}
+// Who is speaking in an uploaded clip (#19): the same scoring as
+// speaker.matches on the identity event. Nothing is kept: no backlog, no
+// auto sample - the clip is not from a room microphone and the caller
+// (the brain) owns the attribution decision.
+function identifyVoiceClip(samplesIn) {
+  const { samples, quality } = prepareUploadedVoice(samplesIn, 15);
+  quality.reason = quality.speech_ms < 1000 ? 'too_short' : 'ok';
+  if (quality.reason !== 'ok') return { ok: true, quality, matches: [], too_short: true, reason: 'too_short', needed_speech_ms: 1000 };
+  const emb = embedVoice(samples);
+  if (!emb) return { ok: false, quality, matches: [], reason: 'no_model' };
+  const matches = matchVoice(emb);
+  return { ok: true, quality, matches, decisive: !ambiguous(matches, VOICE_DECISIVE) };
+}
+function enrolVoiceFromAudio(name, samplesIn, phrase, camera) {
+  if (!/^[a-z0-9_-]{1,32}$/i.test(name)) return { ok: false, accepted: false, reason: 'bad_name' };
+  const { samples, quality } = prepareUploadedVoice(samplesIn, 12);
+  quality.reason = quality.speech_ms < 2000 ? 'too_short' : 'ok';   // >= 2 s needed to enrol
+  if (quality.reason !== 'ok') return { ok: true, accepted: false, reason: quality.reason, quality, speech_ms: quality.speech_ms, needed_speech_ms: 2000, samples: (enrolled && enrolled[name.toLowerCase()] || []).length };
   const emb = embedVoice(samples);
   if (!emb) return { ok: false, accepted: false, reason: 'no_model' };
   const d = path.join(cfg.identityDir, name.toLowerCase());
@@ -2285,13 +2318,28 @@ const server = http.createServer(async (req, res) => {
         const r = enrolFace(String(body.name || ''), cam || 'upload', found, Number.isInteger(body.index) ? body.index : undefined, body.pose);
         res.writeHead(r.ok ? 200 : 400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(r));
       }
+      if (req.method === 'POST' && parts[1] === 'voice' && parts[2] === 'who') {
+        // Who is speaking in an uploaded clip (#19): {audio_b64, format?} ->
+        // {quality, matches, decisive}. Same bearer rule as the other identity
+        // routes; the clip is matched in memory and not kept.
+        const body = await readJsonBody(req);
+        if (!body.audio_b64) { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, reason: 'no_audio' })); }
+        let samples;
+        try { samples = await decodeUploadedAudio(Buffer.from(String(body.audio_b64).replace(/^data:[^,]*,/, ''), 'base64'), body.format); }
+        catch (e) { res.writeHead(e.message === 'unsupported_format' ? 415 : 400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, reason: e.message === 'unsupported_format' || e.message === 'no_converter' ? e.message : 'bad_audio: ' + e.message })); }
+        const r = identifyVoiceClip(samples);
+        console.log(`[nest_headless] IDENTITY who from upload: ${r.matches[0] ? r.matches[0].name + ':' + r.matches[0].score : 'no match'} (${r.quality.speech_ms} ms voiced${r.decisive ? ', decisive' : ''}) from ${ip}`);
+        res.writeHead(r.ok ? 200 : 400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(r));
+      }
       if (req.method === 'POST' && parts[1] === 'voice' && parts[2] === 'enrol') {
         const body = await readJsonBody(req);
         const cam = body.camera ? cameraEntity(body.camera) : null;
         let r;
-        if (body.audio_b64) {   // onboarding from the phone (#16): a 16-bit WAV, 3-10 s, with the phrase spoken
-          const wav = Buffer.from(String(body.audio_b64).replace(/^data:[^,]*,/, ''), 'base64');
-          r = enrolVoiceFromAudio(String(body.name || ''), wav, body.phrase ? String(body.phrase).slice(0, 120) : null, cam);
+        if (body.audio_b64) {   // onboarding from the phone (#16): a clip of 3-10 s with the phrase spoken (WAV, or m4a/caf via the host converter)
+          let samples = null;
+          try { samples = await decodeUploadedAudio(Buffer.from(String(body.audio_b64).replace(/^data:[^,]*,/, ''), 'base64'), body.format); }
+          catch (e) { r = { ok: false, accepted: false, reason: e.message === 'unsupported_format' || e.message === 'no_converter' ? e.message : 'bad_audio: ' + e.message }; }
+          if (samples) r = enrolVoiceFromAudio(String(body.name || ''), samples, body.phrase ? String(body.phrase).slice(0, 120) : null, cam);
         } else {
           const u = body.utterance_id ? utterances.get(body.utterance_id) : (cam ? latestUtterance(cam) : null);
           r = enrolVoice(String(body.name || ''), u);

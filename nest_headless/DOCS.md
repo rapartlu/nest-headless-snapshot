@@ -362,6 +362,10 @@ Endpoints (loopback, or `Authorization: Bearer <API_TOKEN>` from the LAN):
   `face_too_small` (`size_px`, `needed_px`), `multiple_faces` (candidates
   with `index`), `bad_image`.
 - `GET /identity/who/<camera>` -> faces in one fresh frame.
+- `POST /identity/voice/who` {audio_b64, format?} -> {quality: {speech_ms,
+  rms, reason}, matches: [{name, score, room, upload}], decisive}: who is
+  speaking in an uploaded clip (>= 1 s voiced, up to 15 s); WAV, or m4a/caf
+  where the host has `afconvert`/`ffmpeg`. Nothing is kept.
 - `DELETE /identity/<name>` -> forgets voice and face.
 
 Embeddings are JSON under `nest_models/identity/<name>/`; raw audio or the

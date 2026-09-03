@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.13.1
+
+- `POST /identity/voice/who` {audio_b64, format?} -> {quality, matches,
+  decisive} (#19): who is speaking in an uploaded clip, scored exactly as
+  `speaker.matches` on the identity event; >= 1 s voiced needed
+  (`too_short` otherwise); the clip is matched in memory and not kept.
+  Uploaded audio for this and for voice enrolment may be WAV or, where the
+  host has `afconvert` or `ffmpeg`, m4a/caf/aac/mp3 (`format`).
+
 ## 1.13.0
 
 - Transcript wake path (`wake_by_transcript`, off by default): every speech
