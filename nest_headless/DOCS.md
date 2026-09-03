@@ -98,6 +98,15 @@ Two kinds of model run in-process (native onnxruntime, no cloud, no quota):
    linear model still provides the framing tripwire. Retraining is just
    replacing the file - it hot-loads on change.
 
+   State zones take the same two kinds under `nest_models/<camera>__<zone>.onnx`
+   or `.json`. With few labels the linear matcher is the better tool: keep
+   crops in `<root>/<camera>__<zone>/{open,closed}/` and run
+   `tools/retrain_zones.py --labels-root <root> --models-dir <config>/nest_models`
+   nightly; it retrains when the counts change, skips frames labelled both
+   ways, and records a leave-one-out accuracy that the zone events carry as
+   `loo_acc` (treat verdicts as authoritative from about 0.9). Label from
+   the frame that shows the state, not from when a visit happened.
+
 ## Passage zones (doorways)
 
 `watch_passages` draws polygons across doorways, per camera, with the same

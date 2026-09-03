@@ -37,7 +37,7 @@ RNG = np.random.default_rng(42)
 # from the kitchen doorway at the left of the crop, whose own door — when
 # half-closed — otherwise mimics the cupboard's ajar edge (the 12:40/12:50Z
 # false positives on 2026-08-28).
-SUBCROP = (0.0, 0.0, 1.0, 0.90)
+SUBCROP = (0.0, 0.0, 1.0, 0.90)   # the cupboard default; --subcrop 0,0,1,1 for a whole zone crop
 
 
 def load_gray(path):
@@ -89,8 +89,31 @@ def standardize(img):
     return (img - img.mean()) / (img.std() + 1e-6)
 
 
+EXCLUDE = set()   # basenames to skip (labelled both ways, or known bad)
+
+
+def jpegs(dirpath):
+    return [f for f in sorted(Path(dirpath).glob("*.jpg")) + sorted(Path(dirpath).glob("*.jpeg")) if f.name not in EXCLUDE]
+
+
+def fit(Xz, y, epochs, l2):
+    """Class-balanced logistic regression, full-batch gradient descent."""
+    w = np.zeros(Xz.shape[1])
+    b = 0.0
+    pos_w = len(y) / (2 * max(1, y.sum()))
+    neg_w = len(y) / (2 * max(1, (1 - y).sum()))
+    sw = np.where(y == 1, pos_w, neg_w)
+    lr = 0.5
+    for _ in range(epochs):
+        p = 1 / (1 + np.exp(-np.clip(Xz @ w + b, -30, 30)))
+        g = (sw * (p - y))
+        w -= lr * (Xz.T @ g / len(y) + l2 * w)
+        b -= lr * g.mean()
+    return w, b
+
+
 def build_set(dirpath, aug_to, refz):
-    files = sorted(Path(dirpath).glob("*.jpg")) + sorted(Path(dirpath).glob("*.jpeg"))
+    files = dirpath if isinstance(dirpath, list) else jpegs(dirpath)
     if not files:
         sys.exit(f"no jpegs in {dirpath}")
     base = [load_gray(f) for f in files]
@@ -118,7 +141,20 @@ def main():
                          "(default: --neg). Pin this to ONE lighting regime - "
                          "mixing day+evening frames into the median shifts the "
                          "reference and broke real-frame accuracy on 2026-08-29.")
+    ap.add_argument("--subcrop", default=None,
+                    help="x0,y0,x1,y1 view within the crop (default 0,0,1,0.9 for the "
+                         "cupboard; use 0,0,1,1 for a whole zone crop)")
+    ap.add_argument("--loo", action="store_true",
+                    help="leave-one-out check over the ORIGINAL images (the holdout split "
+                         "above sees augmented copies of the same frames, so it flatters)")
+    ap.add_argument("--exclude", default="", help="comma-separated basenames to skip")
     args = ap.parse_args()
+    global SUBCROP
+    EXCLUDE.update(n for n in args.exclude.split(",") if n)
+    if args.subcrop:
+        SUBCROP = tuple(float(v) for v in args.subcrop.split(","))
+        if len(SUBCROP) != 4:
+            sys.exit("--subcrop needs x0,y0,x1,y1")
 
     ref_dir = args.ref_dir or args.neg
     ref_files = sorted(Path(ref_dir).glob("*.jpg")) + sorted(Path(ref_dir).glob("*.jpeg"))
@@ -140,18 +176,33 @@ def main():
     ntest = max(2, len(Xz) // 5)
     Xtr, ytr, Xte, yte = Xz[ntest:], y[ntest:], Xz[:ntest], y[:ntest]
 
-    # class-balanced logistic regression, full-batch gradient descent
-    w = np.zeros(Xtr.shape[1])
-    b = 0.0
-    pos_w = len(ytr) / (2 * max(1, ytr.sum()))
-    neg_w = len(ytr) / (2 * max(1, (1 - ytr).sum()))
-    sw = np.where(ytr == 1, pos_w, neg_w)
-    lr = 0.5
-    for _ in range(args.epochs):
-        p = 1 / (1 + np.exp(-np.clip(Xtr @ w + b, -30, 30)))
-        g = (sw * (p - ytr))
-        w -= lr * (Xtr.T @ g / len(ytr) + args.l2 * w)
-        b -= lr * g.mean()
+    w, b = fit(Xtr, ytr, args.epochs, args.l2)
+
+    # Leave-one-out over the ORIGINAL frames: each is scored by a model that
+    # never saw it or its augmentations. The honest number with few samples.
+    loo_acc = None
+    if args.loo:
+        pos_files, neg_files = jpegs(args.pos), jpegs(args.neg)
+        results = []
+        for cls, files, others in ((1, pos_files, neg_files), (0, neg_files, pos_files)):
+            for i, f in enumerate(files):
+                keep = files[:i] + files[i + 1:]
+                if not keep or not others:
+                    continue
+                Xa, _ = build_set(keep, max(20, args.aug // 2), refz)
+                Xb, _ = build_set(others, max(20, args.aug // 2), refz)
+                Xl = np.vstack([Xa, Xb])
+                yl = np.concatenate([np.full(len(Xa), float(cls)), np.full(len(Xb), float(1 - cls))])
+                m_, s_ = Xl.mean(axis=0), Xl.std(axis=0) + 1e-6
+                w_, b_ = fit((Xl - m_) / s_, yl, max(100, args.epochs // 2), args.l2)
+                x = ((standardize(load_gray(f)) - refz).ravel() - m_) / s_
+                p = 1 / (1 + np.exp(-np.clip(x @ w_ + b_, -30, 30)))
+                results.append((cls, float(p), f.name))
+        ok = sum(1 for c, p, _ in results if (p >= 0.5) == (c == 1))
+        loo_acc = ok / max(1, len(results))
+        print(f"leave-one-out over {len(results)} originals: acc {loo_acc:.3f}")
+        for c, p, n in results:
+            print(f"  {'open  ' if c else 'closed'} {p:.2f} {n}{'' if (p >= 0.5) == (c == 1) else '   <-- wrong'}")
 
     def acc(Xs, ys):
         p = 1 / (1 + np.exp(-np.clip(Xs @ w + b, -30, 30)))
@@ -175,6 +226,7 @@ def main():
         "threshold": 0.5, "trained": str(date.today()),
         "samples": {"pos": npos, "neg": nneg},
         "holdout_acc": round(float(te_acc), 4),
+        "loo_acc": None if loo_acc is None else round(float(loo_acc), 4),
     }
     Path(args.out).write_text(json.dumps(model))
     print(f"wrote {args.out} ({Path(args.out).stat().st_size // 1024} KB)")

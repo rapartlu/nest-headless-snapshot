@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.14.1';
+const ADDON_VERSION = '1.14.2';
 
 const http = require('http');
 const fs = require('fs');
@@ -878,6 +878,8 @@ async function zoneClassifyTick(entityId, mgr) {
           before_jpeg_b64: st.refJpeg.toString('base64'), after_jpeg_b64: c.jpeg.toString('base64'),
           people_nearby: people, recent_names: [...new Set(recent)],
           frame_at: new Date(now).toISOString(), look_url: lookUrl,
+          // the trained model's current view of this zone, when one exists (#22)
+          model: st.model ? { state: st.state, score: st.score, engine: st.engine, ...(st.modelMeta || {}) } : null,
           boxes: [{ label: 'zone:' + z.name, ...boxOf(c.rect) }, ...people.map((p) => ({ label: 'person', name: p.name, score: p.score, ...boxOf(p.box) }))],
         }).catch(() => {});
         st.lastChangeMs = now;
@@ -886,10 +888,15 @@ async function zoneClassifyTick(entityId, mgr) {
       if (st.changed > CHANGE_TICKS && settled) { st.hold = (st.hold || 0) + 1; if (st.hold >= STEADY_TICKS) { st.ref = c.grey; st.refJpeg = c.jpeg; st.refSince = now; st.changed = 0; st.hold = 0; } } else st.hold = 0;
     } else { st.changed = 0; st.hold = 0; st.steady++; if (settled && st.steady >= STEADY_TICKS * 5) { st.ref = c.grey; st.refJpeg = c.jpeg; } }   // slow drift (lighting) refresh
     // --- optional trained state model
+    // <camera>__<zone>.onnx (a CNN) outranks <camera>__<zone>.json (the linear
+    // template matcher from tools/train_door_model.py, retrained by
+    // tools/retrain_zones.py as labels grow, #22); both hot-load on change
     const key = `${entityId}__${z.name}`;
-    if (!infer.hasDoorModel(key)) { st.model = false; continue; }
-    const v = await infer.classifyDoor(key, c.jpeg, { label: z.name, threshold: 0.5 });
-    if (!v) continue;
+    let v = null;
+    if (infer.hasDoorModel(key)) v = await infer.classifyDoor(key, c.jpeg, { label: z.name, threshold: 0.5 });
+    else { const lin = classify(key, c.jpeg); if (lin) v = { ...lin, engine: 'linear' }; }
+    if (!v) { st.model = false; continue; }
+    st.engine = v.engine || 'onnx'; st.modelMeta = { trained: v.trained || null, samples: v.samples || null, loo_acc: v.loo_acc == null ? null : v.loo_acc, holdout_acc: v.holdout_acc == null ? null : v.holdout_acc };
     st.model = true; st.score = v.score; st.ticks.push(v.positive ? 1 : 0);
     while (st.ticks.length > ZONE_DEBOUNCE_TICKS) st.ticks.shift();
     const sum = st.ticks.reduce((a, b) => a + b, 0);
@@ -905,6 +912,7 @@ async function zoneClassifyTick(entityId, mgr) {
         postHaEvent('nest_headless_zone_state', {
           entity_id: entityId, camera: entityId.replace(/^camera\./, ''), zone: z.name, label: z.name,
           state: next, previous: prev, score: v.score, previous_duration_s: prevDuration, t: new Date(now).toISOString(), people_nearby: people,
+          model: true, engine: st.engine, ...st.modelMeta,   // loo_acc: leave-one-out accuracy over the originals it was trained on - trust it from ~0.9 up
           frame_at: new Date(now).toISOString(),
           boxes: [{ label: 'zone:' + z.name, ...boxOf(c.rect) }, ...people.map((p) => ({ label: 'person', name: p.name, score: p.score, ...boxOf(p.box) }))],
         }).catch(() => {});

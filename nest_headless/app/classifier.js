@@ -115,7 +115,9 @@ function classify(camera, jpegBuf) {
       z += v * model.weights[i];
     }
     const score = 1 / (1 + Math.exp(-z));
-    const out = { label: model.label, score: Math.round(score * 1000) / 1000, positive: score >= (model.threshold || 0.5) };
+    const out = { label: model.label, score: Math.round(score * 1000) / 1000, positive: score >= (model.threshold || 0.5), engine: 'linear',
+      // what the model is worth, for a consumer deciding how far to trust it
+      trained: model.trained || null, samples: model.samples || null, loo_acc: model.loo_acc == null ? null : model.loo_acc, holdout_acc: model.holdout_acc == null ? null : model.holdout_acc };
     if (refCorr !== null) {
       out.refCorr = Math.round(refCorr * 1000) / 1000;
       out.framingOk = refCorr >= 0.45;

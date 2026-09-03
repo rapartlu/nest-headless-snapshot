@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.14.2
+
+- Per-zone state models without a CNN (#22): where no `<camera>__<zone>.onnx`
+  exists, a `<camera>__<zone>.json` from `tools/train_door_model.py` (the
+  linear template matcher, `--subcrop 0,0,1,1` for a whole zone crop) drives
+  `nest_headless_zone_state` the same way, hot-loaded on change.
+  `tools/retrain_zones.py` retrains every `<camera>__<zone>/{open,closed}/`
+  label folder under a root whenever its counts change (a nightly job),
+  skipping frames labelled both ways, and the trainer's new `--loo` prints
+  a leave-one-out accuracy over the original frames - the honest number
+  with few samples. Zone events carry `model`/`engine`/`loo_acc`/`samples`
+  so a consumer can decide how far to trust the verdict.
+
 ## 1.14.1
 
 - Memory: the MLX recogniser workers cap their Metal buffer cache

@@ -176,7 +176,7 @@ stream per camera instead of polling, which is far cheaper on the quota.
 | `nest_headless/` | The add-on (Node plus headless Chromium): `app/` code, `host/` servers for running the speech models on a Mac |
 | `nest_headless/DOCS.md` | Options, endpoints, events, zones, identity, Mac mode |
 | `nest_headless/CHANGELOG.md` | Every release, with the reasoning behind each change |
-| `tools/train_door_model.py` | Trainer for the optional per-camera state classifiers |
+| `tools/train_door_model.py`, `tools/retrain_zones.py` | Trainer for the optional per-camera / per-zone state classifiers, and the scheduled retrainer |
 | `examples/` | Ready-to-adapt automations and a timeline dashboard card |
 
 ## License
