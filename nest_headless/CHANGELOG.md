@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.17.1
+
+- Hold a state zone's change detection while a person covers it (#27):
+  `hold_covered` (fraction of the zone under a person box, default 0.5, 0
+  disables) and `hold_near` (also while a person stands within half a
+  zone-width, default on) per state zone in `zones.json` / `PUT /zones`.
+  While held, the pre-visit reference is kept and the people there are
+  noted; once the zone has been clear and settled for the usual ticks, one
+  `nest_headless_zone_change` is judged against that reference, carrying
+  `held_s` and `people_during`, with the before crop from before the visit
+  and the after crop from now. Trained-model `zone_state` is unaffected.
+  Numbers behind it: 47 dryer-door changes in two hours, 42 with a person
+  in front and the door unchanged.
+
 ## 1.17.0
 
 - Zone states from the model's labels (#26): a zone model may have any

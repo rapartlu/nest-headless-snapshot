@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.17.0';
+const ADDON_VERSION = '1.17.1';
 
 const http = require('http');
 const fs = require('fs');
@@ -190,6 +190,13 @@ function zoneFromJson(z, kind) {
         min_face_px: Math.max(40, Math.min(200, Number(z.look.min_face_px) || 60)) };
     } else out.look = null;
   }
+  if (kind === 'state') {
+    // hold_covered: fraction of the zone under a person box that holds change
+    // detection (0 disables); hold_near: also hold while a person stands within
+    // half a zone-width of it (shadows on a porthole) (#27)
+    out.hold_covered = z.hold_covered == null ? 0.5 : Math.max(0, Math.min(1, Number(z.hold_covered) || 0));
+    out.hold_near = z.hold_near !== false;
+  }
   if (typeof z.description === 'string' && z.description.trim()) out.description = z.description.trim().slice(0, 160);   // for the brain ("the sideboard by the window")
   return out;
 }
@@ -198,6 +205,7 @@ function zoneToJson(z, kind) {
   if (z.pts) o.pts = z.pts.map((p) => [Math.round(p[0] * 10000) / 10000, Math.round(p[1] * 10000) / 10000]);
   else { o.x = z.x; o.y = z.y; o.w = z.w; o.h = z.h; }
   if (kind === 'passages') { o.inside = z.inside || null; if (z.look) o.look = { ...z.look, camera: z.look.camera.replace(/^camera\./, '') }; }
+  if (kind === 'state') { o.hold_covered = z.hold_covered == null ? 0.5 : z.hold_covered; o.hold_near = z.hold_near !== false; }
   if (z.description) o.description = z.description;
   return o;
 }
@@ -854,6 +862,38 @@ async function peopleNear(entityId, jpg, rect) {
   } catch (e) { return []; }
 }
 const ZONE_MODEL_MIN_LOO = 0.8;   // a zone model announces state only from this leave-one-out accuracy up
+// person boxes against a zone rect (frame fractions), for the hold (#27)
+const growRect = (r, f) => ({ x: r.x - r.w * f, y: r.y - r.h * f, w: r.w * (1 + 2 * f), h: r.h * (1 + 2 * f) });
+const interArea = (a, b) => Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x)) * Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y));
+const zoneCover = (rect, persons) => persons.reduce((m, p) => Math.max(m, interArea(rect, p.box) / Math.max(1e-9, rect.w * rect.h)), 0);
+// One nest_headless_zone_change: the look differs from the reference. `extra`
+// carries held_s / people_during for a change judged after a person's visit.
+function emitZoneChange(entityId, z, st, c, jpg, sharp, now, people, extra = {}) {
+  const mgr = watchMgr[entityId] || {};
+  const recent = (mgr.recentNames || []).filter((r) => now - r.t < 60000).map((r) => r.name);
+  console.log(`[nest_headless] ZONE CHANGE ${z.name} on ${entityId}: diff ${st.diff} vs reference held ${Math.round((now - st.refSince) / 1000)}s; people ${people.length}${people.some((p) => p.name) ? ' (' + people.filter((p) => p.name).map((p) => p.name).join(',') + ')' : ''}${extra.held_s != null ? '; judged after a ' + extra.held_s + 's visit' : ''}`);
+  // evidence (#21): the frame, the boxes, and a before|after composite kept under <camera>_zones/<zone>/ for GET /look/zones/...
+  keepEventFrame(entityId, now, jpg);
+  let lookUrl = null;
+  if (cfg.samplesDir) {
+    lookUrl = `/look/zones/${entityId.replace(/^camera\./, '')}/${z.name}/${evidence.stampOf(now)}.jpg`;
+    zonePairComposite(sharp, st.refJpeg, c.jpeg)
+      .then((buf) => sampleIndex(entityId, '_zones/' + z.name).put(evidence.stampOf(now) + '.jpg', buf, EVIDENCE_KEEP()))
+      .catch((e) => console.warn(`[nest_headless] zone pair ${z.name} failed: ${e.message}`));
+  }
+  postHaEvent('nest_headless_zone_change', {
+    entity_id: entityId, camera: entityId.replace(/^camera\./, ''), zone: z.name, t: new Date(now).toISOString(),
+    diff: st.diff, reference_held_s: Math.round((now - st.refSince) / 1000),
+    before_jpeg_b64: st.refJpeg.toString('base64'), after_jpeg_b64: c.jpeg.toString('base64'),
+    people_nearby: people, recent_names: [...new Set(recent)],
+    frame_at: new Date(now).toISOString(), look_url: lookUrl,
+    // the trained model's current view of this zone, when one exists (#22)
+    model: st.model ? { state: st.state, score: st.score, scores: st.scores || null, engine: st.engine, ...(st.modelMeta || {}) } : null,
+    boxes: [{ label: 'zone:' + z.name, ...boxOf(c.rect) }, ...people.map((p) => ({ label: 'person', name: p.name, score: p.score, ...boxOf(p.box) }))],
+    ...extra,
+  }).catch(() => {});
+  st.lastChangeMs = now;
+}
 async function zoneClassifyTick(entityId, mgr) {
   const zones = cfg.watchClassifyZones[entityId] || [];
   if (!zones.length || !mgr.page || !mgr.ready || loopBusy()) return;
@@ -864,6 +904,10 @@ async function zoneClassifyTick(entityId, mgr) {
   const W = shot.width, H = shot.height, now = Date.now();
   noteFrame(entityId, jpg, now);   // evidence ring (#21)
   mgr.zones = mgr.zones || {};
+  // people in this frame, once per tick (#27): a person covering a state zone,
+  // or standing right by it, holds its change detection until they step away
+  const wantPeople = zones.some((z) => (z.hold_covered || 0) > 0);
+  const persons = wantPeople ? (await infer.detect(jpg, { conf: 0.4, classes: [0] }).catch(() => null)) || [] : [];
   for (const z of zones) {
     const st = mgr.zones[z.name] || (mgr.zones[z.name] = { state: null, score: null, ticks: [], since: null, model: false, ref: null, refJpeg: null, refSince: null, steady: 0, changed: 0, lastChangeMs: 0, diff: 0 });
     const c = await zoneCrops(sharp, jpg, W, H, z);
@@ -872,34 +916,33 @@ async function zoneClassifyTick(entityId, mgr) {
     st.diff = Math.round(greyDiff(c.grey, st.ref, c.mask) * 10) / 10;
     const settled = greyDiff(c.grey, st.last, c.mask) < ZONE_CHANGE_THRESHOLD / 2;   // not mid-motion
     st.last = c.grey;
-    if (st.diff >= cfg.zoneChangeThreshold) {
-      st.changed++; st.steady = 0;
-      if (st.changed === CHANGE_TICKS) {
-        const people = await peopleNear(entityId, jpg, c.rect);
-        const recent = (mgr.recentNames || []).filter((r) => now - r.t < 60000).map((r) => r.name);
-        console.log(`[nest_headless] ZONE CHANGE ${z.name} on ${entityId}: diff ${st.diff} vs reference held ${Math.round((now - st.refSince) / 1000)}s; people ${people.length}${people.some((p) => p.name) ? ' (' + people.filter((p) => p.name).map((p) => p.name).join(',') + ')' : ''}`);
-        // evidence (#21): the frame, the boxes, and a before|after composite
-        // kept under <camera>_zones/<zone>/ for GET /look/zones/...
-        keepEventFrame(entityId, now, jpg);
-        let lookUrl = null;
-        if (cfg.samplesDir) {
-          lookUrl = `/look/zones/${entityId.replace(/^camera\./, '')}/${z.name}/${evidence.stampOf(now)}.jpg`;
-          zonePairComposite(sharp, st.refJpeg, c.jpeg)
-            .then((buf) => sampleIndex(entityId, '_zones/' + z.name).put(evidence.stampOf(now) + '.jpg', buf, EVIDENCE_KEEP()))
-            .catch((e) => console.warn(`[nest_headless] zone pair ${z.name} failed: ${e.message}`));
-        }
-        postHaEvent('nest_headless_zone_change', {
-          entity_id: entityId, camera: entityId.replace(/^camera\./, ''), zone: z.name, t: new Date(now).toISOString(),
-          diff: st.diff, reference_held_s: Math.round((now - st.refSince) / 1000),
-          before_jpeg_b64: st.refJpeg.toString('base64'), after_jpeg_b64: c.jpeg.toString('base64'),
-          people_nearby: people, recent_names: [...new Set(recent)],
-          frame_at: new Date(now).toISOString(), look_url: lookUrl,
-          // the trained model's current view of this zone, when one exists (#22)
-          model: st.model ? { state: st.state, score: st.score, scores: st.scores || null, engine: st.engine, ...(st.modelMeta || {}) } : null,
-          boxes: [{ label: 'zone:' + z.name, ...boxOf(c.rect) }, ...people.map((p) => ({ label: 'person', name: p.name, score: p.score, ...boxOf(p.box) }))],
-        }).catch(() => {});
-        st.lastChangeMs = now;
+    // --- the hold (#27): while a person covers hold_covered of the zone (or
+    // stands within half a zone-width of it with hold_near), keep the pre-visit
+    // reference and remember who was there; once they have been gone for
+    // STEADY_TICKS settled ticks, judge the settled look against that
+    // reference ONCE. The trained model below runs throughout.
+    const holdOn = (z.hold_covered || 0) > 0;
+    const holdNow = holdOn && (zoneCover(c.rect, persons) >= z.hold_covered || (z.hold_near !== false && persons.some((p) => interArea(growRect(c.rect, 0.5), p.box) > 0)));
+    if (holdNow) {
+      if (!st.heldSince) { st.heldSince = now; st.heldPeople = []; st.heldFaceMs = 0; }
+      if (now - st.heldFaceMs > 20000) {   // who is there, sampled at most every 20 s
+        st.heldFaceMs = now;
+        peopleNear(entityId, jpg, c.rect).then((pp) => { for (const p of pp) if (!st.heldPeople.some((q) => q.box && p.box && Math.abs(q.box.x - p.box.x) < 0.05 && q.name === p.name)) st.heldPeople.push({ name: p.name, score: p.score, box: p.box }); }).catch(() => {});
       }
+      st.clearTicks = 0; st.changed = 0; st.hold = 0;
+    } else if (st.heldSince) {
+      st.clearTicks = settled ? (st.clearTicks || 0) + 1 : 0;
+      if (st.clearTicks >= STEADY_TICKS) {
+        const heldS = Math.round((now - st.heldSince) / 1000);
+        const during = (st.heldPeople || []).map((p) => ({ name: p.name, score: p.score }));
+        if (st.diff >= cfg.zoneChangeThreshold) emitZoneChange(entityId, z, st, c, jpg, sharp, now, st.heldPeople || [], { held_s: heldS, people_during: during });
+        else console.log(`[nest_headless] ZONE ${z.name} on ${entityId}: unchanged after a ${heldS}s visit${during.some((p) => p.name) ? ' by ' + during.filter((p) => p.name).map((p) => p.name).join(',') : ''}`);
+        st.ref = c.grey; st.refJpeg = c.jpeg; st.refSince = now;   // the settled look after the visit is the new reference either way
+        st.heldSince = null; st.heldPeople = null; st.clearTicks = 0; st.changed = 0; st.hold = 0; st.steady = 0;
+      }
+    } else if (st.diff >= cfg.zoneChangeThreshold) {
+      st.changed++; st.steady = 0;
+      if (st.changed === CHANGE_TICKS) emitZoneChange(entityId, z, st, c, jpg, sharp, now, await peopleNear(entityId, jpg, c.rect));
       // adopt the new look once it has held still for STEADY_TICKS after the change
       if (st.changed > CHANGE_TICKS && settled) { st.hold = (st.hold || 0) + 1; if (st.hold >= STEADY_TICKS) { st.ref = c.grey; st.refJpeg = c.jpeg; st.refSince = now; st.changed = 0; st.hold = 0; } } else st.hold = 0;
     } else { st.changed = 0; st.hold = 0; st.steady++; if (settled && st.steady >= STEADY_TICKS * 5) { st.ref = c.grey; st.refJpeg = c.jpeg; } }   // slow drift (lighting) refresh

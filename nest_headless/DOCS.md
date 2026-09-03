@@ -533,6 +533,14 @@ are kept in the archive under `<camera>_events/`, and:
 
 ## Zones API (the app's zone editor)
 
+State zones hold their change detection while a person covers them
+(`hold_covered`, fraction of the zone under a person box, default 0.5; 0
+disables) or stands right by them (`hold_near`, default on): the reference
+from before the visit is kept, and once the person has gone and the zone
+has settled, one `nest_headless_zone_change` is judged against it, with
+`held_s` and `people_during` and the before crop from before the visit.
+Trained-model `zone_state` events keep flowing throughout.
+
 - `GET /zones` -> `{version, frame: {w, h}, cameras: {<camera>: {surfaces,
   passages, state, activity}}, watched, file}`. Each zone is `{name, pts:
   [[x,y],...]}` or `{name, x, y, w, h}` in frame fractions; passages add
