@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.11.7';
+const ADDON_VERSION = '1.11.8';
 
 const http = require('http');
 const fs = require('fs');
@@ -1408,11 +1408,13 @@ const WAKE_NAMES = 'claude|claud|clawed|claws|clause|cloud|cloudy|clod|clawd|kla
 // so at most a few words of junk precede it - hence {0,40}); a wake phrase
 // further in is someone quoting it ("...say hey Claude, it's Rafe" was
 // Hearth's own reply, and an unbounded prefix once cut everything before it).
-const WAKE_RE = new RegExp(`^[\\s\\S]{0,40}?\\b(?:hey|hi|ok|okay)[,.!?]?\\s+(?:${WAKE_NAMES})\\b[,.!?]*\\s*`, 'i');
+// a quiet "hey" transcribes as "a" or "eh" ("a kitchen, send a note to my dad…", 3 Sept)
+const WAKE_WORDS = 'hey|hi|ok|okay|a|eh|hay';
+const WAKE_RE = new RegExp(`^[\\s\\S]{0,40}?\\b(?:${WAKE_WORDS})[,.!?]?\\s+(?:${WAKE_NAMES})\\b[,.!?]*\\s*`, 'i');
 // pre-roll cut mid-phrase: transcript starts with the bare name ("clawed, is the...")
 const WAKE_HEAD_RE = new RegExp(`^\\W*(?:${WAKE_NAMES})\\b[,.!?]*\\s*`, 'i');
 // repeats ("hey claude, hey claude, ...") must be right at the head
-const WAKE_REPEAT_RE = new RegExp(`^\\W*(?:hey|hi|ok|okay)[,.!?]?\\s+(?:${WAKE_NAMES})\\b[,.!?]*\\s*`, 'i');
+const WAKE_REPEAT_RE = new RegExp(`^\\W*(?:${WAKE_WORDS})[,.!?]?\\s+(?:${WAKE_NAMES})\\b[,.!?]*\\s*`, 'i');
 function stripWakePhrase(t) {
   const m = WAKE_RE.exec(t) || WAKE_HEAD_RE.exec(t);
   if (!m) return t;
