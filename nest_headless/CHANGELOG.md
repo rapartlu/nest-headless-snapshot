@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.12.2
+
+- Event-loop lag guard (#17): the loop's lag is measured every 500 ms and
+  reported as `loop_lag_ms` on `GET /`; while it exceeds 400 ms the optional
+  vision work (passage detection, zone ticks, face sampling, backlog
+  candidates) yields for that tick, so the status route and the audio path
+  stay responsive. A 20-minute 100% spin during a phone onboarding burst had
+  made `/` take 1.5 s.
+- Uploaded enrolment images are EXIF-rotated and capped at 1600 px before
+  face detection (a 12 MP phone photo decoded raw is ~48 MB).
+- 1.12.1: uploaded enrolment clips are peak-normalised before the voiced test.
+
 ## 1.12.0
 
 - Verification backlog for identity (#16). A voice capture or a face of good

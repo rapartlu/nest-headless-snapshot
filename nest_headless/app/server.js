@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.12.1';
+const ADDON_VERSION = '1.12.2';
 
 const http = require('http');
 const fs = require('fs');
@@ -580,6 +580,22 @@ async function captureCoalesced(entityId) {
 // ------------------------------------------------------------ watch mode
 const watchMgr = {}; // entityId -> { page, ready, hits, lastHitMs, startedAt, lastError }
 const classifierState = {}; // entityId -> 'ok' | 'dark' | 'framing_drift' (last reported, for nest_headless_health)
+// Event-loop lag, measured every 500 ms. When the loop lags, the optional
+// vision work (passage detection, zone ticks, face sampling, backlog
+// candidates) yields for that tick so the status route and the audio path
+// stay responsive (Hearth #17: a 20-minute 100% spin during an onboarding
+// burst made `/` take 1.5 s and the house go deaf).
+const LAG_SKIP_MS = 400;
+let loopLagMs = 0, lastLagWarnMs = 0;
+{
+  let last = Date.now();
+  setInterval(() => {
+    const now = Date.now();
+    loopLagMs = Math.max(0, now - last - 500); last = now;
+    if (loopLagMs > LAG_SKIP_MS && now - lastLagWarnMs > 30000) { lastLagWarnMs = now; console.warn(`[nest_headless] event loop lagging ${loopLagMs} ms - optional vision work yields`); }
+  }, 500).unref();
+}
+function loopBusy() { return loopLagMs > LAG_SKIP_MS; }
 
 async function watchGrab(entityId) {
   const mgr = watchMgr[entityId];
@@ -615,7 +631,7 @@ function postHaEvent(type, data) {
 // detection pacing below - people cross a doorway in about a second.
 async function passageTick(entityId, mgr, frameBuf, now) {
   const passages = cfg.watchPassages[entityId] || [];
-  if (!passages.length) return;
+  if (!passages.length || loopBusy()) return;
   if (now - (mgr.lastPassageMs || 0) < 700) return;
   mgr.lastPassageMs = now;
   try {
@@ -711,7 +727,7 @@ async function peopleNear(entityId, jpg, rect) {
 }
 async function zoneClassifyTick(entityId, mgr) {
   const zones = cfg.watchClassifyZones[entityId] || [];
-  if (!zones.length || !mgr.page || !mgr.ready) return;
+  if (!zones.length || !mgr.page || !mgr.ready || loopBusy()) return;
   const sharp = getSharp(); if (!sharp) return;
   const shot = await mgr.page.evaluate(fns.grabFrame, { quality: cfg.jpegQuality, crop: null });
   if (!shot || shot.meanLuma < 3) return;
@@ -1162,6 +1178,7 @@ const publicFace = (f) => ({ name: f.name, score: f.score, box: f.box, quality: 
 // Sample faces during a speech capture: at the wake hit and ~1 s later; best (largest) per position.
 async function sampleFacesForCapture(entityId) {
   const out = [];
+  if (loopBusy()) return out;
   try {
     const a = await facesForCamera(entityId); out.push(...a.faces);
     await new Promise((r) => setTimeout(r, 1000));
@@ -1201,6 +1218,7 @@ function considerVoiceForPending(entityId, u, matches, utteranceId) {
   } catch (e) { console.warn('[nest_headless] pending voice failed:', e.message); }
 }
 async function considerFacesForPending(entityId, jpg, found) {
+  if (loopBusy()) return;
   try {
     const now = Date.now();
     if (now - (lastPendingFaceMs[entityId] || 0) < 60000) return;
@@ -1938,7 +1956,7 @@ const server = http.createServer(async (req, res) => {
         addon: 'nest_headless', outDir: cfg.outDir,
         cameras: Object.fromEntries(Object.entries(state).map(([k, v]) => [k, v.lastMeta])),
         addon: 'nest_headless', version: ADDON_VERSION,
-        cpus: os.cpus().length, nice: os.getPriority(), load: os.loadavg().map((v) => +v.toFixed(2)),
+        cpus: os.cpus().length, nice: os.getPriority(), load: os.loadavg().map((v) => +v.toFixed(2)), loop_lag_ms: loopLagMs,
         audio: audioStats, capturing: Object.keys(speechCap),
         watches: Object.fromEntries(Object.entries(watchMgr).map(([k, m]) => [k, {
           ready: m.ready, hits: m.hits, startedAt: m.startedAt, lastError: m.lastError,
@@ -2094,8 +2112,12 @@ const server = http.createServer(async (req, res) => {
         // brain already holds and the owner has identified. Same detector, rules, refusals, storage.
         let found;
         if (body.image_b64) {
-          const jpg = Buffer.from(String(body.image_b64).replace(/^data:[^,]*,/, ''), 'base64');
+          let jpg = Buffer.from(String(body.image_b64).replace(/^data:[^,]*,/, ''), 'base64');
           if (jpg.length < 100) { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, accepted: false, reason: 'bad_image' })); }
+          // phone photos: honour EXIF rotation and cap at 1600 px before detection (a 12 MP
+          // upload decoded raw is ~48 MB and spun the loop during onboarding, Hearth #17)
+          const sharpM = getSharp();
+          if (sharpM) jpg = await sharpM(jpg).rotate().resize({ width: 1600, height: 1600, fit: 'inside', withoutEnlargement: true }).jpeg({ quality: 92 }).toBuffer().catch(() => jpg);
           found = await facesInBuffer(jpg, { minPx: 40 }).catch((e) => ({ ok: false, reason: 'bad_image: ' + e.message, faces: [] }));
         } else if (cam) {
           found = await facesForCamera(cam, { minPx: 40 });
