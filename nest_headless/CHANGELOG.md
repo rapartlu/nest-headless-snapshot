@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.12.9
+
+- Spotter diagnostics on `GET /` under `audio.<camera>`: `decodes`,
+  `lastKeyword`, `lastKeywordAt`, `streamRefreshes`; a spotter stream that
+  has run 10 minutes without a detection is recreated during quiet.
+  (Investigating missed wake phrases: the process and the model were fine;
+  the small spotter simply mis-hears some loud, close utterances, e.g. a
+  near-clipping "Hey Claude" decoded as "I glob".)
+
 ## 1.12.8
 
 - `stt_fallback_url`: a second recogniser server tried when `stt_url`

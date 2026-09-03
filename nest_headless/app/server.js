@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.12.8';
+const ADDON_VERSION = '1.12.9';
 
 const http = require('http');
 const fs = require('fs');
@@ -1788,12 +1788,23 @@ function onAudioChunk(entityId, b64, sampleRate) {
     const recentPeak = Math.max(...st.peaks, 0.02);
     const g = Math.min(8, Math.max(1, 0.5 / recentPeak));
     const spot = g > 1.05 ? Float32Array.from(f32, (v) => Math.max(-1, Math.min(1, v * g))) : f32;
+    // Idle refresh: a spotter stream that had run for an hour with no
+    // detection (so no reset) stopped firing on clearly audible wake phrases
+    // that a fresh stream on the same audio caught at once. Replace the
+    // stream after 10 minutes without a detection, only during quiet and
+    // never while a capture is open, so a phrase is never cut.
+    const nowMs = Date.now();
+    st.bornMs = st.bornMs || nowMs;
+    if (nowMs - st.bornMs > 600000 && st0.lastRms < 0.01 && !speechCap[entityId]) {
+      st.s = k.spotter.createStream(); st.bornMs = nowMs; st0.streamRefreshes = (st0.streamRefreshes || 0) + 1;
+    }
     st.s.acceptWaveform({ samples: spot, sampleRate: 16000 });
     while (k.spotter.isReady(st.s)) {
-      k.spotter.decode(st.s);
+      k.spotter.decode(st.s); st0.decodes = (st0.decodes || 0) + 1;
       const r = k.spotter.getResult(st.s);
       if (r && r.keyword) {
-        k.spotter.reset(st.s);
+        k.spotter.reset(st.s); st.bornMs = Date.now();
+        st0.lastKeyword = r.keyword; st0.lastKeywordAt = new Date().toISOString();
         const now = Date.now();
         if (speechCap[entityId]) continue;                       // capture in progress: no re-trigger
         if (now - (lastKeywordMs[entityId] || 0) < 2500) continue;
