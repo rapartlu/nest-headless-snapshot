@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.11.1
+
+- Zone editor API for the app. `GET /zones` returns every zone of every kind
+  per camera (surfaces, passages, state, activity), each as a polygon (`pts`)
+  or a rect, plus which cameras are watched. `PUT /zones` {cameras:
+  {<camera>: {surfaces?, passages?, state?, activity?}}} validates, replaces
+  the given kinds for the given cameras, saves `<config>/nest_models/zones.json`
+  and hot-applies to live watches (the page motion mask restarts; streams
+  stay up; trackers and zone references reset). Writes need loopback or the
+  API token; reads are open. `zones.json` overrides the option strings at
+  start-up, so app edits survive restarts.
+- Every zone kind accepts polygons: state zones now mask their change
+  fingerprint to the drawn shape.
+
 ## 1.11.0
 
 - State zones (Hearth #12, #13), the senses/intelligence split made

@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.11.0';
+const ADDON_VERSION = '1.11.1';
 
 const http = require('http');
 const fs = require('fs');
@@ -132,6 +132,76 @@ const cfg = {
   identityDir: path.join(CONFIG_DIR, 'nest_models/identity'),
   identityKeepSamples: (process.env.IDENTITY_KEEP_SAMPLES || 'false') === 'true',
 };
+
+// ------------------------------------------------------------ zones file (the app's zone editor)
+// <config>/nest_models/zones.json overrides the option strings per camera and
+// is what PUT /zones writes. Every zone kind may be a polygon (pts) or a rect.
+//   { "version": 1, "cameras": { "kitchen_camera": {
+//       "surfaces": [{name, pts|x,y,w,h}], "passages": [{name, pts|x,y,w,h, inside:[x,y]?}],
+//       "state": [{name, pts|x,y,w,h}], "activity": [{name, pts|x,y,w,h}] } } }
+const ZONES_FILE = path.join(CONFIG_DIR, 'nest_models', 'zones.json');
+const ZONE_KINDS = { surfaces: 'watchRois', passages: 'watchPassages', state: 'watchClassifyZones', activity: 'watchActivityZones' };
+function zoneFromJson(z, kind) {
+  if (!z || typeof z !== 'object' || !/^[a-z0-9_-]{1,32}$/i.test(String(z.name || ''))) throw new Error('bad zone name');
+  const f = (v) => { const n = Number(v); if (!Number.isFinite(n) || n < -0.5 || n > 1.5) throw new Error(`bad coordinate in ${z.name}`); return n; };
+  let out;
+  if (Array.isArray(z.pts)) {
+    const pts = z.pts.map((p) => [f(p[0]), f(p[1])]);
+    if (pts.length < 3) throw new Error(`${z.name}: a polygon needs 3 points`);
+    const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
+    const x = Math.min(...xs), y = Math.min(...ys);
+    out = { name: z.name, pts, x, y, w: Math.max(...xs) - x, h: Math.max(...ys) - y, centroid: [xs.reduce((a, b) => a + b, 0) / xs.length, ys.reduce((a, b) => a + b, 0) / ys.length] };
+  } else {
+    out = { name: z.name, x: f(z.x), y: f(z.y), w: f(z.w), h: f(z.h) };
+    if (!(out.w > 0 && out.h > 0)) throw new Error(`${z.name}: empty rect`);
+    out.centroid = [out.x + out.w / 2, out.y + out.h / 2];
+  }
+  if (kind === 'passages') {
+    out.inside = Array.isArray(z.inside) && z.inside.length === 2 ? [f(z.inside[0]), f(z.inside[1])] : null;
+    if (!out.pts) out.pts = [[out.x, out.y], [out.x + out.w, out.y], [out.x + out.w, out.y + out.h], [out.x, out.y + out.h]];   // the tracker needs a polygon
+  }
+  return out;
+}
+function zoneToJson(z, kind) {
+  const o = { name: z.name };
+  if (z.pts) o.pts = z.pts.map((p) => [Math.round(p[0] * 10000) / 10000, Math.round(p[1] * 10000) / 10000]);
+  else { o.x = z.x; o.y = z.y; o.w = z.w; o.h = z.h; }
+  if (kind === 'passages') o.inside = z.inside || null;
+  return o;
+}
+function zonesToJson() {
+  const cams = {};
+  const names = new Set();
+  for (const key of Object.values(ZONE_KINDS)) for (const cam of Object.keys(cfg[key] || {})) names.add(cam);
+  for (const cam of names) {
+    cams[cam.replace(/^camera\./, '')] = Object.fromEntries(Object.entries(ZONE_KINDS).map(([kind, key]) => [kind, (cfg[key][cam] || []).map((z) => zoneToJson(z, kind))]));
+  }
+  return { version: 1, frame: { w: 1920, h: 1080 }, cameras: cams, file: fs.existsSync(ZONES_FILE) ? ZONES_FILE : null };
+}
+function loadZonesFile() {
+  let j;
+  try { j = JSON.parse(fs.readFileSync(ZONES_FILE, 'utf8')); } catch (e) { return false; }
+  for (const [camName, kinds] of Object.entries(j.cameras || {})) {
+    const cam = 'camera.' + camName.replace(/^camera\./, '');
+    for (const [kind, key] of Object.entries(ZONE_KINDS)) {
+      if (!Array.isArray(kinds[kind])) continue;
+      const parsed = kinds[kind].map((z) => zoneFromJson(z, kind));
+      if (parsed.length) cfg[key][cam] = parsed; else delete cfg[key][cam];
+    }
+  }
+  console.log(`[nest_headless] zones loaded from ${ZONES_FILE}`);
+  return true;
+}
+function saveZonesFile(cams) {
+  fs.mkdirSync(path.dirname(ZONES_FILE), { recursive: true });
+  const current = (() => { try { return JSON.parse(fs.readFileSync(ZONES_FILE, 'utf8')); } catch (e) { return { version: 1, cameras: {} }; } })();
+  // start from the live config so cameras the file has never seen keep their option-string zones
+  const live = zonesToJson().cameras;
+  const merged = { version: 1, updated_at: new Date().toISOString(), cameras: { ...live, ...(current.cameras || {}), ...cams } };
+  fs.writeFileSync(ZONES_FILE + '.tmp', JSON.stringify(merged, null, 2));
+  fs.renameSync(ZONES_FILE + '.tmp', ZONES_FILE);
+}
+loadZonesFile();
 
 function parseWatches(spec) {
   const out = {};
@@ -586,17 +656,34 @@ async function passageTick(entityId, mgr, frameBuf, now) {
 const ZONE_TICK_MS = 2000, ZONE_DEBOUNCE_TICKS = 2, STEADY_TICKS = 3, CHANGE_TICKS = 2, ZONE_CHANGE_THRESHOLD = 10;
 let sharpMod = null;
 function getSharp() { if (sharpMod === null) { try { sharpMod = require('sharp'); } catch (e) { sharpMod = false; } } return sharpMod; }
+const FP = 48; // fingerprint side
+// Polygon zones: a 48x48 mask over the bounding rect so the change test only
+// looks inside the drawn shape (cached on the zone object).
+function zoneMask(z) {
+  if (!z.pts) return null;
+  if (z.mask48) return z.mask48;
+  const m = new Uint8Array(FP * FP);
+  const inPoly = (px, py) => { let inside = false; for (let i = 0, j = z.pts.length - 1; i < z.pts.length; j = i++) { const [xi, yi] = z.pts[i], [xj, yj] = z.pts[j]; if ((yi > py) !== (yj > py) && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi) inside = !inside; } return inside; };
+  for (let y = 0; y < FP; y++) for (let x = 0; x < FP; x++) if (inPoly(z.x + (x + 0.5) / FP * z.w, z.y + (y + 0.5) / FP * z.h)) m[y * FP + x] = 1;
+  z.mask48 = m;
+  return m;
+}
 async function zoneCrops(sharp, jpg, W, H, z) {
   const left = Math.max(0, Math.round(z.x * W)), top = Math.max(0, Math.round(z.y * H));
   const width = Math.max(8, Math.min(W - left, Math.round(z.w * W))), height = Math.max(8, Math.min(H - top, Math.round(z.h * H)));
   const base = sharp(jpg).extract({ left, top, width, height });
   const [jpeg, grey] = await Promise.all([
     base.clone().jpeg({ quality: 88 }).toBuffer(),
-    base.clone().resize(48, 48, { fit: 'fill' }).greyscale().raw().toBuffer(),   // fingerprint for the change test
+    base.clone().resize(FP, FP, { fit: 'fill' }).greyscale().raw().toBuffer(),   // fingerprint for the change test
   ]);
-  return { jpeg, grey, rect: { x: left / W, y: top / H, w: width / W, h: height / H } };
+  return { jpeg, grey, mask: zoneMask(z), rect: { x: left / W, y: top / H, w: width / W, h: height / H } };
 }
-function greyDiff(a, b) { if (!a || !b || a.length !== b.length) return 0; let s = 0; for (let i = 0; i < a.length; i++) s += Math.abs(a[i] - b[i]); return s / a.length; }
+function greyDiff(a, b, mask) {
+  if (!a || !b || a.length !== b.length) return 0;
+  let s = 0, n = 0;
+  for (let i = 0; i < a.length; i++) { if (mask && !mask[i]) continue; s += Math.abs(a[i] - b[i]); n++; }
+  return n ? s / n : 0;
+}
 async function peopleNear(entityId, jpg, rect) {
   // person boxes overlapping the zone grown by half its size each way, with face matches when a face sits in the box
   try {
@@ -631,8 +718,8 @@ async function zoneClassifyTick(entityId, mgr) {
     const c = await zoneCrops(sharp, jpg, W, H, z);
     // --- change detection against the reference look
     if (!st.ref) { st.steady++; if (st.steady >= STEADY_TICKS) { st.ref = c.grey; st.refJpeg = c.jpeg; st.refSince = now; } st.last = c.grey; continue; }
-    st.diff = Math.round(greyDiff(c.grey, st.ref) * 10) / 10;
-    const settled = greyDiff(c.grey, st.last) < ZONE_CHANGE_THRESHOLD / 2;   // not mid-motion
+    st.diff = Math.round(greyDiff(c.grey, st.ref, c.mask) * 10) / 10;
+    const settled = greyDiff(c.grey, st.last, c.mask) < ZONE_CHANGE_THRESHOLD / 2;   // not mid-motion
     st.last = c.grey;
     if (st.diff >= cfg.zoneChangeThreshold) {
       st.changed++; st.steady = 0;
@@ -1461,14 +1548,37 @@ function onAudioChunk(entityId, b64, sampleRate) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function runWatch(entityId, intervalSec) {
-  const mgr = watchMgr[entityId] = { ready: false, hits: 0, lastHitMs: 0, lastError: null, page: null };
-  const surfaces = cfg.watchRois[entityId] || [];
-  // passage zones join the page's motion mask (named "passage:<name>") so a
-  // person in a doorway produces hits; they are never cat surfaces
-  const rois = surfaces
+// The page's motion mask: cat surfaces, passage zones (named "passage:<name>",
+// never cat surfaces) and activity zones (reported per tick, never a hit).
+function roisFor(entityId) {
+  return (cfg.watchRois[entityId] || [])
     .concat((cfg.watchPassages[entityId] || []).map((p) => ({ name: 'passage:' + p.name, pts: p.pts, x: p.x, y: p.y, w: p.w, h: p.h })))
     .concat((cfg.watchActivityZones[entityId] || []).map((z) => ({ name: z.name, pts: z.pts, x: z.x, y: z.y, w: z.w, h: z.h, activity: true })));
+}
+// Hot-apply a zone change on a live watch: restart the page loop with the new
+// mask, forget trackers/zone references. Streams stay up.
+async function applyZones(entityId) {
+  const mgr = watchMgr[entityId];
+  if (!mgr || !mgr.page || !mgr.ready) return false;
+  const page = mgr.page;
+  if (!mgr.activityExposed && (cfg.watchActivityZones[entityId] || []).length) {
+    await page.exposeFunction('__activityNode', (pcts) => { try { onActivity(entityId, pcts); } catch (e) { /* ignore */ } });
+    mgr.activityExposed = true;
+  }
+  await page.evaluate(() => { if (window.__watchTimer) { clearInterval(window.__watchTimer); window.__watchTimer = null; } });
+  const rois = roisFor(entityId);
+  if (rois.length) {
+    await page.evaluate((src) => { window.__grabFrame = eval('(' + src + ')'); }, fns.grabFrame.toString());
+    await page.evaluate(fns.startWatchLoop, { intervalMs: mgr.intervalSec * 1000, rois, diffPct: cfg.watchDiffPct, quality: cfg.jpegQuality });
+  }
+  mgr.tracker = null; mgr.zones = {}; delete activityState[entityId];
+  console.log(`[nest_headless] zones applied on ${entityId}: ${(cfg.watchRois[entityId] || []).length} surfaces, ${(cfg.watchPassages[entityId] || []).length} passages, ${(cfg.watchClassifyZones[entityId] || []).length} state, ${(cfg.watchActivityZones[entityId] || []).length} activity`);
+  return true;
+}
+async function runWatch(entityId, intervalSec) {
+  const mgr = watchMgr[entityId] = { ready: false, hits: 0, lastHitMs: 0, lastError: null, page: null, intervalSec };
+  const surfaces = cfg.watchRois[entityId] || [];
+  const rois = roisFor(entityId);
   // No ROIs is fine: the stream still serves instant snapshots and classify
   // ticks - there is just no surface-motion event source for this camera.
   for (;;) {
@@ -1481,7 +1591,8 @@ async function runWatch(entityId, intervalSec) {
         watchHit(entityId, payload).catch((e) => console.warn('[nest_headless] watch hit failed:', e.message)));
       if ((cfg.watchActivityZones[entityId] || []).length) {
         await page.exposeFunction('__activityNode', (pcts) => { try { onActivity(entityId, pcts); } catch (e) { /* ignore */ } });
-      }
+        mgr.activityExposed = true;
+      } else mgr.activityExposed = false;
       if (cfg.audioCameras.includes(entityId)) {
         await page.exposeFunction('__audioChunkNode', (b64, rate) => onAudioChunk(entityId, b64, rate));
       }
@@ -1599,7 +1710,7 @@ const server = http.createServer(async (req, res) => {
   // Snapshots, frames, detection and status stay LAN-open for HA.
   const ip = (req.socket.remoteAddress || '').replace(/^::ffff:/, '');
   const loopback = ip === '127.0.0.1' || ip === '::1';
-  const sensitive = parts[0] === 'listen' || parts[0] === 'identity' || parts[0] === 'utterance' || parts[0] === 'audiodebug';
+  const sensitive = parts[0] === 'listen' || parts[0] === 'identity' || parts[0] === 'utterance' || parts[0] === 'audiodebug' || (parts[0] === 'zones' && req.method !== 'GET');
   if (sensitive && !loopback) {
     const auth = req.headers.authorization || '';
     if (!cfg.apiToken || auth !== `Bearer ${cfg.apiToken}`) {
@@ -1675,6 +1786,46 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ mgr: mgr ? { ready: mgr.ready, hits: mgr.hits, lastError: mgr.lastError } : null, page: pageState }));
       return;
+    }
+    if (parts[0] === 'zones') {
+      // Zone editor API (the app, admin-only there). GET is open; PUT/DELETE need
+      // loopback or the API token. PUT {cameras: {<camera>: {surfaces?, passages?,
+      // state?, activity?}}} replaces the given kinds for the given cameras,
+      // saves zones.json and hot-applies to live watches (no restart).
+      if (req.method === 'GET') {
+        const j = zonesToJson();
+        j.watched = Object.keys(watchMgr).map((k) => k.replace(/^camera\./, ''));
+        res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(j));
+      }
+      if (req.method === 'PUT') {
+        const body = await readJsonBody(req);
+        const cams = body && body.cameras;
+        if (!cams || typeof cams !== 'object') { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, reason: 'cameras object required' })); }
+        const applied = [];
+        try {
+          // validate everything first, then commit
+          const parsed = {};
+          for (const [camName, kinds] of Object.entries(cams)) {
+            const cam = cameraEntity(camName);
+            parsed[cam] = {};
+            for (const [kind, key] of Object.entries(ZONE_KINDS)) {
+              if (kinds[kind] === undefined) continue;
+              if (!Array.isArray(kinds[kind])) throw new Error(`${camName}.${kind} must be an array`);
+              parsed[cam][key] = kinds[kind].map((z) => zoneFromJson(z, kind));
+            }
+          }
+          for (const [cam, byKey] of Object.entries(parsed)) {
+            for (const [key, list] of Object.entries(byKey)) { if (list.length) cfg[key][cam] = list; else delete cfg[key][cam]; }
+          }
+          saveZonesFile(Object.fromEntries(Object.entries(parsed).map(([cam]) => [cam.replace(/^camera\./, ''), zonesToJson().cameras[cam.replace(/^camera\./, '')] || {}])));
+          for (const cam of Object.keys(parsed)) { if (await applyZones(cam)) applied.push(cam.replace(/^camera\./, '')); }
+        } catch (e) {
+          res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, reason: e.message }));
+        }
+        console.log(`[nest_headless] ZONES updated from ${ip}: ${Object.keys(cams).join(', ')} (applied live: ${applied.join(', ') || 'none'})`);
+        res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: true, applied, ...zonesToJson() }));
+      }
+      res.writeHead(405); return res.end('method not allowed');
     }
     if (parts[0] === 'listen' && parts[1] && req.method === 'POST') {
       // Follow-up window (Hearth #4): the brain has just spoken on this

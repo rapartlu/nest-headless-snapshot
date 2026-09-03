@@ -356,3 +356,22 @@ and logs its text as `SHADOW` lines next to the `SPEECH` line, without using
 or posting it. `host/whisper_server.py` serves either `STT_ENGINE=mlx-whisper`
 (default, whisper-large-v3-turbo) or `STT_ENGINE=parakeet-mlx`
 (Parakeet-TDT 0.6B v3), always from worker processes (`WHISPER_WORKERS`).
+
+
+## Zones API (the app's zone editor)
+
+- `GET /zones` -> `{version, frame: {w, h}, cameras: {<camera>: {surfaces,
+  passages, state, activity}}, watched, file}`. Each zone is `{name, pts:
+  [[x,y],...]}` or `{name, x, y, w, h}` in frame fractions; passages add
+  `inside: [x,y] | null`.
+- `PUT /zones` with `{cameras: {<camera>: {surfaces?, passages?, state?,
+  activity?}}}` replaces the kinds you send for the cameras you send (send an
+  empty array to clear a kind). Validation errors come back as 400 with a
+  reason; nothing is applied unless everything validates. On success the
+  change is saved to `<config>/nest_models/zones.json` and applied live.
+  Needs loopback or `Authorization: Bearer <API_TOKEN>`.
+- Draw on `/frame/<camera>` (open, LAN): fractions of that frame.
+
+Kinds: `surfaces` (cat zones), `passages` (doorways, direction from
+`inside`), `state` (change detection with before/after crops; optional model
+`<camera>__<name>.onnx`), `activity` (running/idle from in-zone motion).
