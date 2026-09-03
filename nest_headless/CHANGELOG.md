@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.17.3
+
+- `POST /training/<set>/<label>/<file>/move {label}` relabels a training
+  crop from the review (#28): the file moves under the new label (folder
+  created if new), replacing a same-named file there as the newer verdict;
+  answers `{ok, url, replaced}`. Same token rule and path validation as
+  `DELETE`.
+
 ## 1.17.2
 
 - Enrolments and sample deletions update the in-memory identity index

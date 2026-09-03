@@ -417,7 +417,8 @@ Reviewing the corpus: `GET /identity/<name>/samples` (people) and
 sample and its embedding. A brain's labelled training crops can be reviewed
 the same way when `training_dir` points at them: `GET /training` (sets and
 counts), `GET /training/<set>/<label>` (files), `GET` a file, `DELETE` a
-file. All under the identity token rule.
+file, `POST .../<file>/move {label}` to relabel it. All under the identity
+token rule.
 
 ### Verification backlog and onboarding
 

@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.17.2';
+const ADDON_VERSION = '1.17.3';
 
 const http = require('http');
 const fs = require('fs');
@@ -2796,6 +2796,21 @@ const server = http.createServer(async (req, res) => {
       if (parts[1] && parts[2] && parts[3] && /\.jpe?g$/i.test(parts[3])) {
         const f = path.join(root, parts[1], parts[2], parts[3]);
         if (!fs.existsSync(f)) { res.writeHead(404); return res.end('no such crop'); }
+        // POST .../<file>/move {label}: relabel from the app's review (#28). A
+        // same-named file under the new label is the same instant labelled
+        // earlier; the move is the newer verdict and replaces it.
+        if (req.method === 'POST' && parts[4] === 'move') {
+          const body = await readJsonBody(req);
+          const label = String(body.label || '');
+          if (!/^[A-Za-z0-9_]{1,40}$/.test(label)) { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, reason: 'bad_label' })); }
+          if (label === parts[2]) { res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: true, url: `/training/${parts[1]}/${parts[2]}/${parts[3]}`, replaced: false })); }
+          const dstDir = path.join(root, parts[1], label), dst = path.join(dstDir, parts[3]);
+          await fsp.mkdir(dstDir, { recursive: true });
+          const replaced = fs.existsSync(dst);
+          await fsp.rename(f, dst);
+          console.log(`[nest_headless] TRAINING crop ${parts[1]}/${parts[2]}/${parts[3]} -> ${label}${replaced ? ' (replaced)' : ''} from ${ip}`);
+          res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: true, url: `/training/${parts[1]}/${label}/${parts[3]}`, replaced }));
+        }
         if (req.method === 'GET') { const buf = await fsp.readFile(f); res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Content-Length': buf.length, 'Cache-Control': 'private, max-age=86400' }); return res.end(buf); }
         if (req.method === 'DELETE') { await fsp.unlink(f); console.log(`[nest_headless] TRAINING crop dropped ${parts[1]}/${parts[2]}/${parts[3]} from ${ip}`); res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: true })); }
       }
