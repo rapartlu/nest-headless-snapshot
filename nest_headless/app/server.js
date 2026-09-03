@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.12.4';
+const ADDON_VERSION = '1.12.5';
 
 const http = require('http');
 const fs = require('fs');
@@ -1727,7 +1727,10 @@ async function finishSpeechCapture(entityId, c, reason) {
   try {
     if (quality.reason === 'ok' || quality.speech_ms >= 800) u.embedding = embedVoice(all);
     const matches = u.embedding ? matchVoice(u.embedding) : [];
-    considerVoiceForPending(entityId, u, matches, utteranceId);
+    // Only speech addressed to the house feeds the backlog or the auto room
+    // samples: a spotter false alarm on background conversation (wake
+    // unconfirmed, no follow-up window) is not something to keep.
+    if (wakeConfirmed || c.followUp) considerVoiceForPending(entityId, u, matches, utteranceId);
     const seen = c.facesPromise ? await c.facesPromise.catch(() => []) : [];
     await postHaEvent('nest_headless_identity', {
       entity_id: entityId, camera: entityId.replace(/^camera\./, ''), utterance_id: utteranceId,

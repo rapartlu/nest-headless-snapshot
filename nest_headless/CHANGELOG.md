@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.12.5
+
+- Backlog and auto room samples only from speech addressed to the house:
+  a capture whose wake word Whisper did not confirm, outside a follow-up
+  window, no longer parks a clip or keeps a sample. A spotter false alarm
+  on background conversation had queued a 4 s clip of it.
+
 ## 1.12.4
 
 - Confident room voice matches keep a room sample (#16 follow-up, approved
