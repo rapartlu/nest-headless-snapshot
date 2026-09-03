@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.12.0
+
+- Verification backlog for identity (#16). A voice capture or a face of good
+  quality whose match is ambiguous (voice best < 0.6, face best < 0.5, or a
+  runner-up within 0.1) or unknown is parked under
+  `<config>/nest_models/identity/pending/<id>/` with its embedding, the clip
+  (16 kHz WAV, <= 10 s) or a context crop (JPEG), and `meta.json`; kept 7
+  days or 200 samples, oldest dropped; at most one face candidate per camera
+  per minute. `nest_headless_identity_pending` {count, newest?} fires on add
+  and after any label/drop.
+- Endpoints (loopback or API token): `GET /identity/pending?kind=&camera=&limit=`,
+  `GET /identity/pending/<id>/media`, `POST /identity/pending/<id>/label
+  {name}` (enrols the sample, creating the person), `POST
+  /identity/pending/<id>/unknown` (not a household member: a 30-day negative
+  set stops the same visitor being queued again), `DELETE
+  /identity/pending/<id>`.
+- Onboarding inputs: `POST /identity/voice/enrol` accepts `{name, audio_b64,
+  phrase?}` (16-bit WAV, any rate/channels, 3-10 s); `POST /identity/face/enrol`
+  accepts `pose` (front|left|right|up|down) and returns `poses_held`;
+  `GET /identity/<name>` -> {voice_samples, face_samples, poses_held,
+  last_matched}. `GET /identity` reports `pending`.
+- 1.11.9: house-specific text scrubbed; `WAKE_NAMES` env override.
+
 ## 1.11.7
 
 - Activity zones ignore people (Hearth #12 field note): before a zone goes

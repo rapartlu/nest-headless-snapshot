@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.11.9';
+const ADDON_VERSION = '1.12.0';
 
 const http = require('http');
 const fs = require('fs');
@@ -41,6 +41,7 @@ const { classify } = require('./classifier');
 const infer = require('./infer');
 const { parseWatchPassages, PassageTracker } = require('./passages');
 const faces = require('./faces');
+const { PendingStore } = require('./pending');
 
 // ------------------------------------------------------------ configuration
 // HA config root: the supervisor mounts it at /homeassistant (or /config on
@@ -629,6 +630,7 @@ async function passageTick(entityId, mgr, frameBuf, now) {
     if (faces.hasModels(FACE_MODELS_DIR())) {
       try {
         const found = await faces.facesInJpeg(FACE_MODELS_DIR(), frameBuf, { minPx: 40 });
+        considerFacesForPending(entityId, frameBuf, found).catch(() => {});
         seen = (found || []).filter((f) => f.embedding).map((f) => ({ box: f.box, matches: matchFace(f.embedding) }));
       } catch (e) { /* faces are a bonus */ }
     }
@@ -697,6 +699,7 @@ async function peopleNear(entityId, jpg, rect) {
     let seen = [];
     if (faces.hasModels(FACE_MODELS_DIR())) {
       const found = await faces.facesInJpeg(FACE_MODELS_DIR(), jpg, { minPx: 40 }).catch(() => null);
+      considerFacesForPending(entityId, jpg, found).catch(() => {});
       seen = (found || []).filter((f) => f.embedding).map((f) => ({ box: f.box, matches: matchFace(f.embedding) }));
     }
     return near.map((p) => {
@@ -1115,7 +1118,7 @@ function loadEnrolled() {
       for (const f of fs.readdirSync(d)) {
         const isVoice = /^voice-.*\.json$/.test(f), isFace = /^face-.*\.json$/.test(f);
         if (!isVoice && !isFace) continue;
-        try { const j = JSON.parse(fs.readFileSync(path.join(d, f), 'utf8')); if (Array.isArray(j.embedding)) (isVoice ? items : fitems).push({ embedding: j.embedding, file: f, at: j.at }); } catch (e) { /* skip */ }
+        try { const j = JSON.parse(fs.readFileSync(path.join(d, f), 'utf8')); if (Array.isArray(j.embedding)) (isVoice ? items : fitems).push({ embedding: j.embedding, file: f, at: j.at, pose: j.pose || null }); } catch (e) { /* skip */ }
       }
       if (items.length) enrolled[name] = items;
       if (fitems.length) enrolledFaces[name] = fitems;
@@ -1124,6 +1127,7 @@ function loadEnrolled() {
   return enrolled;
 }
 const FACE_MODELS_DIR = () => path.join(cfg.identityDir, 'models');
+const pending = new PendingStore(path.join(cfg.identityDir, 'pending'));   // verification backlog (#16)
 function matchFace(embedding) {
   if (!enrolled) loadEnrolled();
   const out = [];
@@ -1136,9 +1140,10 @@ function matchFace(embedding) {
 // Faces in a fresh frame off the held stream: [{name|null, score, box, quality, matches}], largest first.
 // ArcFace cosine: same person on this camera ~0.5-0.8, strangers ~0.1-0.3; `name` is set at >= 0.4,
 // the full top-3 is always included so the brain can apply its own threshold.
-async function facesInBuffer(jpg, { minPx = 40 } = {}) {
+async function facesInBuffer(jpg, { minPx = 40, camera = null } = {}) {
   if (!faces.hasModels(FACE_MODELS_DIR())) return { ok: false, reason: 'no_face_models', faces: [] };
   const found = await faces.facesInJpeg(FACE_MODELS_DIR(), jpg, { minPx });
+  if (camera) considerFacesForPending(camera, jpg, found).catch(() => {});
   return { ok: true, faces: (found || []).map((f) => {
     const matches = f.embedding ? matchFace(f.embedding) : [];
     const top = matches[0] && matches[0].score >= 0.4 ? matches[0] : null;
@@ -1150,7 +1155,7 @@ async function facesForCamera(entityId, { minPx = 40 } = {}) {
   if (!mgr || !mgr.ready || !mgr.page) return { ok: false, reason: 'camera_not_watched', faces: [] };
   if (!faces.hasModels(FACE_MODELS_DIR())) return { ok: false, reason: 'no_face_models', faces: [] };
   const shot = await mgr.page.evaluate(fns.grabFrame, { quality: cfg.jpegQuality, crop: null });
-  return facesInBuffer(Buffer.from(shot.dataUrl.split(',')[1], 'base64'), { minPx });
+  return facesInBuffer(Buffer.from(shot.dataUrl.split(',')[1], 'base64'), { minPx, camera: entityId });
 }
 const r4 = (v) => Math.round(v * 10000) / 10000;
 const publicFace = (f) => ({ name: f.name, score: f.score, box: f.box, quality: f.quality, matches: f.matches });
@@ -1169,7 +1174,127 @@ async function sampleFacesForCapture(entityId) {
   }
   return keep.map(publicFace);
 }
-function enrolFace(name, entityId, found, index) {
+// ------------------------------------------------------------ verification backlog (Hearth #16)
+// Good-quality samples whose match is ambiguous or unknown are parked for an
+// admin to label, mark as "not a household member", or drop. Decisive: voice
+// >= 0.6, face >= 0.5, and a clear gap to the runner-up.
+const VOICE_DECISIVE = 0.6, FACE_DECISIVE = 0.5, AMBIGUOUS_GAP = 0.1;
+const lastMatched = {};        // name -> ISO time of the last decisive match
+const lastPendingFaceMs = {};  // camera -> ms; one face candidate per camera per minute
+function ambiguous(matches, decisive) {
+  if (!matches.length || matches[0].score < decisive) return true;
+  return !!(matches[1] && matches[0].score - matches[1].score < AMBIGUOUS_GAP);
+}
+function notePendingCount(newest) {
+  postHaEvent('nest_headless_identity_pending', { count: pending.count(), ...(newest ? { newest } : {}) }).catch(() => {});
+}
+function considerVoiceForPending(entityId, u, matches, utteranceId) {
+  try {
+    if (!u.embedding || !u.quality || u.quality.reason !== 'ok') return;
+    if (!ambiguous(matches, VOICE_DECISIVE)) { lastMatched[matches[0].name] = new Date().toISOString(); return; }
+    if (pending.unknownScore('voice', u.embedding, cosine) >= VOICE_DECISIVE) return;   // a visitor already marked unknown
+    const clip = u.samples.length > 160000 ? u.samples.subarray(0, 160000) : u.samples;  // <= 10 s
+    const meta = pending.add({ kind: 'voice', camera: entityId.replace(/^camera\./, ''), t: new Date().toISOString(), utterance_id: utteranceId,
+      quality: u.quality, matches, embedding: u.embedding, speech_ms: u.quality.speech_ms, media: { buf: wavBuffer(clip), ext: 'wav' } });
+    console.log(`[nest_headless] IDENTITY pending voice ${meta.id} (best ${matches[0] ? matches[0].name + ':' + matches[0].score : 'none'})`);
+    notePendingCount({ id: meta.id, kind: 'voice', camera: meta.camera, t: meta.t });
+  } catch (e) { console.warn('[nest_headless] pending voice failed:', e.message); }
+}
+async function considerFacesForPending(entityId, jpg, found) {
+  try {
+    const now = Date.now();
+    if (now - (lastPendingFaceMs[entityId] || 0) < 60000) return;
+    const sharp = getSharp(); if (!sharp) return;
+    for (const f of found || []) {
+      if (!f.embedding || f.quality.size_px < 60) continue;
+      const matches = matchFace(f.embedding);
+      if (!ambiguous(matches, FACE_DECISIVE)) { lastMatched[matches[0].name] = new Date().toISOString(); continue; }
+      if (pending.unknownScore('face', f.embedding, faces.cosine) >= FACE_DECISIVE) continue;
+      // a human-readable crop: the face box with 2.5x context
+      const m = await sharp(jpg).metadata();
+      const side = Math.round(Math.max(f.box.w * m.width, f.box.h * m.height) * 2.5);
+      const left = Math.max(0, Math.round((f.box.x + f.box.w / 2) * m.width - side / 2)), top = Math.max(0, Math.round((f.box.y + f.box.h / 2) * m.height - side / 2));
+      const crop = await sharp(jpg).extract({ left, top, width: Math.min(m.width - left, side), height: Math.min(m.height - top, side) }).jpeg({ quality: 88 }).toBuffer();
+      const meta = pending.add({ kind: 'face', camera: entityId.replace(/^camera\./, ''), t: new Date().toISOString(),
+        quality: f.quality, matches, embedding: f.embedding, size_px: f.quality.size_px, media: { buf: crop, ext: 'jpg' } });
+      lastPendingFaceMs[entityId] = now;
+      console.log(`[nest_headless] IDENTITY pending face ${meta.id} (${f.quality.size_px}px, best ${matches[0] ? matches[0].name + ':' + matches[0].score : 'none'})`);
+      notePendingCount({ id: meta.id, kind: 'face', camera: meta.camera, t: meta.t });
+      break;
+    }
+  } catch (e) { console.warn('[nest_headless] pending face failed:', e.message); }
+}
+function writePersonSample(name, kind, record, mediaSrc) {
+  const d = path.join(cfg.identityDir, name.toLowerCase());
+  fs.mkdirSync(d, { recursive: true });
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  fs.writeFileSync(path.join(d, `${kind}-${ts}.json`), JSON.stringify({ at: new Date().toISOString(), ...record }));
+  if (cfg.identityKeepSamples && mediaSrc) try { fs.copyFileSync(mediaSrc, path.join(d, `${kind}-${ts}.${mediaSrc.endsWith('.wav') ? 'wav' : 'jpg'}`)); } catch (e) { /* optional */ }
+  loadEnrolled();
+}
+function enrolPending(id, name) {
+  if (!/^[a-z0-9_-]{1,32}$/i.test(name)) return { ok: false, accepted: false, reason: 'bad_name' };
+  const m = pending.get(id);
+  if (!m) return { ok: false, accepted: false, reason: 'unknown_sample' };
+  const media = pending.mediaPath(id);
+  writePersonSample(name, m.kind, { camera: m.camera, quality: m.quality, embedding: m.embedding, from_pending: id, matches_at_label: m.matches }, media && media.file);
+  pending.remove(id);
+  console.log(`[nest_headless] IDENTITY labelled pending ${id} as ${name.toLowerCase()} (${m.kind})`);
+  notePendingCount();
+  return { ok: true, accepted: true, ...personSummary(name.toLowerCase()), pending: pending.count() };
+}
+function personSummary(name) {
+  if (!enrolled) loadEnrolled();
+  const v = enrolled[name] || [], f = enrolledFaces[name] || [];
+  const poses = [...new Set(f.map((it) => it.pose).filter(Boolean))];
+  return { name, voice_samples: v.length, face_samples: f.length, poses_held: poses, last_matched: lastMatched[name] || null,
+    updated_at: [...v, ...f].map((i) => i.at).sort().pop() || null };
+}
+// Uploaded WAV (RIFF, 16-bit PCM, any rate/channels) -> 16 kHz float32 mono.
+function wavToFloat16k(buf) {
+  if (buf.length < 44 || buf.toString('ascii', 0, 4) !== 'RIFF') throw new Error('not a WAV');
+  let pos = 12, fmt = null, data = null;
+  while (pos + 8 <= buf.length) {
+    const id = buf.toString('ascii', pos, pos + 4), size = buf.readUInt32LE(pos + 4);
+    if (id === 'fmt ') fmt = { channels: buf.readUInt16LE(pos + 10), rate: buf.readUInt32LE(pos + 12), bits: buf.readUInt16LE(pos + 22) };
+    else if (id === 'data') data = buf.subarray(pos + 8, pos + 8 + size);
+    pos += 8 + size + (size & 1);
+  }
+  if (!fmt || !data) throw new Error('WAV missing fmt/data');
+  if (fmt.bits !== 16) throw new Error('16-bit PCM WAV expected');
+  const n = Math.floor(data.length / 2 / fmt.channels);
+  let mono = new Float32Array(n);
+  for (let i = 0; i < n; i++) { let s = 0; for (let c = 0; c < fmt.channels; c++) s += data.readInt16LE((i * fmt.channels + c) * 2); mono[i] = s / fmt.channels / 32768; }
+  if (fmt.rate !== 16000) {
+    const sherpa = require('sherpa-onnx-node');
+    const rs = new sherpa.LinearResampler(fmt.rate, 16000);
+    const r = rs.resample(mono, true); mono = Float32Array.from(r.samples || r);
+  }
+  return mono;
+}
+function enrolVoiceFromAudio(name, wavBuf, phrase, camera) {
+  if (!/^[a-z0-9_-]{1,32}$/i.test(name)) return { ok: false, accepted: false, reason: 'bad_name' };
+  let samples;
+  try { samples = wavToFloat16k(wavBuf); } catch (e) { return { ok: false, accepted: false, reason: 'bad_audio: ' + e.message }; }
+  if (samples.length > 16000 * 12) samples = samples.subarray(0, 16000 * 12);
+  // quality against an absolute floor (phone audio is close-mic): voiced >= 2 s
+  let voicedMs = 0, acc = 0;
+  for (let i = 0; i + 4000 <= samples.length; i += 4000) { const r = rmsOf(samples.subarray(i, i + 4000)); if (r > 0.006) voicedMs += 250; acc += r; }
+  const quality = { speech_ms: voicedMs, rms: Math.round(acc / Math.max(1, Math.floor(samples.length / 4000)) * 10000) / 10000, reason: voicedMs < 2000 ? 'too_short' : 'ok' };
+  if (quality.reason !== 'ok') return { ok: true, accepted: false, reason: quality.reason, quality, speech_ms: voicedMs, needed_speech_ms: 2000, samples: (enrolled && enrolled[name.toLowerCase()] || []).length };
+  const emb = embedVoice(samples);
+  if (!emb) return { ok: false, accepted: false, reason: 'no_model' };
+  const d = path.join(cfg.identityDir, name.toLowerCase());
+  fs.mkdirSync(d, { recursive: true });
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  fs.writeFileSync(path.join(d, `voice-${ts}.json`), JSON.stringify({ at: new Date().toISOString(), camera: camera || 'upload', phrase: phrase || null, quality, embedding: emb }));
+  if (cfg.identityKeepSamples) writeWav16k(path.join(d, `voice-${ts}.wav`), samples);
+  loadEnrolled();
+  console.log(`[nest_headless] IDENTITY enrolled voice for ${name.toLowerCase()} from upload (${enrolled[name.toLowerCase()].length} samples${phrase ? ', phrase: ' + String(phrase).slice(0, 40) : ''})`);
+  return { ok: true, accepted: true, quality, samples: enrolled[name.toLowerCase()].length };
+}
+
+function enrolFace(name, entityId, found, index, pose) {
   if (!/^[a-z0-9_-]{1,32}$/i.test(name)) return { ok: false, accepted: false, reason: 'bad_name' };
   if (!found.ok) return { ok: false, accepted: false, reason: found.reason };
   const usable = found.faces.filter((f) => f._emb);
@@ -1185,15 +1310,17 @@ function enrolFace(name, entityId, found, index) {
   const d = path.join(cfg.identityDir, name.toLowerCase());
   fs.mkdirSync(d, { recursive: true });
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
-  fs.writeFileSync(path.join(d, `face-${ts}.json`), JSON.stringify({ at: new Date().toISOString(), camera: entityId, quality: pick.quality, box: pick.box, embedding: pick._emb }));
+  const POSES = ['front', 'left', 'right', 'up', 'down'];
+  const p = POSES.includes(String(pose || '').toLowerCase()) ? String(pose).toLowerCase() : null;
+  fs.writeFileSync(path.join(d, `face-${ts}.json`), JSON.stringify({ at: new Date().toISOString(), camera: entityId, quality: pick.quality, box: pick.box, pose: p, embedding: pick._emb }));
   if (cfg.identityKeepSamples && pick._aligned) {
     const rgba = Buffer.alloc(faces.ALIGN * faces.ALIGN * 4);
     for (let i = 0; i < faces.ALIGN * faces.ALIGN; i++) { rgba[i * 4] = pick._aligned[i * 3]; rgba[i * 4 + 1] = pick._aligned[i * 3 + 1]; rgba[i * 4 + 2] = pick._aligned[i * 3 + 2]; rgba[i * 4 + 3] = 255; }
     fs.writeFileSync(path.join(d, `face-${ts}.jpg`), require('jpeg-js').encode({ data: rgba, width: faces.ALIGN, height: faces.ALIGN }, 90).data);
   }
   loadEnrolled();
-  console.log(`[nest_headless] IDENTITY enrolled face for ${name.toLowerCase()} (${enrolledFaces[name.toLowerCase()].length} samples, ${pick.quality.size_px}px)`);
-  return { ok: true, accepted: true, quality: pick.quality, samples: enrolledFaces[name.toLowerCase()].length };
+  console.log(`[nest_headless] IDENTITY enrolled face for ${name.toLowerCase()} (${enrolledFaces[name.toLowerCase()].length} samples, ${pick.quality.size_px}px${p ? ', ' + p : ''})`);
+  return { ok: true, accepted: true, quality: pick.quality, samples: enrolledFaces[name.toLowerCase()].length, poses_held: personSummary(name.toLowerCase()).poses_held };
 }
 function matchVoice(embedding) {
   if (!enrolled) loadEnrolled();
@@ -1265,7 +1392,7 @@ function identitySummary() {
   return { people: [...names].map((name) => ({
     name, voice_samples: (enrolled[name] || []).length, face_samples: (enrolledFaces[name] || []).length,
     updated_at: [...(enrolled[name] || []), ...(enrolledFaces[name] || [])].map((i) => i.at).sort().pop() || null,
-  })), face_models: faces.hasModels(FACE_MODELS_DIR()) };
+  })), face_models: faces.hasModels(FACE_MODELS_DIR()), pending: pending.count() };
 }
 function readJsonBody(req) {
   return new Promise((resolve) => {
@@ -1539,6 +1666,7 @@ async function finishSpeechCapture(entityId, c, reason) {
   try {
     if (quality.reason === 'ok' || quality.speech_ms >= 800) u.embedding = embedVoice(all);
     const matches = u.embedding ? matchVoice(u.embedding) : [];
+    considerVoiceForPending(entityId, u, matches, utteranceId);
     const seen = c.facesPromise ? await c.facesPromise.catch(() => []) : [];
     await postHaEvent('nest_headless_identity', {
       entity_id: entityId, camera: entityId.replace(/^camera\./, ''), utterance_id: utteranceId,
@@ -1917,6 +2045,36 @@ const server = http.createServer(async (req, res) => {
       if (req.method === 'GET' && !parts[1]) {
         res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(identitySummary()));
       }
+      // ---- verification backlog (#16)
+      if (parts[1] === 'pending') {
+        if (req.method === 'GET' && !parts[2]) {
+          const r = pending.list({ kind: url.searchParams.get('kind') || null, camera: url.searchParams.get('camera') || null, limit: Number(url.searchParams.get('limit')) || 50 });
+          r.samples = r.samples.map((m) => ({ id: m.id, kind: m.kind, camera: m.camera, t: m.t, utterance_id: m.utterance_id, matches: m.matches, quality: m.quality, size_px: m.size_px, speech_ms: m.speech_ms, media_url: `/identity/pending/${m.id}/media` }));
+          res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(r));
+        }
+        if (req.method === 'GET' && parts[2] && parts[3] === 'media') {
+          const m = pending.mediaPath(parts[2]);
+          if (!m) { res.writeHead(404); return res.end('no such sample'); }
+          const buf = fs.readFileSync(m.file);
+          res.writeHead(200, { 'Content-Type': m.type, 'Content-Length': buf.length }); return res.end(buf);
+        }
+        if (req.method === 'POST' && parts[2] && parts[3] === 'label') {
+          const body = await readJsonBody(req);
+          const r = enrolPending(parts[2], String(body.name || ''));
+          res.writeHead(r.ok ? 200 : (r.reason === 'unknown_sample' ? 404 : 400), { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(r));
+        }
+        if (req.method === 'POST' && parts[2] && parts[3] === 'unknown') {
+          const ok = pending.markUnknown(parts[2]);
+          if (ok) { console.log(`[nest_headless] IDENTITY pending ${parts[2]} marked not-household`); notePendingCount(); }
+          res.writeHead(ok ? 200 : 404, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok, pending: pending.count() }));
+        }
+        if (req.method === 'DELETE' && parts[2]) {
+          const ok = pending.remove(parts[2]);
+          if (ok) notePendingCount();
+          res.writeHead(ok ? 200 : 404, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok, pending: pending.count() }));
+        }
+        res.writeHead(404); return res.end('unknown pending route');
+      }
       if (req.method === 'GET' && parts[1] === 'who' && parts[2]) {
         // who is in view right now: one frame, faces matched against enrolled people
         const r = await facesForCamera(cameraEntity(parts[2]));
@@ -1936,15 +2094,27 @@ const server = http.createServer(async (req, res) => {
         } else if (cam) {
           found = await facesForCamera(cam, { minPx: 40 });
         } else { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, accepted: false, reason: 'no_camera_or_image' })); }
-        const r = enrolFace(String(body.name || ''), cam || 'upload', found, Number.isInteger(body.index) ? body.index : undefined);
+        const r = enrolFace(String(body.name || ''), cam || 'upload', found, Number.isInteger(body.index) ? body.index : undefined, body.pose);
         res.writeHead(r.ok ? 200 : 400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(r));
       }
       if (req.method === 'POST' && parts[1] === 'voice' && parts[2] === 'enrol') {
         const body = await readJsonBody(req);
         const cam = body.camera ? cameraEntity(body.camera) : null;
-        const u = body.utterance_id ? utterances.get(body.utterance_id) : (cam ? latestUtterance(cam) : null);
-        const r = enrolVoice(String(body.name || ''), u);
+        let r;
+        if (body.audio_b64) {   // onboarding from the phone (#16): a 16-bit WAV, 3-10 s, with the phrase spoken
+          const wav = Buffer.from(String(body.audio_b64).replace(/^data:[^,]*,/, ''), 'base64');
+          r = enrolVoiceFromAudio(String(body.name || ''), wav, body.phrase ? String(body.phrase).slice(0, 120) : null, cam);
+        } else {
+          const u = body.utterance_id ? utterances.get(body.utterance_id) : (cam ? latestUtterance(cam) : null);
+          r = enrolVoice(String(body.name || ''), u);
+        }
         res.writeHead(r.ok ? 200 : 400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(r));
+      }
+      if (req.method === 'GET' && parts[1] && !parts[2]) {   // per-person summary for the app
+        if (!enrolled) loadEnrolled();
+        const name = parts[1].toLowerCase();
+        if (!enrolled[name] && !enrolledFaces[name]) { res.writeHead(404, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, reason: 'unknown' })); }
+        res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: true, ...personSummary(name) }));
       }
       if (req.method === 'DELETE' && parts[1]) {
         const r = forgetPerson(parts[1]);

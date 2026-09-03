@@ -349,6 +349,18 @@ Embeddings are JSON under `nest_models/identity/<name>/`; raw audio or the
 aligned 112x112 face crop are kept only with `identity_keep_samples`. The
 add-on never decides who someone is or enrols on its own.
 
+### Verification backlog and onboarding
+
+Samples the add-on could enrol but cannot attribute confidently are parked
+for an admin (never under `www/`): `GET /identity/pending` lists them with a
+`media_url` (clip or crop), `POST /identity/pending/<id>/label {name}`
+enrols one, `POST /identity/pending/<id>/unknown` marks a visitor (kept as a
+negative for 30 days so they are not queued again), `DELETE` drops one.
+`nest_headless_identity_pending` {count, newest?} keeps a badge honest.
+Retention: 7 days or 200 samples. Onboarding from a phone: voice enrol with
+`{name, audio_b64, phrase?}` (16-bit WAV, 3-10 s) several times per person;
+face enrol with `pose`; `GET /identity/<name>` shows what is held.
+
 ## Follow-up window and the API token
 
 `POST /listen/<camera>?seconds=8&reason=after_tts` opens a speech capture
