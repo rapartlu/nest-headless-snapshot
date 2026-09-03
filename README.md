@@ -58,11 +58,13 @@ choosing who to tell — belongs to a separate brain that consumes the events
 
 ## Privacy stance
 
-- Audio is processed in memory. Utterance audio is held for 90 s so a brain
-  can fetch it, then gone. With `wake_by_transcript` on, every spoken sentence in
+- Audio is processed in memory. Utterance audio is held in memory so a brain
+  can fetch it (24 h for speech addressed to the house, 90 s otherwise), then
+  gone; it never touches disk. With `wake_by_transcript` on, every spoken sentence in
   range of a microphone is transcribed locally and discarded at once unless
   it was addressed to the house (wake phrase, or an open reply window); it
-  is off by default. Nothing is kept on disk except: enrolment samples
+  is off by default. Nothing is kept on disk except the frame archive (heartbeat frames and the
+  frames behind events, under your HA `www/` like any camera still), enrolment samples
   if you enable `identity_keep_samples`, and — if you use the verification
   backlog — short clips and face crops the add-on could not attribute, kept
   for at most 7 days for an admin to label or drop.

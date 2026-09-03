@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.14.0
+
+- Evidence by reference (#21). Every frame the add-on judges is noted in a
+  per-camera memory ring, and the frames behind events are written to the
+  archive under `<camera>_events/`; `GET /archive/<camera>/<time>.jpg`
+  (ISO, stamp or epoch ms; `?within=ms`, default 120 s) answers with the
+  nearest frame from memory, the event archive or the heartbeat archive
+  (`X-Frame-At`, `X-Frame-Source`, `X-Frame-Distance-Ms`).
+- Events carry `frame_at` and `boxes` (`[{label, score?, name?, x, y, w, h}]`
+  in frame fractions): passage (passage zone, tracked person, faces),
+  passage_look (faces), zone_change and zone_state (zone, people nearby),
+  surface_activity (surface, detections), speech (faces sampled at the
+  wake, when already in hand) and identity (`frame_at`).
+- Zone changes keep a before|after composite under
+  `<camera>_zones/<zone>/` and name it on the event as `look_url`;
+  `GET /look/zones/<camera>/<zone>/<time>.jpg` serves the nearest.
+- Utterances the house was addressed on stay in memory for 24 h (cap 300,
+  oldest out; gone on restart) instead of 90 s; `audio_ttl_s` says which.
+
 ## 1.13.5
 
 - Second look as a series (#7): `look: {camera, delay_ms, until_ms (<= 8 s),

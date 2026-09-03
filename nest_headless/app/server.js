@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.13.5';
+const ADDON_VERSION = '1.14.0';
 
 const http = require('http');
 const fs = require('fs');
@@ -44,6 +44,7 @@ const faces = require('./faces');
 const { PendingStore } = require('./pending');
 const diskq = require('./diskq');
 const { SegmentTracker } = require('./segments');
+const evidence = require('./evidence');
 
 // ------------------------------------------------------------ configuration
 // HA config root: the supervisor mounts it at /homeassistant (or /config on
@@ -537,6 +538,37 @@ function sampleIndex(entityId, suffix = '') {
   if (!dirIndexes.has(dir)) dirIndexes.set(dir, new diskq.DirIndex(dir));
   return dirIndexes.get(dir);
 }
+// ---- evidence by reference (#21): every frame node handles goes into a
+// per-camera memory ring (exact frames for the last minute or two); frames
+// behind events are also written to <camera>_events/ in the archive, and
+// GET /archive/<camera>/<time>.jpg answers with the nearest of either.
+const frameRings = {};
+function noteFrame(entityId, jpg, t = Date.now()) {
+  (frameRings[entityId] || (frameRings[entityId] = new evidence.FrameRing(90))).push(t, jpg);
+  return t;
+}
+function keepEventFrame(entityId, t, jpg) {
+  if (!cfg.samplesDir || !jpg) return;
+  sampleIndex(entityId, '_events').put(evidence.stampOf(t) + '.jpg', jpg, { max: 600, dropN: 60 }).catch(() => {});
+}
+// nearest frame to t: memory ring, then the event archive, then the heartbeat archive
+async function frameNear(entityId, t, withinMs) {
+  const cands = [];
+  const r = frameRings[entityId] && frameRings[entityId].nearest(t);
+  if (r) cands.push({ dt: r.dt, t: r.t, source: 'memory', jpg: r.jpg });
+  if (cfg.samplesDir) {
+    for (const [suffix, source] of [['_events', 'events'], ['', 'archive']]) {
+      const ix = sampleIndex(entityId, suffix);
+      const n = evidence.nearestName(await ix.load(), t);
+      if (n) cands.push({ dt: n.dt, t: n.t, source, file: path.join(ix.dir, n.name) });
+    }
+  }
+  const best = cands.sort((a, b) => a.dt - b.dt)[0];
+  if (!best || best.dt > withinMs) return null;
+  if (!best.jpg) best.jpg = await require('fs/promises').readFile(best.file);
+  return best;
+}
+const boxOf = (b) => ({ x: r4(b.x), y: r4(b.y), w: r4(b.w), h: r4(b.h) });
 const lastArchiveMs = {};
 function archiveSample(entityId, buf) {
   // keep the training archive at a sane cadence however often frames flow
@@ -667,6 +699,15 @@ async function passageTick(entityId, mgr, frameBuf, now) {
       const face = seen.find(inBox) || (seen.length === 1 && persons.length === 1 ? seen[0] : null);
       if (face) ev.person = { ...ev.person, matches: face.matches, name: face.name, score: face.score, size_px: face.size_px };
       ev.faces = seen;
+      // evidence (#21): the frame this came from, and the boxes on it
+      const zone = passages.find((p) => p.name === ev.passage);
+      ev.frame_at = new Date(now).toISOString();
+      ev.boxes = [
+        ...(zone ? [{ label: 'passage:' + zone.name, ...boxOf(zone) }] : []),
+        ...(t ? [{ label: 'person', track_id: ev.track_id, ...boxOf(t.box) }] : []),
+        ...seen.map((f) => ({ label: 'face', name: f.name, score: f.score, size_px: f.size_px, ...boxOf(f.box) })),
+      ];
+      keepEventFrame(entityId, now, frameBuf);
       console.log(`[nest_headless] PASSAGE ${ev.direction} ${ev.passage} on ${entityId} track ${ev.track_id} h=${ev.attributes.height_ratio} carrying=${ev.attributes.carrying} who=${ev.person.matches[0] ? ev.person.matches[0].name + ':' + ev.person.matches[0].score : '-'} faces=${seen.length}`);
       postHaEvent('nest_headless_passage', { entity_id: entityId, camera: entityId.replace(/^camera\./, ''), ...ev }).catch(() => {});
       scheduleSecondLook(entityId, ev, passages.find((p) => p.name === ev.passage));
@@ -694,17 +735,18 @@ function scheduleSecondLook(fromEntity, ev, zone) {
     // the face is ~30 px; it reaches the identification floor a few seconds
     // in. Frames are the held stream's own (no vendor command). Stop at the
     // first face large enough to embed; otherwise report the largest seen.
-    let attempts = 0, bestEmbedded = null, largest = null, lastList = [], lastReason = null, atMs = delay_ms;
+    let attempts = 0, bestEmbedded = null, largest = null, lastList = [], lastReason = null, atMs = delay_ms, lastAt = null;
     try {
       for (let t = delay_ms; t <= until_ms; t += every_ms) {
         await sleep(Math.max(0, t0 + t - Date.now()));
         attempts++;
         const r = await facesForCamera(camera);
         lastReason = r.ok ? null : (r.reason || 'no_frame');
+        lastAt = r.at || Date.now();
         lastList = (r.faces || []).map(faceSummary);
         for (const f of lastList) if (!largest || f.size_px > largest.size_px) largest = f;
         const embedded = lastList.filter((f) => f.matches.length && f.size_px >= min_face_px).sort((a, b) => b.score - a.score)[0];
-        if (embedded) { bestEmbedded = embedded; atMs = t; break; }
+        if (embedded) { bestEmbedded = embedded; atMs = t; keepEventFrame(camera, lastAt, r.jpg); break; }
         atMs = t;
       }
       const best = bestEmbedded;
@@ -714,6 +756,8 @@ function scheduleSecondLook(fromEntity, ev, zone) {
         entity_id: camera, camera: camera.replace(/^camera\./, ''), from_camera: fromEntity.replace(/^camera\./, ''),
         passage: ev.passage, direction: ev.direction, track_id: ev.track_id,
         delay_ms, until_ms, every_ms, min_face_px, attempts, at_ms: atMs, ok: !!best, reason,
+        frame_at: lastAt ? new Date(lastAt).toISOString() : null,
+        boxes: (best ? lastList : (largest ? [largest] : lastList)).map((f) => ({ label: 'face', name: f.name, score: f.score, size_px: f.size_px, ...boxOf(f.box) })),
         faces: best ? lastList : (largest ? [largest] : lastList),
         person: best ? { name: best.name, score: best.score, size_px: best.size_px, matches: best.matches } : null,
       }).catch(() => {});
@@ -747,6 +791,15 @@ function zoneMask(z) {
   for (let y = 0; y < FP; y++) for (let x = 0; x < FP; x++) if (inPoly(z.x + (x + 0.5) / FP * z.w, z.y + (y + 0.5) / FP * z.h)) m[y * FP + x] = 1;
   z.mask48 = m;
   return m;
+}
+// before | after crops side by side (same height), for the app's evidence view (#21)
+async function zonePairComposite(sharp, before, after) {
+  const [a, b] = await Promise.all([sharp(before).metadata(), sharp(after).metadata()]);
+  const h = Math.min(a.height, b.height, 480);
+  const [ab, bb] = await Promise.all([sharp(before).resize({ height: h }).toBuffer({ resolveWithObject: true }), sharp(after).resize({ height: h }).toBuffer({ resolveWithObject: true })]);
+  const gap = 6;
+  return sharp({ create: { width: ab.info.width + gap + bb.info.width, height: h, channels: 3, background: { r: 255, g: 210, b: 0 } } })
+    .composite([{ input: ab.data, left: 0, top: 0 }, { input: bb.data, left: ab.info.width + gap, top: 0 }]).jpeg({ quality: 88 }).toBuffer();
 }
 async function zoneCrops(sharp, jpg, W, H, z) {
   const left = Math.max(0, Math.round(z.x * W)), top = Math.max(0, Math.round(z.y * H));
@@ -793,6 +846,7 @@ async function zoneClassifyTick(entityId, mgr) {
   if (!shot || shot.meanLuma < 3) return;
   const jpg = Buffer.from(shot.dataUrl.split(',')[1], 'base64');
   const W = shot.width, H = shot.height, now = Date.now();
+  noteFrame(entityId, jpg, now);   // evidence ring (#21)
   mgr.zones = mgr.zones || {};
   for (const z of zones) {
     const st = mgr.zones[z.name] || (mgr.zones[z.name] = { state: null, score: null, ticks: [], since: null, model: false, ref: null, refJpeg: null, refSince: null, steady: 0, changed: 0, lastChangeMs: 0, diff: 0 });
@@ -808,11 +862,23 @@ async function zoneClassifyTick(entityId, mgr) {
         const people = await peopleNear(entityId, jpg, c.rect);
         const recent = (mgr.recentNames || []).filter((r) => now - r.t < 60000).map((r) => r.name);
         console.log(`[nest_headless] ZONE CHANGE ${z.name} on ${entityId}: diff ${st.diff} vs reference held ${Math.round((now - st.refSince) / 1000)}s; people ${people.length}${people.some((p) => p.name) ? ' (' + people.filter((p) => p.name).map((p) => p.name).join(',') + ')' : ''}`);
+        // evidence (#21): the frame, the boxes, and a before|after composite
+        // kept under <camera>_zones/<zone>/ for GET /look/zones/...
+        keepEventFrame(entityId, now, jpg);
+        let lookUrl = null;
+        if (cfg.samplesDir) {
+          lookUrl = `/look/zones/${entityId.replace(/^camera\./, '')}/${z.name}/${evidence.stampOf(now)}.jpg`;
+          zonePairComposite(sharp, st.refJpeg, c.jpeg)
+            .then((buf) => sampleIndex(entityId, '_zones/' + z.name).put(evidence.stampOf(now) + '.jpg', buf, { max: 200, dropN: 20 }))
+            .catch((e) => console.warn(`[nest_headless] zone pair ${z.name} failed: ${e.message}`));
+        }
         postHaEvent('nest_headless_zone_change', {
           entity_id: entityId, camera: entityId.replace(/^camera\./, ''), zone: z.name, t: new Date(now).toISOString(),
           diff: st.diff, reference_held_s: Math.round((now - st.refSince) / 1000),
           before_jpeg_b64: st.refJpeg.toString('base64'), after_jpeg_b64: c.jpeg.toString('base64'),
           people_nearby: people, recent_names: [...new Set(recent)],
+          frame_at: new Date(now).toISOString(), look_url: lookUrl,
+          boxes: [{ label: 'zone:' + z.name, ...boxOf(c.rect) }, ...people.map((p) => ({ label: 'person', name: p.name, score: p.score, ...boxOf(p.box) }))],
         }).catch(() => {});
         st.lastChangeMs = now;
       }
@@ -839,7 +905,10 @@ async function zoneClassifyTick(entityId, mgr) {
         postHaEvent('nest_headless_zone_state', {
           entity_id: entityId, camera: entityId.replace(/^camera\./, ''), zone: z.name, label: z.name,
           state: next, previous: prev, score: v.score, previous_duration_s: prevDuration, t: new Date(now).toISOString(), people_nearby: people,
+          frame_at: new Date(now).toISOString(),
+          boxes: [{ label: 'zone:' + z.name, ...boxOf(c.rect) }, ...people.map((p) => ({ label: 'person', name: p.name, score: p.score, ...boxOf(p.box) }))],
         }).catch(() => {});
+        keepEventFrame(entityId, now, jpg);
       }
     }
   }
@@ -913,8 +982,10 @@ async function watchHit(entityId, payload) {
   // resolution for its first seconds, which diffs like motion (fired a
   // phantom deterrent 6s after a restart). Ignore hits until it settles.
   if (now - (mgr.readySinceMs || 0) < 45000) return;
+  const hitFrame = Buffer.from(payload.dataUrl.split(',')[1], 'base64');
+  if (payload.meanLuma >= 3) noteFrame(entityId, hitFrame, now);   // evidence ring (#21)
   if ((cfg.watchPassages[entityId] || []).length && payload.meanLuma >= 3) {
-    passageTick(entityId, mgr, Buffer.from(payload.dataUrl.split(',')[1], 'base64'), now).catch(() => {});
+    passageTick(entityId, mgr, hitFrame, now).catch(() => {});
   }
   if (String(payload.roi || '').startsWith('passage:')) return;   // doorway motion: tracked above, not a surface hit
   // Detection PACING, not the alert cooldown: the old shared 60s cooldown
@@ -947,6 +1018,8 @@ async function watchHit(entityId, payload) {
   if (verdict === false) return;
   if (now - mgr.lastHitMs < cfg.watchCooldownSeconds * 1000) return; // alert repeat throttle
   mgr.lastHitMs = now;
+  keepEventFrame(entityId, now, frameBuf);
+  const roiZone = (cfg.watchRois[entityId] || []).find((r) => r.name === payload.roi);
   await postHaEvent('nest_headless_surface_activity', {
     entity_id: entityId,
     camera: entityId.replace(/^camera\./, ''),
@@ -955,6 +1028,11 @@ async function watchHit(entityId, payload) {
     cat: verdict,
     detections: dets ? dets.slice(0, 5) : null,
     people: await countPeople(frameBuf),
+    frame_at: new Date(now).toISOString(),
+    boxes: [
+      ...(roiZone ? [{ label: 'surface:' + roiZone.name, ...boxOf(roiZone) }] : []),
+      ...(dets || []).slice(0, 8).map((d) => ({ label: d.name, score: d.conf, roi: d.roi || null, ...boxOf(d.box) })),
+    ],
   });
 }
 
@@ -1230,7 +1308,12 @@ async function facesForCamera(entityId, { minPx = 40 } = {}) {
   if (!mgr || !mgr.ready || !mgr.page) return { ok: false, reason: 'camera_not_watched', faces: [] };
   if (!faces.hasModels(FACE_MODELS_DIR())) return { ok: false, reason: 'no_face_models', faces: [] };
   const shot = await mgr.page.evaluate(fns.grabFrame, { quality: cfg.jpegQuality, crop: null });
-  return facesInBuffer(Buffer.from(shot.dataUrl.split(',')[1], 'base64'), { minPx, camera: entityId });
+  const jpg = Buffer.from(shot.dataUrl.split(',')[1], 'base64');
+  const at = noteFrame(entityId, jpg);
+  const r = await facesInBuffer(jpg, { minPx, camera: entityId });
+  r.at = at; r.jpg = jpg;
+  for (const f of r.faces || []) f.at = at;
+  return r;
 }
 const r4 = (v) => Math.round(v * 10000) / 10000;
 const publicFace = (f) => ({ name: f.name, score: f.score, box: f.box, quality: f.quality, matches: f.matches });
@@ -1248,7 +1331,7 @@ async function sampleFacesForCapture(entityId) {
   for (const f of out.sort((x, y) => y.box.w * y.box.h - x.box.w * x.box.h)) {
     if (!keep.some((k) => Math.abs(k.box.x - f.box.x) < 0.05 && Math.abs(k.box.y - f.box.y) < 0.05)) keep.push(f);
   }
-  return keep.map(publicFace);
+  return keep.map((f) => ({ ...publicFace(f), at: f.at || null }));
 }
 // ------------------------------------------------------------ verification backlog (Hearth #16)
 // Good-quality samples whose match is ambiguous or unknown are parked for an
@@ -1500,9 +1583,15 @@ function matchVoice(embedding) {
 }
 // recent utterances kept 90 s for enrolment: id -> {camera, samples, quality, embedding, at}
 const utterances = new Map();
-function rememberUtterance(id, u) {
+// Utterances the house was addressed on stay in memory for UTTERANCE_KEEP_MS
+// (24 h, cap UTTERANCE_MAX oldest-out) so the app can play the evidence
+// behind a decision (#21); the rest 90 s. Memory only: gone on restart,
+// never on disk here.
+const UTTERANCE_KEEP_MS = 24 * 3600000, UTTERANCE_MAX = 300;
+function rememberUtterance(id, u, keepMs = 90000) {
   utterances.set(id, u);
-  setTimeout(() => utterances.delete(id), 90000).unref();
+  setTimeout(() => utterances.delete(id), keepMs).unref();
+  if (utterances.size > UTTERANCE_MAX) { const oldest = [...utterances.entries()].sort((a, b) => a[1].at - b[1].at)[0]; if (oldest) utterances.delete(oldest[0]); }
 }
 function latestUtterance(entityId) {
   let best = null;
@@ -1604,6 +1693,8 @@ function startSpeechCapture(entityId, keyword, ring, opts = {}) {
     // faces at the wake moment (+1 s), in parallel with the capture; used by the identity event
     facesPromise: faces.hasModels(FACE_MODELS_DIR()) ? sampleFacesForCapture(entityId) : null,
   };
+  const c0 = speechCap[entityId];
+  if (c0.facesPromise) c0.facesPromise.then((v) => { c0.facesResult = v; }).catch(() => {});
 }
 // End-pointing (Hearth #3). The spotter fires mid-phrase ("hey cl..."), so
 // the audio after the hit starts with the wake phrase's own tail; counting
@@ -1866,6 +1957,7 @@ async function finishSpeechCapture(entityId, c, reason) {
   const durationMs = Math.round(all.length / 16);
   const utteranceId = `${entityId.replace(/^camera\./, '')}-${c.t0}`;
   const closeToEventMs = Date.now() - tClose;
+  const seenFaces = c.facesResult || [];   // faces already sampled (never awaited here: the transcript must not wait)
   console.log(`[nest_headless] SPEECH "${text}" on ${entityId} (${durationMs} ms, ${reason}, ${stt ? stt.engine : 'no-stt'} ${sttMs} ms${speculative ? ' speculative' : ''}, close->event ${closeToEventMs} ms, wake ${wakeConfirmed ? 'confirmed' : 'unconfirmed'})`);
   await postHaEvent('nest_headless_speech', {
     entity_id: entityId, camera: entityId.replace(/^camera\./, ''), keyword: c.keyword,
@@ -1880,12 +1972,15 @@ async function finishSpeechCapture(entityId, c, reason) {
     // (kitchen + hallway both heard "hey kitchen" at 08:19); the brain dedupes on this
     concurrent_cameras: Object.entries(recentCaptureStart).filter(([cam, t0]) => cam !== entityId && Math.abs(t0 - c.t0) < 1500).map(([cam]) => cam.replace(/^camera\./, '')),
     // raw 16 kHz mono WAV, memory-held for 90 s, for a stronger recogniser on the brain
-    audio_path: `/utterance/${utteranceId}.wav`, audio_ttl_s: 90,
+    audio_path: `/utterance/${utteranceId}.wav`, audio_ttl_s: (wakeConfirmed || c.followUp) ? UTTERANCE_KEEP_MS / 1000 : 90,
+    // evidence (#21): the faces sampled for this capture, and when
+    ...(seenFaces.length ? { frame_at: new Date(Math.max(...seenFaces.map((f) => f.at || 0)) || Date.now()).toISOString(),
+      boxes: seenFaces.map((f) => ({ label: 'face', name: f.name, score: f.score, size_px: f.quality && f.quality.size_px, ...boxOf(f.box) })) } : {}),
   });
   // Identity follows as its own event so it can never delay the transcript.
   const quality = voiceQuality(c, all);
   const u = { camera: entityId, samples: all, quality, embedding: null, at: Date.now() };
-  rememberUtterance(utteranceId, u);
+  rememberUtterance(utteranceId, u, (wakeConfirmed || c.followUp) ? UTTERANCE_KEEP_MS : 90000);
   try {
     if (quality.reason === 'ok' || quality.speech_ms >= 800) u.embedding = embedVoice(all);
     const matches = u.embedding ? matchVoice(u.embedding) : [];
@@ -1897,6 +1992,7 @@ async function finishSpeechCapture(entityId, c, reason) {
     await postHaEvent('nest_headless_identity', {
       entity_id: entityId, camera: entityId.replace(/^camera\./, ''), utterance_id: utteranceId,
       speaker: { quality, matches }, faces: seen,
+      frame_at: seen.length ? new Date(Math.max(...seen.map((f) => f.at || 0)) || Date.now()).toISOString() : null,
     });
   } catch (e) { console.warn('[nest_headless] identity failed:', e.message); }
 }
@@ -2230,6 +2326,31 @@ const server = http.createServer(async (req, res) => {
       serveFile(res, cameraEntity(parts[1].replace(/\.jpg$/, '')));
       return;
     }
+    // ---- evidence by reference (#21)
+    // GET /archive/<camera>/<iso|stamp|epoch-ms>.jpg[?within=ms] -> the frame
+    // nearest that time (memory ring, event archive, heartbeat archive),
+    // with X-Frame-At / X-Frame-Source / X-Frame-Distance-Ms; 404 if none within.
+    if (parts[0] === 'archive' && parts[1] && parts[2]) {
+      const t = evidence.parseTime(parts[2]);
+      if (t === null) { res.writeHead(400); return res.end('bad time'); }
+      const within = Math.max(1000, Math.min(3600000, Number(url.searchParams.get('within')) || 120000));
+      const f = await frameNear(cameraEntity(parts[1]), t, within);
+      if (!f) { res.writeHead(404); return res.end('no frame within range'); }
+      res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Content-Length': f.jpg.length, 'X-Frame-At': new Date(f.t).toISOString(), 'X-Frame-Source': f.source, 'X-Frame-Distance-Ms': String(f.dt), 'Cache-Control': 'max-age=86400' });
+      return res.end(f.jpg);
+    }
+    // GET /look/zones/<camera>/<zone>/<time>.jpg -> the before|after composite nearest that time
+    if (parts[0] === 'look' && parts[1] === 'zones' && parts[2] && parts[3] && parts[4]) {
+      if (!cfg.samplesDir || !/^[a-z0-9_-]{1,32}$/i.test(parts[3])) { res.writeHead(404); return res.end('no zone evidence'); }
+      const t = evidence.parseTime(parts[4]);
+      if (t === null) { res.writeHead(400); return res.end('bad time'); }
+      const ix = sampleIndex(cameraEntity(parts[2]), '_zones/' + parts[3]);
+      const n = evidence.nearestName(await ix.load(), t);
+      if (!n || n.dt > 600000) { res.writeHead(404); return res.end('no zone evidence within range'); }
+      const buf = await require('fs/promises').readFile(path.join(ix.dir, n.name));
+      res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Content-Length': buf.length, 'X-Frame-At': new Date(n.t).toISOString(), 'X-Frame-Distance-Ms': String(n.dt), 'Cache-Control': 'max-age=86400' });
+      return res.end(buf);
+    }
     if (parts[0] === 'audiodebug' && parts[1]) {
       const cam = 'camera.' + parts[1].replace(/\.wav$/, '');
       const st = kwsCtx && kwsCtx.streams && kwsCtx.streams[cam];
@@ -2245,9 +2366,10 @@ const server = http.createServer(async (req, res) => {
     }
     if (parts[0] === 'utterance' && parts[1]) {
       // the audio behind a nest_headless_speech event (utterance_id), while it
-      // is still in memory (90 s); never written to disk here
+      // is still in memory (24 h for speech addressed to the house, else 90 s;
+      // gone on restart); never written to disk here
       const u = utterances.get(parts[1].replace(/\.wav$/, ''));
-      if (!u || !u.samples) { res.writeHead(404); return res.end('no such utterance (expired after 90 s?)'); }
+      if (!u || !u.samples) { res.writeHead(404); return res.end('no such utterance (expired, or the service restarted)'); }
       const pcm = Buffer.alloc(u.samples.length * 2);
       for (let i = 0; i < u.samples.length; i++) pcm.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(u.samples[i] * 32767))), i * 2);
       const h = Buffer.alloc(44);

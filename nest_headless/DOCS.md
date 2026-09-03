@@ -467,6 +467,28 @@ or posting it. `host/whisper_server.py` serves either `STT_ENGINE=mlx-whisper`
 (Parakeet-TDT 0.6B v3), always from worker processes (`WHISPER_WORKERS`).
 
 
+## Evidence by reference
+
+A brain that explains a decision needs the frame it came from. Every frame
+the add-on judges goes into a per-camera memory ring, frames behind events
+are kept in the archive under `<camera>_events/`, and:
+
+- `GET /archive/<camera>/<time>.jpg[?within=ms]` returns the nearest frame
+  to `time` (ISO 8601, a `2026-09-03T16-24-52-317Z` stamp, or epoch ms) from
+  memory, the event archive or the heartbeat archive; `X-Frame-At`,
+  `X-Frame-Source` (memory | events | archive) and `X-Frame-Distance-Ms`
+  say what you got; 404 beyond `within` (default 120 s).
+- Events carry `frame_at` and `boxes: [{label, x, y, w, h, score?, name?}]`
+  in frame fractions - the passage zone, the tracked person and faces on a
+  passage; the zone and people nearby on zone events; the surface and the
+  detections on surface activity; the faces on speech and identity - so a
+  viewer can draw the frame as the add-on saw it.
+- Zone changes keep a before|after composite; the event names it as
+  `look_url` and `GET /look/zones/<camera>/<zone>/<time>.jpg` serves the
+  nearest one.
+- `/utterance/<id>.wav` stays available for 24 h for speech addressed to the
+  house (memory only, cap 300, gone on restart); other captures 90 s.
+
 ## Zones API (the app's zone editor)
 
 - `GET /zones` -> `{version, frame: {w, h}, cameras: {<camera>: {surfaces,
