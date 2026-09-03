@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.16.2';
+const ADDON_VERSION = '1.16.3';
 
 const http = require('http');
 const fs = require('fs');
@@ -1389,7 +1389,7 @@ function enrolCat(name, source, found, index) {
   // the same crop sent twice teaches nothing: a near-identical descriptor already held is a duplicate (1.15.1)
   if (!enrolled) loadEnrolled();
   const existing = enrolledCats[name] || [];
-  if (existing.some((it) => catid.cosine(pick._emb, it.embedding, !!pick._sized, it.sized) >= 0.995)) return { ok: true, accepted: false, reason: 'duplicate', samples: existing.length };
+  if (existing.some((it) => it.v === catid.VERSION && catid.cosine(pick._emb, it.embedding, !!pick._sized, it.sized) >= 0.995)) return { ok: true, accepted: false, reason: 'duplicate', samples: existing.length };   // stale (older-descriptor) samples never block a re-enrolment
   const d = path.join(cfg.identityDir, name);
   fs.mkdirSync(d, { recursive: true });
   // cap per cat: the oldest photo sample goes first, room samples last

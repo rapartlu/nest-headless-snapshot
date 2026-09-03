@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.16.3
+
+- Cat enrolment's duplicate guard ignores stale (older-descriptor) samples,
+  so re-enrolling the same photo after a descriptor change is accepted.
+
 ## 1.16.2
 
 - Cat descriptor v2 (#23): the detection box's colour histogram has its
