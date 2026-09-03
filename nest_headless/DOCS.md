@@ -421,6 +421,14 @@ closes it; `DELETE /listen/<camera>` closes it early, which the brain should
 do before it plays a reply on the speaker, or the house will hear itself.
 `GET /` lists open windows under `conversations`.
 
+Latency notes: the speculative transcription begins at 250 ms of closing
+quiet and its text is published as `nest_headless_speech_partial` (`final:
+false`, same `utterance_id` as the final event) for captures the house was
+addressed on, so a brain can begin its turn early and confirm against the
+final; a transcript ending in a question mark closes the capture at 400 ms
+of quiet. A sentence two microphones hear is transcribed once (the second
+camera's copy is dropped; `concurrent_cameras` still names it).
+
 `POST /listen/<camera>?seconds=8&reason=after_tts` opens a speech capture
 without a wake word (for the brain, right after it has spoken): same
 end-pointing, same `nest_headless_speech` with `keyword: "follow-up"`,

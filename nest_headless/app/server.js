@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.13.1';
+const ADDON_VERSION = '1.13.3';
 
 const http = require('http');
 const fs = require('fs');
@@ -1529,8 +1529,11 @@ function startSpeechCapture(entityId, keyword, ring, opts = {}) {
   const rmses = ring.map(rmsOf).sort((a, b) => a - b);
   const floor = Math.min(0.015, Math.max(0.006, (rmses[Math.floor(rmses.length * 0.1)] || 0.006) * 3));
   const t0 = Date.now();
+  // another camera already capturing the same sentence (started within 1.5 s): this one is its twin and skips the speculative pass
+  const twin = Object.entries(recentCaptureStart).find(([cam, at]) => cam !== entityId && Math.abs(at - t0) < 1500 && speechCap[cam]);
   recentCaptureStart[entityId] = t0;
   speechCap[entityId] = {
+    twinOf: twin ? twin[0] : null,
     keyword, chunks: [...pre], startedAt: new Date(), t0,
     floor, phase: opts.followUp ? 'listen' : 'tail', tailQuietMs: 0, keepFrom: opts.followUp ? 0 : pre.length,
     listenT0: opts.followUp ? Date.now() : null, voicedMs: 0, silenceMs: 0,
@@ -1552,6 +1555,23 @@ function startSpeechCapture(entityId, keyword, ring, opts = {}) {
 //            >= 500 ms voiced before `speech_silence_ms` of quiet can close
 //            it; speech_max_seconds is the hard stop throughout.
 const TAIL_GAP_MS = 300, TAIL_MAX_MS = 1200, SPEECH_MIN_VOICED_MS = 500, SPEECH_INITIAL_QUIET_MS = 3000;
+// Provisional transcript from the speculative pass (final: false). Only for
+// captures the house was addressed on (a wake word or a reply window), and
+// only when the wake phrase is actually in it for wake captures, so ordinary
+// talk after a spotter false alarm never goes out early.
+function postPartial(entityId, c, r) {
+  try {
+    const wake = !!r.text && (WAKE_RE.test(r.text) || WAKE_HEAD_RE.test(r.text));
+    if (!c.followUp && !wake) return;
+    const text = stripWakePhrase(r.text);
+    if (!text) return;
+    postHaEvent('nest_headless_speech_partial', {
+      entity_id: entityId, camera: entityId.replace(/^camera\./, ''), utterance_id: `${entityId.replace(/^camera\./, '')}-${c.t0}`,
+      text, engine: r.engine, final: false, wake_confirmed: wake,
+      ...(c.followUp ? { opened_by: c.openedBy || null, open_reason: c.openReason || null } : {}),
+    }).catch(() => {});
+  } catch (e) { /* provisional only */ }
+}
 function feedSpeechCapture(entityId, chunk) {
   const c = speechCap[entityId];
   if (!c) return;
@@ -1577,13 +1597,22 @@ function feedSpeechCapture(entityId, chunk) {
     const voiced = rms > quietBelow;
     if (voiced) { c.voicedMs += ms; c.silenceMs = 0; if (c.spec) c.specStale = true; } else c.silenceMs += ms;
     const spoke = c.voicedMs >= SPEECH_MIN_VOICED_MS, listened = Date.now() - c.listenT0;
-    // Speculative transcription during the closing silence (see finishSpeechCapture)
-    if (spoke && !voiced && c.silenceMs >= 350 && c.silenceMs < cfg.speechSilenceMs && (!c.spec || c.specStale)) {
+    // Speculative transcription during the closing silence (see
+    // finishSpeechCapture): started at 250 ms of quiet (the recogniser is
+    // fast enough now), skipped on the twin capture of a sentence two mics
+    // heard. Its text also goes out as nest_headless_speech_partial so the
+    // brain can start thinking before the window closes, and a transcript
+    // ending in a question mark closes the capture at 400 ms of quiet
+    // instead of the full speech_silence_ms: a question is done when asked.
+    if (spoke && !voiced && c.silenceMs >= 250 && c.silenceMs < cfg.speechSilenceMs && (!c.spec || c.specStale) && !c.twinOf) {
       const kept = c.chunks.slice(Math.min(c.keepFrom || 0, Math.max(0, c.chunks.length - 1)));
-      c.specStale = false;
-      c.spec = transcribeSamples(samplesFromChunks(kept));
+      c.specStale = false; c.specText = null;
+      const p = transcribeSamples(samplesFromChunks(kept));
+      c.spec = p;
+      p.then((r) => { if (c.spec === p && !c.specStale) { c.specText = r.text; postPartial(entityId, c, r); } }).catch(() => {});
     }
-    if (spoke && c.silenceMs >= cfg.speechSilenceMs) reason = 'silence';
+    const questionDone = !!c.specText && !c.specStale && /\?["')\]]*\s*$/.test(c.specText) && c.silenceMs >= 400;
+    if (spoke && (c.silenceMs >= cfg.speechSilenceMs || questionDone)) reason = 'silence';
     else if (!c.voicedMs && listened >= (c.giveUpMs || SPEECH_INITIAL_QUIET_MS)) reason = 'no_speech';
     else if (!spoke && c.voicedMs && c.silenceMs >= 2000) reason = 'no_speech';   // a grunt, then nothing
     else if (elapsed >= cfg.speechMaxSeconds * 1000) reason = spoke ? 'max_seconds' : 'no_speech';
@@ -1740,7 +1769,10 @@ async function finishSpeechCapture(entityId, c, reason) {
   // decides - but flagged, so an 8 s ramble after a false wake is cheap to
   // discard.
   const text0 = text;
-  const wakeConfirmed = !!text && (WAKE_RE.test(text) || WAKE_HEAD_RE.test(text));
+  // A segment has its whole start, so it must carry the full wake phrase; the
+  // bare-name rule exists only for spotter captures whose pre-roll may have
+  // cut the "hey" (a hallway sentence beginning "kitchen speaker" once passed).
+  const wakeConfirmed = !!text && (WAKE_RE.test(text) || (!c.fromSegment && WAKE_HEAD_RE.test(text)));
   text = stripWakePhrase(text);
   // Whisper's stage directions - "(baby crying)", "[inaudible]", "(background
   // noise drowns out speaker)" - are not something the brain should parse.
@@ -1824,6 +1856,11 @@ function segFeed(entityId, chunk, rms) {
   const seg = tr.feed(chunk, rms);
   if (!seg) return;
   const w = convo[entityId] && convo[entityId].until > Date.now() ? convo[entityId] : null;
+  // The same sentence reaching two microphones: whichever camera is already
+  // capturing or deciding on it (started within 1.5 s) owns it; this copy is
+  // dropped unheard rather than spending a second recogniser call.
+  const twin = Object.entries(recentCaptureStart).find(([cam, t0]) => cam !== entityId && Math.abs(t0 - seg.startedMs) < 1500 && (speechCap[cam] || segPending[cam]));
+  if (twin) { segStat(entityId, 'segments_duplicate'); return; }
   segStat(entityId, 'segments');
   recentCaptureStart[entityId] = seg.startedMs;
   segPending[entityId] = true;

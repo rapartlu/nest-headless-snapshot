@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.13.3
+
+- Transcript wake path: a segment must carry the full wake phrase ("hey"
+  plus the name); the bare-name rule stays reserved for spotter captures
+  whose pre-roll can cut the "hey". A hallway sentence beginning "kitchen
+  speaker" had passed as a wake.
+
+## 1.13.2
+
+- Latency: the speculative transcription starts at 250 ms of closing quiet
+  (was 350), its text goes out as `nest_headless_speech_partial`
+  (`final: false`, only for captures the house was addressed on) so a brain
+  can start its turn before the window closes, and a transcript ending in a
+  question mark closes the capture at 400 ms of quiet instead of the full
+  `speech_silence_ms`. A sentence two microphones hear is transcribed once:
+  the second camera's segment is dropped and its spotter capture skips the
+  speculative pass (`twinOf`). Measured before: duplicate calls queued on
+  the recogniser and pushed 0.2 s transcriptions to 1.2-1.6 s.
+
 ## 1.13.1
 
 - `POST /identity/voice/who` {audio_b64, format?} -> {quality, matches,
