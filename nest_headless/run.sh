@@ -63,6 +63,8 @@ if [ -f "$OPTS" ]; then
   [ -n "$STT_URL_OPT" ] && export STT_URL="$STT_URL_OPT"
   STT_SHADOW_OPT="$(jq -r '.stt_shadow_url // ""' "$OPTS")"
   [ -n "$STT_SHADOW_OPT" ] && export STT_SHADOW_URL="$STT_SHADOW_OPT"
+  STT_FALLBACK_OPT="$(jq -r '.stt_fallback_url // ""' "$OPTS")"
+  [ -n "$STT_FALLBACK_OPT" ] && export STT_FALLBACK_URL="$STT_FALLBACK_OPT"
   export IDENTITY_KEEP_SAMPLES="$(jq -r '.identity_keep_samples // false' "$OPTS")"
   export IDENTITY_AUTO_SAMPLES="$(jq -r '.identity_auto_samples // true' "$OPTS")"
 fi

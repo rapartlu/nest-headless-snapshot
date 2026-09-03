@@ -30,6 +30,7 @@ Options:
 | `stt_model_dir` | (empty) | in-process recogniser: a sherpa-onnx transducer or Whisper directory; empty = the spotter's own transducer |
 | `stt_url` | (empty) | external recogniser (`host/whisper_server.py` or whisper.cpp `whisper-server`), used ahead of the in-process one |
 | `stt_shadow_url` | (empty) | second recogniser for bake-offs; its text is only logged |
+| `stt_fallback_url` | (empty) | second server tried when `stt_url` fails, before the in-process recogniser (keep a different engine warm as the backup) |
 | `identity_keep_samples` | `false` | keep raw enrolment audio / aligned face crops on disk |
 | `identity_auto_samples` | `true` | keep an embedding-only room sample from each confident room voice match (12 per person, oldest auto sample out; consented samples never displaced) |
 | `watch_passages` | (empty) | doorway polygons with an optional `in=x,y` room-side point → `nest_headless_passage` |
@@ -405,6 +406,12 @@ unless the caller sends `Authorization: Bearer <token>` (`API_TOKEN` or
 Assistant. Denials are logged with the address.
 
 ## Recogniser bake-offs
+
+Two servers can stay warm with one primary: point `stt_url` at the engine
+you trust and `stt_fallback_url` at the other; `host/stt_switch.sh
+parakeet|whisper` swaps them and restarts the service. The authors ended a
+day-long shadow run with Parakeet primary: equal on commands, better on
+names, and silent on near-silence where Whisper produced text.
 
 `stt_shadow_url` sends every utterance to a second recogniser in parallel
 and logs its text as `SHADOW` lines next to the `SPEECH` line, without using

@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.12.7';
+const ADDON_VERSION = '1.12.8';
 
 const http = require('http');
 const fs = require('fs');
@@ -125,6 +125,7 @@ const cfg = {
   // Shadow recogniser for bake-offs: every utterance is also sent here and the
   // result only logged (SHADOW lines), never used or posted. Empty = off.
   sttShadowUrl: (process.env.STT_SHADOW_URL || '').replace(/\/+$/, ''),
+  sttFallbackUrl: (process.env.STT_FALLBACK_URL || '').replace(/\/+$/, ''),   // second server tried when stt_url fails (e.g. Whisper behind Parakeet)
   // Bearer token for the sensitive routes (/listen, /identity, /utterance,
   // /audiodebug) from anywhere but loopback (Hearth #10). API_TOKEN or
   // API_TOKEN_FILE; when neither is set those routes are loopback-only.
@@ -1642,7 +1643,10 @@ async function transcribeSamples(all) {
       .catch((e) => console.warn(`[nest_headless] SHADOW failed: ${e.message}`));
   }
   if (cfg.sttUrl) {
-    remote = await whisperServer(all).catch((e) => { console.warn('[nest_headless] whisper server failed, using local recogniser:', e.message); return null; });
+    remote = await whisperServer(all).catch((e) => { console.warn(`[nest_headless] stt server ${cfg.sttUrl} failed: ${e.message}`); return null; });
+    // the backup server (a different engine kept warm) before the in-process recogniser
+    if (!remote && cfg.sttFallbackUrl) remote = await whisperServer(all, cfg.sttFallbackUrl).catch((e) => { console.warn(`[nest_headless] fallback stt ${cfg.sttFallbackUrl} failed too: ${e.message}`); return null; });
+    if (!remote) console.warn('[nest_headless] using the local recogniser');
   }
   if (remote) {
     text = remote.text; stt = { engine: remote.engine };

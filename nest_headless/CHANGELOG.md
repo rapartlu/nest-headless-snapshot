@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.12.8
+
+- `stt_fallback_url`: a second recogniser server tried when `stt_url`
+  fails, ahead of the in-process one, so two engines can stay warm with one
+  primary. `host/stt_switch.sh parakeet|whisper` swaps them and restarts.
+- Bake-off outcome in the authors' house: Parakeet (parakeet-tdt-0.6b-v3
+  via MLX) is now primary, Whisper large-v3-turbo the fallback. Over a day
+  of paired transcripts Parakeet was as accurate on commands, better on
+  names, and returned an empty string on near-silence where Whisper
+  invented text ("Thank you.", a looping phrase) four times.
+
 ## 1.12.7
 
 - A watched camera that the vendor app has switched off (every offer answers
