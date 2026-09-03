@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.17.2
+
+- Enrolments and sample deletions update the in-memory identity index
+  instead of re-reading the whole identity directory; the directory (on a
+  share) is read once at boot, asynchronously. Every cat enrolment had been
+  a 2.5 s synchronous re-read of 96 files on the event loop.
+
 ## 1.17.1
 
 - Hold a state zone's change detection while a person covers it (#27):

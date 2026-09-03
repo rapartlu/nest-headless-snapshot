@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.17.1';
+const ADDON_VERSION = '1.17.2';
 
 const http = require('http');
 const fs = require('fs');
@@ -1366,6 +1366,44 @@ function loadEnrolled() {
   } catch (e) { /* no identity dir yet */ }
   return enrolled;
 }
+// The identity dir lives on a share: a full re-read (96 files, 2.5 s, on the
+// event loop) after every enrolment was the lag behind 1.17.1's cat
+// onboarding. Read it once at boot, asynchronously, and keep the maps
+// current by hand from then on.
+async function loadEnrolledAsync() {
+  const fsp = require('fs/promises');
+  const e = {}, f = {}, c = {};
+  try {
+    for (const name of await fsp.readdir(cfg.identityDir)) {
+      const d = path.join(cfg.identityDir, name);
+      if (['models', 'pending', 'negatives'].includes(name) || !(await fsp.stat(d)).isDirectory()) continue;
+      for (const file of await fsp.readdir(d)) {
+        const kind = /^(voice|face|cat)-.*\.json$/.exec(file);
+        if (!kind) continue;
+        try {
+          const j = JSON.parse(await fsp.readFile(path.join(d, file), 'utf8'));
+          if (Array.isArray(j.embedding)) (({ voice: e, face: f, cat: c })[kind[1]][name] = ({ voice: e, face: f, cat: c })[kind[1]][name] || []).push({ ...sampleItem(file, j), sized: j.sized !== false, v: j.v || 1 });
+        } catch (err) { /* skip */ }
+      }
+    }
+  } catch (err) { /* no identity dir yet */ }
+  enrolled = e; enrolledFaces = f; enrolledCats = c;
+  console.log(`[nest_headless] identity loaded: ${Object.keys(e).length} voices, ${Object.keys(f).length} faces, ${Object.keys(c).length} cats`);
+  return enrolled;
+}
+function addSample(name, kind, file, j) {
+  if (!enrolled) loadEnrolled();
+  const map = kind === 'voice' ? enrolled : kind === 'face' ? enrolledFaces : enrolledCats;
+  (map[name] = map[name] || []).push({ ...sampleItem(file, j), sized: j.sized !== false, v: j.v || 1 });
+}
+function removeSample(name, file) {
+  if (!enrolled) loadEnrolled();
+  for (const map of [enrolled, enrolledFaces, enrolledCats]) {
+    if (!map[name]) continue;
+    map[name] = map[name].filter((it) => it.file !== file);
+    if (!map[name].length) delete map[name];
+  }
+}
 const FACE_MODELS_DIR = () => path.join(cfg.identityDir, 'models');
 const pending = new PendingStore(path.join(cfg.identityDir, 'pending'));   // verification backlog (#16)
 function matchFace(embedding) {
@@ -1449,7 +1487,7 @@ function enrolCat(name, source, found, index) {
   const j = { at: new Date().toISOString(), camera: source, source: String(source).startsWith('camera.') ? 'room' : 'upload', quality: pick.quality, box: pick.box, sized: !!pick._sized, v: catid.VERSION, embedding: pick._emb };
   fs.writeFileSync(path.join(d, `cat-${ts}.json`), JSON.stringify(j));
   if (cfg.identityKeepSamples && pick._crop) fs.writeFileSync(path.join(d, `cat-${ts}.jpg`), pick._crop);
-  loadEnrolled();
+  addSample(name, 'cat', `cat-${ts}.json`, j);
   console.log(`[nest_headless] IDENTITY enrolled cat ${name} (${(enrolledCats[name] || []).length} samples, ${pick.quality.size_px}px${found.photo ? ', photo' : ''})`);
   return { ok: true, accepted: true, quality: pick.quality, samples: (enrolledCats[name] || []).length };
 }
@@ -1676,7 +1714,7 @@ function deleteSample(name, id) {
   const d = path.join(cfg.identityDir, name);
   if (!fs.existsSync(path.join(d, id + '.json'))) return { ok: false, reason: 'unknown_sample' };
   for (const ext of ['.json', '.jpg', '.wav']) { try { fs.unlinkSync(path.join(d, id + ext)); } catch (e) { /* ok */ } }
-  loadEnrolled();
+  removeSample(name, id + '.json');
   const kind = id.split('-')[0];
   const left = (kind === 'cat' ? enrolledCats[name] : kind === 'voice' ? enrolled[name] : enrolledFaces[name]) || [];
   console.log(`[nest_headless] IDENTITY dropped sample ${id} of ${name} (${left.length} ${kind} left)`);
@@ -1758,9 +1796,10 @@ function enrolVoiceFromAudio(name, samplesIn, phrase, camera) {
   const d = path.join(cfg.identityDir, name.toLowerCase());
   fs.mkdirSync(d, { recursive: true });
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
-  fs.writeFileSync(path.join(d, `voice-${ts}.json`), JSON.stringify({ at: new Date().toISOString(), camera: camera || 'upload', source: String(camera || '').startsWith('camera.') ? 'room' : 'upload', phrase: phrase || null, quality, embedding: emb }));
+  const j = { at: new Date().toISOString(), camera: camera || 'upload', source: String(camera || '').startsWith('camera.') ? 'room' : 'upload', phrase: phrase || null, quality, embedding: emb };
+  fs.writeFileSync(path.join(d, `voice-${ts}.json`), JSON.stringify(j));
   if (cfg.identityKeepSamples) writeWav16k(path.join(d, `voice-${ts}.wav`), samples);
-  loadEnrolled();
+  addSample(name.toLowerCase(), 'voice', `voice-${ts}.json`, j);
   console.log(`[nest_headless] IDENTITY enrolled voice for ${name.toLowerCase()} from upload (${enrolled[name.toLowerCase()].length} samples${phrase ? ', phrase: ' + String(phrase).slice(0, 40) : ''})`);
   return { ok: true, accepted: true, quality, samples: enrolled[name.toLowerCase()].length };
 }
@@ -1783,7 +1822,8 @@ function enrolFace(name, entityId, found, index, pose) {
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
   const POSES = ['front', 'left', 'right', 'up', 'down'];
   const p = POSES.includes(String(pose || '').toLowerCase()) ? String(pose).toLowerCase() : null;
-  fs.writeFileSync(path.join(d, `face-${ts}.json`), JSON.stringify({ at: new Date().toISOString(), camera: entityId, source: String(entityId).startsWith('camera.') ? 'room' : 'upload', quality: pick.quality, box: pick.box, pose: p, embedding: pick._emb }));
+  const j = { at: new Date().toISOString(), camera: entityId, source: String(entityId).startsWith('camera.') ? 'room' : 'upload', quality: pick.quality, box: pick.box, pose: p, embedding: pick._emb };
+  fs.writeFileSync(path.join(d, `face-${ts}.json`), JSON.stringify(j));
   if (cfg.identityKeepSamples) {
     // for review (#24): a context crop (the face box with 2.5x margin) from the
     // source frame when we have it, else the aligned 112 px crop
@@ -1796,7 +1836,7 @@ function enrolFace(name, entityId, found, index, pose) {
       fs.writeFileSync(path.join(d, `face-${ts}.jpg`), require('jpeg-js').encode({ data: rgba, width: faces.ALIGN, height: faces.ALIGN }, 90).data);
     }
   }
-  loadEnrolled();
+  addSample(name.toLowerCase(), 'face', `face-${ts}.json`, j);
   console.log(`[nest_headless] IDENTITY enrolled face for ${name.toLowerCase()} (${enrolledFaces[name.toLowerCase()].length} samples, ${pick.quality.size_px}px${p ? ', ' + p : ''})`);
   return { ok: true, accepted: true, quality: pick.quality, samples: enrolledFaces[name.toLowerCase()].length, poses_held: personSummary(name.toLowerCase()).poses_held };
 }
@@ -1869,9 +1909,10 @@ function enrolVoice(name, u) {
   const d = path.join(cfg.identityDir, name.toLowerCase());
   fs.mkdirSync(d, { recursive: true });
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
-  fs.writeFileSync(path.join(d, `voice-${ts}.json`), JSON.stringify({ at: new Date().toISOString(), camera: u.camera, source: 'room', quality: u.quality, embedding: emb }));
+  const j = { at: new Date().toISOString(), camera: u.camera, source: 'room', quality: u.quality, embedding: emb };
+  fs.writeFileSync(path.join(d, `voice-${ts}.json`), JSON.stringify(j));
   if (cfg.identityKeepSamples) writeWav16k(path.join(d, `voice-${ts}.wav`), u.samples);
-  loadEnrolled();
+  addSample(name.toLowerCase(), 'voice', `voice-${ts}.json`, j);
   console.log(`[nest_headless] IDENTITY enrolled voice for ${name.toLowerCase()} (${enrolled[name.toLowerCase()].length} samples)`);
   return { ok: true, accepted: true, quality: u.quality, samples: enrolled[name.toLowerCase()].length };
 }
@@ -1879,7 +1920,7 @@ function forgetPerson(name) {
   const d = path.join(cfg.identityDir, name.toLowerCase());
   if (!/^[a-z0-9_-]{1,32}$/i.test(name) || !fs.existsSync(d)) return { ok: false, reason: 'unknown' };
   fs.rmSync(d, { recursive: true, force: true });
-  loadEnrolled();
+  if (!enrolled) loadEnrolled(); else { delete enrolled[name.toLowerCase()]; delete enrolledFaces[name.toLowerCase()]; delete enrolledCats[name.toLowerCase()]; }
   return { ok: true };
 }
 function identitySummary() {
@@ -3013,7 +3054,7 @@ server.listen(cfg.port, () => {
   console.log(`[nest_headless] listening on :${cfg.port}`);
   infer.warmUp().then((ms) => console.log(`[nest_headless] vision models warm in ${ms} ms`)).catch((e) => console.warn('[nest_headless] warm-up failed:', e.message));
   // read the identity dir (possibly a network share) at boot, not during the first conversation
-  setTimeout(() => { try { loadEnrolled(); } catch (e) { /* no identity dir yet */ } }, 3000).unref();
+  setTimeout(() => loadEnrolledAsync().catch(() => {}), 3000).unref();
   if (faces.hasModels(FACE_MODELS_DIR())) faces.getSessions(FACE_MODELS_DIR()).catch(() => {});
   for (const [entityId, interval] of Object.entries(cfg.watches)) {
     runWatch(entityId, interval).catch((e) => console.error(`[nest_headless] watch ${entityId} crashed:`, e.message));
