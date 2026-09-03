@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.15.0';
+const ADDON_VERSION = '1.15.1';
 
 const http = require('http');
 const fs = require('fs');
@@ -1366,8 +1366,15 @@ function enrolCat(name, source, found, index) {
     else return { ok: true, accepted: false, reason: 'multiple_cats', cats: usable.map((c, i) => ({ index: i, box: c.box, size_px: c.quality.size_px, matches: c.matches })) };
     if (!pick) return { ok: true, accepted: false, reason: 'bad_index', cats: usable.length };
   }
+  // the same crop sent twice teaches nothing: a near-identical descriptor already held is a duplicate (1.15.1)
+  if (!enrolled) loadEnrolled();
+  const existing = enrolledCats[name] || [];
+  if (existing.some((it) => catid.cosine(pick._emb, it.embedding, !!pick._sized, it.sized) >= 0.995)) return { ok: true, accepted: false, reason: 'duplicate', samples: existing.length };
   const d = path.join(cfg.identityDir, name);
   fs.mkdirSync(d, { recursive: true });
+  // cap per cat: the oldest photo sample goes first, room samples last
+  const CAT_MAX = 200;
+  if (existing.length >= CAT_MAX) { const old = [...existing].sort((a, b) => (a.source === b.source ? (a.at < b.at ? -1 : 1) : (a.source === 'room' ? 1 : -1)))[0]; try { fs.unlinkSync(path.join(d, old.file)); } catch (e) { /* ok */ } }
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
   const j = { at: new Date().toISOString(), camera: source, source: String(source).startsWith('camera.') ? 'room' : 'upload', quality: pick.quality, box: pick.box, sized: !!pick._sized, embedding: pick._emb };
   fs.writeFileSync(path.join(d, `cat-${ts}.json`), JSON.stringify(j));

@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.15.1
+
+- Cat enrolment refuses a near-identical sample (`reason: duplicate`, cosine
+  >= 0.995 with one already held) and caps a cat at 200 samples, oldest
+  photo first. Seven of the first fourteen samples sent for one cat were
+  exact repeats.
+
 ## 1.15.0
 
 - Cat identity (#23), the same flow as people: `POST /identity/cat/enrol`
