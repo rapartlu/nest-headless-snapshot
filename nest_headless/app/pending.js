@@ -4,36 +4,48 @@
 // or drop. Storage: <identityDir>/pending/<id>/{meta.json, clip.wav|crop.jpg}.
 // Retention: MAX_AGE_DAYS or MAX_SAMPLES (oldest dropped). A small negative
 // set (_unknown.json) stops the same visitor being queued again for 30 days.
+//
+// The index of metadata lives in memory: it is read from disk once,
+// asynchronously, and every add/remove updates it here first. The directory
+// may be on a network share, where a sync readdir plus one readFile per
+// sample cost seconds on the event loop (#17). Media and metadata writes are
+// asynchronous too; a failed write drops the entry again.
 'use strict';
 
 const fs = require('fs');
+const fsp = require('fs/promises');
 const path = require('path');
 
 const MAX_AGE_MS = 7 * 86400000, MAX_SAMPLES = 200, UNKNOWN_TTL_MS = 30 * 86400000;
+const ID_RE = /^[a-z0-9_-]{1,64}$/i;
 
 class PendingStore {
-  constructor(dir) { this.dir = dir; this.unknownFile = path.join(dir, '_unknown.json'); }
-  ensure() { fs.mkdirSync(this.dir, { recursive: true }); }
+  constructor(dir) {
+    this.dir = dir; this.unknownFile = path.join(dir, '_unknown.json');
+    this.index = null;          // id -> meta
+    this.removed = new Set();   // ids removed while the initial load was still running
+    this.unknown = null;
+    this.ready = this._loadAsync().catch((e) => console.warn('[nest_headless] pending index load failed:', e.message));
+  }
+  async _loadAsync() {
+    await fsp.mkdir(this.dir, { recursive: true });
+    const idx = this._load();
+    for (const id of await fsp.readdir(this.dir)) {
+      if (id.startsWith('_') || idx.has(id) || this.removed.has(id)) continue;
+      try { const m = JSON.parse(await fsp.readFile(path.join(this.dir, id, 'meta.json'), 'utf8')); if (m && m.id === id) idx.set(id, m); } catch (e) { /* skip */ }
+    }
+    this.removed.clear();
+    return idx;
+  }
+  _load() { if (!this.index) this.index = new Map(); return this.index; }
 
   list({ kind = null, camera = null, limit = 50 } = {}) {
-    this.ensure();
-    const out = [];
-    for (const id of fs.readdirSync(this.dir)) {
-      if (id.startsWith('_')) continue;
-      const m = this.get(id);
-      if (!m) continue;
-      if (kind && m.kind !== kind) continue;
-      if (camera && m.camera !== camera) continue;
-      out.push(m);
-    }
+    const out = [...this._load().values()].filter((m) => (!kind || m.kind === kind) && (!camera || m.camera === camera));
     out.sort((a, b) => (a.t < b.t ? 1 : -1));
     return { count: out.length, samples: out.slice(0, Math.max(1, Math.min(500, limit))) };
   }
-  count() { this.ensure(); return fs.readdirSync(this.dir).filter((id) => !id.startsWith('_')).length; }
-  get(id) {
-    if (!/^[a-z0-9_-]{1,64}$/i.test(id)) return null;
-    try { return JSON.parse(fs.readFileSync(path.join(this.dir, id, 'meta.json'), 'utf8')); } catch (e) { return null; }
-  }
+  count() { return this._load().size; }
+  get(id) { return ID_RE.test(id) ? this._load().get(id) || null : null; }
   mediaPath(id) {
     const m = this.get(id);
     if (!m) return null;
@@ -42,40 +54,48 @@ class PendingStore {
   }
   remove(id) {
     if (!this.get(id)) return false;
-    fs.rmSync(path.join(this.dir, id), { recursive: true, force: true });
+    this.index.delete(id); this.removed.add(id);
+    fsp.rm(path.join(this.dir, id), { recursive: true, force: true }).catch(() => {});
     return true;
   }
   // Prune by age and count, oldest first.
   prune() {
-    this.ensure();
     const now = Date.now();
-    const items = fs.readdirSync(this.dir).filter((id) => !id.startsWith('_')).map((id) => ({ id, m: this.get(id) })).filter((x) => x.m);
-    for (const x of items) if (now - Date.parse(x.m.t) > MAX_AGE_MS) this.remove(x.id);
-    const left = items.filter((x) => fs.existsSync(path.join(this.dir, x.id))).sort((a, b) => (a.m.t < b.m.t ? -1 : 1));
+    for (const m of [...this._load().values()]) if (now - Date.parse(m.t) > MAX_AGE_MS) this.remove(m.id);
+    const left = [...this.index.values()].sort((a, b) => (a.t < b.t ? -1 : 1));
     for (let i = 0; i < left.length - MAX_SAMPLES; i++) this.remove(left[i].id);
   }
   // sample: {kind, camera, t, utterance_id?, quality, matches, embedding, size_px?, speech_ms?, media: {buf, ext}}
   add(sample) {
-    this.ensure();
     const id = `${sample.kind}-${new Date(sample.t || Date.now()).toISOString().replace(/[:.]/g, '-')}-${Math.random().toString(36).slice(2, 6)}`;
     const d = path.join(this.dir, id);
-    fs.mkdirSync(d, { recursive: true });
     const mediaName = sample.media.ext === 'wav' ? 'clip.wav' : 'crop.jpg';
-    fs.writeFileSync(path.join(d, mediaName), sample.media.buf);
     const meta = { id, kind: sample.kind, camera: sample.camera, t: sample.t || new Date().toISOString(), utterance_id: sample.utterance_id || null,
       quality: sample.quality || null, matches: sample.matches || [], size_px: sample.size_px, speech_ms: sample.speech_ms, media: mediaName, embedding: sample.embedding };
-    fs.writeFileSync(path.join(d, 'meta.json'), JSON.stringify(meta));
+    this._load().set(id, meta);
+    (async () => {
+      await fsp.mkdir(d, { recursive: true });
+      await fsp.writeFile(path.join(d, mediaName), sample.media.buf);
+      await fsp.writeFile(path.join(d, 'meta.json'), JSON.stringify(meta));
+    })().catch((e) => { this.index.delete(id); console.warn('[nest_headless] pending write failed:', e.message); });
     this.prune();
     return meta;
   }
-  loadUnknown() { try { return JSON.parse(fs.readFileSync(this.unknownFile, 'utf8')).filter((u) => Date.now() - Date.parse(u.t) < UNKNOWN_TTL_MS); } catch (e) { return []; } }
+  loadUnknown() {
+    if (this.unknown === null) {
+      try { this.unknown = JSON.parse(fs.readFileSync(this.unknownFile, 'utf8')); } catch (e) { this.unknown = []; }
+      if (!Array.isArray(this.unknown)) this.unknown = [];
+    }
+    return this.unknown.filter((u) => Date.now() - Date.parse(u.t) < UNKNOWN_TTL_MS);
+  }
   markUnknown(id) {
     const m = this.get(id);
     if (!m) return false;
     const list = this.loadUnknown();
     list.push({ kind: m.kind, embedding: m.embedding, t: new Date().toISOString(), from: id });
-    this.ensure();
-    fs.writeFileSync(this.unknownFile, JSON.stringify(list));
+    this.unknown = list;
+    fsp.mkdir(this.dir, { recursive: true }).then(() => fsp.writeFile(this.unknownFile, JSON.stringify(list)))
+      .catch((e) => console.warn('[nest_headless] unknown list write failed:', e.message));
     this.remove(id);
     return true;
   }

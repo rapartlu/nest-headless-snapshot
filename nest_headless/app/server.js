@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.12.2';
+const ADDON_VERSION = '1.12.3';
 
 const http = require('http');
 const fs = require('fs');
@@ -42,6 +42,7 @@ const infer = require('./infer');
 const { parseWatchPassages, PassageTracker } = require('./passages');
 const faces = require('./faces');
 const { PendingStore } = require('./pending');
+const diskq = require('./diskq');
 
 // ------------------------------------------------------------ configuration
 // HA config root: the supervisor mounts it at /homeassistant (or /config on
@@ -431,16 +432,13 @@ async function capture(entityId) {
 async function persistShot(entityId, shot) {
   const buf = Buffer.from(shot.dataUrl.split(',')[1], 'base64');
     const file = cameraFile(entityId);
-    const tmp = file + '.tmp';
-    fs.writeFileSync(tmp, buf);
-    fs.renameSync(tmp, file);
+    await diskq.writeAtomic(file, buf);   // async: www/ may be a network share (#17)
     let cropFile = null;
     let verdict = null;
     if (shot.cropDataUrl) {
       cropFile = file.replace(/\.jpg$/, '_crop.jpg');
       const cbuf = Buffer.from(shot.cropDataUrl.split(',')[1], 'base64');
-      fs.writeFileSync(cropFile + '.tmp', cbuf);
-      fs.renameSync(cropFile + '.tmp', cropFile);
+      await diskq.writeAtomic(cropFile, cbuf);
       verdict = classify(entityId, cbuf); // linear model: verdict + framing gate
       // The fine-tuned CNN (hot-loaded onnx) outranks the linear verdict when
       // present; the linear model's framing gate still applies on top.
@@ -490,10 +488,7 @@ async function persistShot(entityId, shot) {
         // frame too (as *_f.jpg) - crops cover only the door, so floor-level
         // animals were never being archived and the detector had no hallway
         // training data at all
-        try {
-          fs.writeFileSync(path.join(cfg.samplesDir, entityId.replace(/^camera\./, ''),
-            stamped.replace(/\.jpg$/, '_f.jpg')), buf);
-        } catch (e) { /* crop archive still stands */ }
+        sampleIndex(entityId).put(stamped.replace(/\.jpg$/, '_f.jpg'), buf).catch(() => { /* crop archive still stands */ });
       }
       const entry = { t: new Date().toISOString(), img: stamped, luma: meta.meanLuma };
       if (verdict) entry.classifier = verdict;
@@ -503,9 +498,8 @@ async function persistShot(entityId, shot) {
           const { cat, dets } = await catOnSurface(entityId, buf);
           entry.cat = cat;
           entry.dets = (dets || []).map((d) => ({ name: d.name, conf: d.conf, roi: d.roi }));
-          const boxed = infer.annotate(buf, dets || [], cfg.watchRois[entityId] || []);
           const aname = stamped.replace(/\.jpg$/, '_a.jpg');
-          fs.writeFileSync(path.join(cfg.samplesDir, entityId.replace(/^camera\./, ''), aname), boxed);
+          infer.annotate(buf, dets || [], cfg.watchRois[entityId] || []).then((boxed) => sampleIndex(entityId).put(aname, boxed)).catch(() => {});
           entry.aimg = aname;
         } catch (e) { /* timeline entry stays un-annotated */ }
       }
@@ -515,29 +509,26 @@ async function persistShot(entityId, shot) {
   return { buf, meta };
 }
 
+// Archive directories: the listing is read once and kept in memory, and every
+// write is queued per directory. On a network share a sync readdir of a
+// 2000-file archive took 2.6 s and stalled audio and the status route (#17).
+const dirIndexes = new Map();
+function sampleIndex(entityId, suffix = '') {
+  const dir = path.join(cfg.samplesDir, entityId.replace(/^camera\./, '') + suffix);
+  if (!dirIndexes.has(dir)) dirIndexes.set(dir, new diskq.DirIndex(dir));
+  return dirIndexes.get(dir);
+}
 const lastArchiveMs = {};
 function archiveSample(entityId, buf) {
-  try {
-    // keep the training archive at a sane cadence however often frames flow
-    const now = Date.now();
-    if (now - (lastArchiveMs[entityId] || 0) < cfg.sampleArchiveSeconds * 1000 - 2000) return null;
-    lastArchiveMs[entityId] = now;
-    const dir = path.join(cfg.samplesDir, entityId.replace(/^camera\./, ''));
-    fs.mkdirSync(dir, { recursive: true });
-    const existing = fs.readdirSync(dir).filter((f) => f.endsWith('.jpg')).sort();
-    // cap the archive: drop oldest tenth when full
-    if (existing.length >= cfg.samplesMax) {
-      for (const f of existing.slice(0, Math.ceil(cfg.samplesMax / 10))) {
-        try { fs.unlinkSync(path.join(dir, f)); } catch (e) { /* ok */ }
-      }
-    }
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    fs.writeFileSync(path.join(dir, stamp + '.jpg'), buf);
-    return stamp + '.jpg';
-  } catch (e) {
-    console.warn('[nest_headless] sample archive failed:', e.message);
-    return null;
-  }
+  // keep the training archive at a sane cadence however often frames flow
+  const now = Date.now();
+  if (now - (lastArchiveMs[entityId] || 0) < cfg.sampleArchiveSeconds * 1000 - 2000) return null;
+  lastArchiveMs[entityId] = now;
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  // cap the archive: drop the oldest tenth when full
+  sampleIndex(entityId).put(stamp + '.jpg', buf, { max: cfg.samplesMax, dropN: Math.ceil(cfg.samplesMax / 10) })
+    .catch((e) => console.warn('[nest_headless] sample archive failed:', e.message));
+  return stamp + '.jpg';
 }
 
 // Rolling per-camera capture timeline: samples/<camera>/timeline.json holds
@@ -549,15 +540,13 @@ function appendTimeline(entityId, entry) {
   try {
     const cam = entityId.replace(/^camera\./, '');
     const dir = path.join(cfg.samplesDir, cam);
-    fs.mkdirSync(dir, { recursive: true });
     const f = path.join(dir, 'timeline.json');
     let arr = timelineCache[cam];
     if (!arr) { try { arr = JSON.parse(fs.readFileSync(f, 'utf8')); } catch (e) { arr = []; } }
     arr.unshift(entry);
     if (arr.length > 300) arr = arr.slice(0, 300);
     timelineCache[cam] = arr;
-    fs.writeFileSync(f + '.tmp', JSON.stringify(arr));
-    fs.renameSync(f + '.tmp', f);
+    diskq.writeAtomic(f, Buffer.from(JSON.stringify(arr))).catch((e) => console.warn('[nest_headless] timeline write failed:', e.message));
   } catch (e) {
     console.warn('[nest_headless] timeline append failed:', e.message);
   }
@@ -900,40 +889,31 @@ async function watchHit(entityId, payload) {
 
 const lastHitSnapMs = {};
 function saveHitSnapshot(entityId, frameBuf, dets, roi) {
-  try {
-    if (!cfg.samplesDir) return;
-    const now = Date.now();
-    if (now - (lastHitSnapMs[entityId] || 0) < 10000) return;
-    lastHitSnapMs[entityId] = now;
-    const dir = path.join(cfg.samplesDir, entityId.replace(/^camera\./, '') + '_hits');
-    fs.mkdirSync(dir, { recursive: true });
-    const existing = fs.readdirSync(dir).filter((f) => f.endsWith('.jpg')).sort();
-    if (existing.length >= 600) {
-      for (const f of existing.slice(0, 60)) {
-        try { fs.unlinkSync(path.join(dir, f)); } catch (e) { /* ok */ }
-      }
-    }
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const boxed = infer.annotate(frameBuf, dets || [], cfg.watchRois[entityId] || []);
-    fs.writeFileSync(path.join(dir, `${stamp}_${roi}.jpg`), boxed);
-  } catch (e) { /* evidence is best-effort */ }
+  if (!cfg.samplesDir) return;
+  const now = Date.now();
+  if (now - (lastHitSnapMs[entityId] || 0) < 10000) return;
+  lastHitSnapMs[entityId] = now;
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  infer.annotate(frameBuf, dets || [], cfg.watchRois[entityId] || [])
+    .then((boxed) => sampleIndex(entityId, '_hits').put(`${stamp}_${roi}.jpg`, boxed, { max: 600, dropN: 60 }))
+    .catch(() => { /* evidence is best-effort */ });
 }
 
 // Keep the evidence: raw + box-annotated copies of every frame that
 // confirmed a cat on a surface. The alert notification shows the annotated
-// one, so "where was it?" never needs forensics again.
-function saveCatSnapshot(entityId, frameBuf, dets) {
+// one, so "where was it?" never needs forensics again. Resolves once
+// _cat.jpg exists (the alert names it); the archive copy trails.
+async function saveCatSnapshot(entityId, frameBuf, dets) {
   try {
     const base = cameraFile(entityId).replace(/\.jpg$/, '');
-    fs.writeFileSync(base + '_cat_raw.jpg', frameBuf);
-    const boxed = infer.annotate(frameBuf, dets, cfg.watchRois[entityId] || []);
-    fs.writeFileSync(base + '_cat.jpg', boxed);
+    const raw = diskq.writeAtomic(base + '_cat_raw.jpg', frameBuf);
+    const boxed = await infer.annotate(frameBuf, dets, cfg.watchRois[entityId] || []);
+    await diskq.writeAtomic(base + '_cat.jpg', boxed);
+    await raw;
     if (cfg.samplesDir) {
       // every cat event archived, no throttle: these are the frames questions
       // get asked about ("where was it? was that really a cat?")
-      const dir = path.join(cfg.samplesDir, entityId.replace(/^camera\./, '') + '_cats');
-      fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(path.join(dir, new Date().toISOString().replace(/[:.]/g, '-') + '.jpg'), boxed);
+      sampleIndex(entityId, '_cats').put(new Date().toISOString().replace(/[:.]/g, '-') + '.jpg', boxed).catch(() => {});
     }
   } catch (e) {
     console.warn(`[nest_headless] cat snapshot ${entityId} failed: ${e.message}`);
@@ -988,7 +968,7 @@ async function catOnSurface(entityId, frameBuf) {
       dets.push({ ...x, roi: r ? r.name : null });
       if (r && (x.cls === 15 || x.cls === 16)) cat = true;
     }
-    if (cat) saveCatSnapshot(entityId, frameBuf, dets);
+    if (cat) await saveCatSnapshot(entityId, frameBuf, dets);   // the alert names _cat.jpg: it must exist first
     return { cat, dets };
   } catch (e) {
     console.warn(`[nest_headless] detect ${entityId} failed: ${e.message}`);
@@ -1124,6 +1104,13 @@ const cosine = (a, b) => { let d = 0, na = 0, nb = 0; for (let i = 0; i < a.leng
 // enrolled: { name: [ {embedding, file} ] } loaded from identity/<name>/voice-*.json
 // enrolledFaces: same shape from identity/<name>/face-*.json (ArcFace 512-d)
 let enrolled = null, enrolledFaces = {};
+// In-memory shape of an enrolled sample. source: 'room' (a camera microphone
+// or frame) or 'upload' (a phone recording or photo) - older files carry
+// only `camera`, so it is derived from that.
+function sampleItem(file, j) {
+  return { embedding: j.embedding, file, at: j.at, pose: j.pose || null,
+    source: j.source || (String(j.camera || '').startsWith('camera.') ? 'room' : 'upload') };
+}
 function loadEnrolled() {
   enrolled = {}; enrolledFaces = {};
   try {
@@ -1134,7 +1121,7 @@ function loadEnrolled() {
       for (const f of fs.readdirSync(d)) {
         const isVoice = /^voice-.*\.json$/.test(f), isFace = /^face-.*\.json$/.test(f);
         if (!isVoice && !isFace) continue;
-        try { const j = JSON.parse(fs.readFileSync(path.join(d, f), 'utf8')); if (Array.isArray(j.embedding)) (isVoice ? items : fitems).push({ embedding: j.embedding, file: f, at: j.at, pose: j.pose || null }); } catch (e) { /* skip */ }
+        try { const j = JSON.parse(fs.readFileSync(path.join(d, f), 'utf8')); if (Array.isArray(j.embedding)) (isVoice ? items : fitems).push(sampleItem(f, j)); } catch (e) { /* skip */ }
       }
       if (items.length) enrolled[name] = items;
       if (fitems.length) enrolledFaces[name] = fitems;
@@ -1255,7 +1242,7 @@ function enrolPending(id, name) {
   const m = pending.get(id);
   if (!m) return { ok: false, accepted: false, reason: 'unknown_sample' };
   const media = pending.mediaPath(id);
-  writePersonSample(name, m.kind, { camera: m.camera, quality: m.quality, embedding: m.embedding, from_pending: id, matches_at_label: m.matches }, media && media.file);
+  writePersonSample(name, m.kind, { camera: m.camera, source: 'room', quality: m.quality, embedding: m.embedding, from_pending: id, matches_at_label: m.matches }, media && media.file);
   pending.remove(id);
   console.log(`[nest_headless] IDENTITY labelled pending ${id} as ${name.toLowerCase()} (${m.kind})`);
   notePendingCount();
@@ -1265,7 +1252,9 @@ function personSummary(name) {
   if (!enrolled) loadEnrolled();
   const v = enrolled[name] || [], f = enrolledFaces[name] || [];
   const poses = [...new Set(f.map((it) => it.pose).filter(Boolean))];
+  const bySource = (arr) => ({ room: arr.filter((it) => it.source === 'room').length, upload: arr.filter((it) => it.source !== 'room').length });
   return { name, voice_samples: v.length, face_samples: f.length, poses_held: poses, last_matched: lastMatched[name] || null,
+    voice_sources: bySource(v), face_sources: bySource(f),
     updated_at: [...v, ...f].map((i) => i.at).sort().pop() || null };
 }
 // Uploaded WAV (RIFF, 16-bit PCM, any rate/channels) -> 16 kHz float32 mono.
@@ -1311,7 +1300,7 @@ function enrolVoiceFromAudio(name, wavBuf, phrase, camera) {
   const d = path.join(cfg.identityDir, name.toLowerCase());
   fs.mkdirSync(d, { recursive: true });
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
-  fs.writeFileSync(path.join(d, `voice-${ts}.json`), JSON.stringify({ at: new Date().toISOString(), camera: camera || 'upload', phrase: phrase || null, quality, embedding: emb }));
+  fs.writeFileSync(path.join(d, `voice-${ts}.json`), JSON.stringify({ at: new Date().toISOString(), camera: camera || 'upload', source: String(camera || '').startsWith('camera.') ? 'room' : 'upload', phrase: phrase || null, quality, embedding: emb }));
   if (cfg.identityKeepSamples) writeWav16k(path.join(d, `voice-${ts}.wav`), samples);
   loadEnrolled();
   console.log(`[nest_headless] IDENTITY enrolled voice for ${name.toLowerCase()} from upload (${enrolled[name.toLowerCase()].length} samples${phrase ? ', phrase: ' + String(phrase).slice(0, 40) : ''})`);
@@ -1336,7 +1325,7 @@ function enrolFace(name, entityId, found, index, pose) {
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
   const POSES = ['front', 'left', 'right', 'up', 'down'];
   const p = POSES.includes(String(pose || '').toLowerCase()) ? String(pose).toLowerCase() : null;
-  fs.writeFileSync(path.join(d, `face-${ts}.json`), JSON.stringify({ at: new Date().toISOString(), camera: entityId, quality: pick.quality, box: pick.box, pose: p, embedding: pick._emb }));
+  fs.writeFileSync(path.join(d, `face-${ts}.json`), JSON.stringify({ at: new Date().toISOString(), camera: entityId, source: String(entityId).startsWith('camera.') ? 'room' : 'upload', quality: pick.quality, box: pick.box, pose: p, embedding: pick._emb }));
   if (cfg.identityKeepSamples && pick._aligned) {
     const rgba = Buffer.alloc(faces.ALIGN * faces.ALIGN * 4);
     for (let i = 0; i < faces.ALIGN * faces.ALIGN; i++) { rgba[i * 4] = pick._aligned[i * 3]; rgba[i * 4 + 1] = pick._aligned[i * 3 + 1]; rgba[i * 4 + 2] = pick._aligned[i * 3 + 2]; rgba[i * 4 + 3] = 255; }
@@ -1346,12 +1335,23 @@ function enrolFace(name, entityId, found, index, pose) {
   console.log(`[nest_headless] IDENTITY enrolled face for ${name.toLowerCase()} (${enrolledFaces[name.toLowerCase()].length} samples, ${pick.quality.size_px}px${p ? ', ' + p : ''})`);
   return { ok: true, accepted: true, quality: pick.quality, samples: enrolledFaces[name.toLowerCase()].length, poses_held: personSummary(name.toLowerCase()).poses_held };
 }
+// score = best over every sample (unchanged); room / upload = best over the
+// samples from that channel, null when the person has none. A phone-enrolled
+// voice heard on a ceiling microphone scores lower (level, reverb and
+// bandwidth differ), and this lets the brain see that rather than guess (#16).
 function matchVoice(embedding) {
   if (!enrolled) loadEnrolled();
+  const r3 = (v) => Math.round(v * 1000) / 1000;
   const out = [];
   for (const [name, items] of Object.entries(enrolled)) {
-    const best = Math.max(...items.map((it) => cosine(embedding, it.embedding)));
-    out.push({ name, score: Math.round(best * 1000) / 1000 });
+    let best = -1, room = null, upload = null;
+    for (const it of items) {
+      const s = cosine(embedding, it.embedding);
+      if (s > best) best = s;
+      if (it.source === 'room') room = room === null ? s : Math.max(room, s);
+      else upload = upload === null ? s : Math.max(upload, s);
+    }
+    out.push({ name, score: r3(best), room: room === null ? null : r3(room), upload: upload === null ? null : r3(upload) });
   }
   return out.sort((a, b) => b.score - a.score).slice(0, 3);
 }
@@ -1397,7 +1397,7 @@ function enrolVoice(name, u) {
   const d = path.join(cfg.identityDir, name.toLowerCase());
   fs.mkdirSync(d, { recursive: true });
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
-  fs.writeFileSync(path.join(d, `voice-${ts}.json`), JSON.stringify({ at: new Date().toISOString(), camera: u.camera, quality: u.quality, embedding: emb }));
+  fs.writeFileSync(path.join(d, `voice-${ts}.json`), JSON.stringify({ at: new Date().toISOString(), camera: u.camera, source: 'room', quality: u.quality, embedding: emb }));
   if (cfg.identityKeepSamples) writeWav16k(path.join(d, `voice-${ts}.wav`), u.samples);
   loadEnrolled();
   console.log(`[nest_headless] IDENTITY enrolled voice for ${name.toLowerCase()} (${enrolled[name.toLowerCase()].length} samples)`);
@@ -2216,6 +2216,8 @@ const server = http.createServer(async (req, res) => {
 server.listen(cfg.port, () => {
   console.log(`[nest_headless] listening on :${cfg.port}`);
   infer.warmUp().then((ms) => console.log(`[nest_headless] vision models warm in ${ms} ms`)).catch((e) => console.warn('[nest_headless] warm-up failed:', e.message));
+  // read the identity dir (possibly a network share) at boot, not during the first conversation
+  setTimeout(() => { try { loadEnrolled(); } catch (e) { /* no identity dir yet */ } }, 3000).unref();
   if (faces.hasModels(FACE_MODELS_DIR())) faces.getSessions(FACE_MODELS_DIR()).catch(() => {});
   for (const [entityId, interval] of Object.entries(cfg.watches)) {
     runWatch(entityId, interval).catch((e) => console.error(`[nest_headless] watch ${entityId} crashed:`, e.message));

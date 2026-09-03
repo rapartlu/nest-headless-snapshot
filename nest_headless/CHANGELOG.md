@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.12.3
+
+- The real cause behind #17: synchronous disk I/O on a network share. The
+  Mac runs against the NAS over SMB, where a sync `readdir` of a 2000-file
+  archive directory took 2.6 s and every 250 KB write 70-180 ms, each one on
+  the event loop. Two to three seconds of lag followed every archive tick,
+  delaying audio and the status route. All hot-path disk work now goes
+  through `diskq.js`: `fs.promises`, serialised per file or directory,
+  atomic latest-wins writes for the www/ stills and timelines, and directory
+  listings read once and kept in memory (`DirIndex`). The verification
+  backlog keeps its index in memory the same way. `UV_THREADPOOL_SIZE=8` in
+  the Mac launchd plist gives the async I/O headroom.
+- `annotate()` (box-drawn evidence frames) is async and draws through sharp
+  as an SVG overlay; the JS decode-paint-encode stays as the fallback.
+- Identity samples carry `source`: `room` (a camera microphone or frame) or
+  `upload` (phone recording or photo). Voice matches report `room` and
+  `upload` bests alongside the unchanged `score`; `GET /identity/<name>`
+  adds `voice_sources` and `face_sources` counts (#16 follow-up).
+- The identity directory is read at boot rather than during the first
+  conversation.
+- sharp was in package.json but had never been installed in the Mac
+  checkout; the docs now say to run `npm install` there.
+
 ## 1.12.2
 
 - Event-loop lag guard (#17): the loop's lag is measured every 500 ms and

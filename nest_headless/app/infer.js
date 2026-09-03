@@ -228,7 +228,28 @@ async function classifyDoor(camera, jpegBuf, { size = 256, threshold = 0.30, lab
 // Burn detection boxes (and the watched regions) into a JPEG - pure JS via
 // jpeg-js, no canvas. Answers "where exactly was the cat?" in the alert
 // notification itself instead of leaving it to archaeology.
-function annotate(jpegBuf, dets, rois = [], { quality = 85 } = {}) {
+// Box-annotated copy of a frame: zone outlines plus detections (animals thick
+// red, everything else thin blue). With sharp the drawing is an SVG overlay
+// composited natively off the event loop; without it the JS fallback decodes,
+// paints and re-encodes on the main thread (~250 ms for 1080p).
+async function annotate(jpegBuf, dets, rois = [], { quality = 85 } = {}) {
+  const sharp = getSharp();
+  if (!sharp) return annotateJs(jpegBuf, dets, rois, { quality });
+  const { width: W, height: H } = await sharp(jpegBuf).metadata();
+  const f = (v) => String(Math.round(v * 10) / 10);
+  const svg = [`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">`];
+  for (const r of rois) {
+    if (r.pts) svg.push(`<polygon points="${r.pts.map((p) => f(p[0] * W) + ',' + f(p[1] * H)).join(' ')}" fill="none" stroke="rgb(255,210,0)" stroke-width="3"/>`);
+    else svg.push(`<rect x="${f(r.x * W)}" y="${f(r.y * H)}" width="${f(r.w * W)}" height="${f(r.h * H)}" fill="none" stroke="rgb(255,210,0)" stroke-width="2"/>`);
+  }
+  for (const x of dets || []) {
+    const animal = x.cls === 15 || x.cls === 16;
+    svg.push(`<rect x="${f(x.box.x * W)}" y="${f(x.box.y * H)}" width="${f(x.box.w * W)}" height="${f(x.box.h * H)}" fill="none" stroke="${animal ? 'rgb(255,40,60)' : 'rgb(90,200,255)'}" stroke-width="${animal ? 6 : 3}"/>`);
+  }
+  svg.push('</svg>');
+  return sharp(jpegBuf).composite([{ input: Buffer.from(svg.join('')), top: 0, left: 0 }]).jpeg({ quality }).toBuffer();
+}
+function annotateJs(jpegBuf, dets, rois = [], { quality = 85 } = {}) {
   const img = jpeg.decode(jpegBuf, { useTArray: true, maxMemoryUsageInMB: 96 });
   const W = img.width, H = img.height, d = img.data;
   const px = (x, y, r, g, b) => {

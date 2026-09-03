@@ -234,9 +234,19 @@ Environment (a launchd plist is the natural home; see the example below):
 | `HA_WS_URL` | `ws://<ha-host>:8123/api/websocket` |
 | `TOKEN_FILE` | local file holding a long-lived HA token (mode 600) |
 | `LOG_FILE` | local log path (keeps `sh` off the share) |
+| `UV_THREADPOOL_SIZE` | `8`: headroom for the async disk I/O against the share (Node's default pool is 4) |
 
 Start with `sh nest_headless/run.sh`. Samples, `latest`, the timeline and
-models still live on the HA config share, so dashboards keep working.
+models still live on the HA config share, so dashboards keep working. Run
+`npm install` in the checkout the service actually starts from: `sharp` is
+a native dependency and, when it is missing, JPEG decoding silently falls
+back to JS on the main thread (the log says `sharp unavailable`).
+
+Disk I/O against the share is slow (a 250 KB write 70-180 ms, a `readdir`
+of a 2000-file archive 2.6 s) and since 1.12.3 none of it touches the event
+loop: writes are queued per file or directory and listings are cached. If
+`loop_lag_ms` on `GET /` climbs anyway, look for a new synchronous call
+before blaming the models.
 
 macOS privacy: a launchd agent is refused access to network volumes
 ("Operation not permitted") until the `node` binary is granted **Full Disk
@@ -321,9 +331,15 @@ Note for both host servers: launchd reads `EnvironmentVariables` only at
 
 Voice: every `nest_headless_speech` is followed by `nest_headless_identity`
 {utterance_id, speaker: {quality: {speech_ms, rms, reason}, matches: [{name,
-score}]}, faces: [...]}. Speaker embeddings come from
+score, room, upload}]}, faces: [...]}. Speaker embeddings come from
 `nest_models/identity/models/speaker.onnx` (3D-Speaker ERes2Net); same
-person on these mics scores ~0.6+, strangers ~0.4-.
+person on these mics scores ~0.6+, strangers ~0.4-. `score` is the best over
+all of a person's samples; `room` and `upload` are the bests over samples
+from a camera microphone and from phone uploads (null when there are none).
+A voice enrolled only from a phone at arm's length scores lower on a ceiling
+microphone (level, reverb, bandwidth), and the split shows that rather than
+leaving the brain to guess: label a couple of room captures from the backlog
+and `room` catches up.
 
 Faces: `nest_models/identity/models/{scrfd_10g.onnx, arcface_w600k_r50.onnx}`
 (InsightFace buffalo_l). Faces are sampled at the wake moment and 1 s later;
@@ -359,7 +375,10 @@ negative for 30 days so they are not queued again), `DELETE` drops one.
 `nest_headless_identity_pending` {count, newest?} keeps a badge honest.
 Retention: 7 days or 200 samples. Onboarding from a phone: voice enrol with
 `{name, audio_b64, phrase?}` (16-bit WAV, 3-10 s) several times per person;
-face enrol with `pose`; `GET /identity/<name>` shows what is held.
+face enrol with `pose`; `GET /identity/<name>` shows what is held, including
+`voice_sources` / `face_sources` {room, upload} so an admin can see when a
+person has no room-channel samples yet. Every sample file carries `source`
+(`room` or `upload`); backlog labels are always `room`.
 
 ## Follow-up window and the API token
 
