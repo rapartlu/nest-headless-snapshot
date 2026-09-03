@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.15.0
+
+- Cat identity (#23), the same flow as people: `POST /identity/cat/enrol`
+  {name, camera, index?} from the current frame or {name, image_b64} from a
+  photo or labelled crop (refusals `no_cat`, `cat_too_small` with
+  `size_px`/`needed_px`, `multiple_cats` with candidates), `GET /identity`
+  lists `cats: [{name, samples, room, upload, last_seen}]`, `GET
+  /identity/cat/<name>`, `DELETE /identity/cat/<name>`. Every cat detection
+  on `nest_headless_surface_activity` carries `who: {name|null, score,
+  matches, size_px}` and the event a top-level `who` for the best cat (the
+  boolean `cat` is unchanged); `GET /identity/who/<camera>` adds `cats`.
+  Ambiguous cats go to the backlog as `kind: "cat"` and label like faces.
+  The descriptor (`catid.js`) is a colour histogram plus coat, texture and
+  size terms on the box's inner 60 %, no neural model; a photo sample has
+  no frame so it matches on colour and texture only. Naming line 0.9,
+  decisive 0.92 with 0.03 clear of the runner-up.
+
 ## 1.14.3
 
 - A zone model whose leave-one-out accuracy is under 0.8 keeps reporting its

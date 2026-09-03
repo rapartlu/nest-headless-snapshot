@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.14.3';
+const ADDON_VERSION = '1.15.0';
 
 const http = require('http');
 const fs = require('fs');
@@ -41,6 +41,7 @@ const { classify } = require('./classifier');
 const infer = require('./infer');
 const { parseWatchPassages, PassageTracker } = require('./passages');
 const faces = require('./faces');
+const catid = require('./catid');
 const { PendingStore } = require('./pending');
 const diskq = require('./diskq');
 const { SegmentTracker } = require('./segments');
@@ -1018,6 +1019,10 @@ async function watchHit(entityId, payload) {
   // People trigger the same pixel diff constantly; they are logged, not fired.
   const frameBuf = Buffer.from(payload.dataUrl.split(',')[1], 'base64');
   const { cat, dets } = await catOnSurface(entityId, frameBuf);
+  // which cat (#23): describe and match every cat box; ambiguous ones go to the backlog
+  let catsSeen = [];
+  if (dets && dets.some((x) => x.cls === 15 || x.cls === 16)) catsSeen = await identifyCats(entityId, frameBuf, dets).catch(() => []);
+  const whoOf = (x) => { const c = catsSeen.find((k) => k.box === x.box); return c ? { name: c.name, score: c.score, matches: c.matches, size_px: c.quality.size_px } : null; };
   // Evidence for EVERY hit, verdict or not: "a cat was just there, did you
   // catch it?" has now been asked three times and each time the frames the
   // detector judged were already gone (only heartbeats and cat-positives
@@ -1039,7 +1044,9 @@ async function watchHit(entityId, payload) {
     roi: payload.roi,
     changed_pct: payload.changedPct,
     cat: verdict,
-    detections: dets ? dets.slice(0, 5) : null,
+    detections: dets ? dets.slice(0, 5).map((x) => ({ ...x, who: whoOf(x) })) : null,
+    // which cat (#23): the best-identified cat in the frame; `cat` above stays the boolean verdict
+    who: (() => { const best = catsSeen.filter((c) => c.name).sort((a, b) => b.score - a.score)[0]; return best ? { name: best.name, score: best.score, matches: best.matches, size_px: best.quality.size_px } : (catsSeen[0] ? { name: null, score: catsSeen[0].score, matches: catsSeen[0].matches, size_px: catsSeen[0].quality.size_px } : null); })(),
     people: await countPeople(frameBuf),
     frame_at: new Date(now).toISOString(),
     boxes: [
@@ -1265,7 +1272,7 @@ function embedVoice(samples) {
 const cosine = (a, b) => { let d = 0, na = 0, nb = 0; for (let i = 0; i < a.length; i++) { d += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; } return d / Math.sqrt(na * nb || 1); };
 // enrolled: { name: [ {embedding, file} ] } loaded from identity/<name>/voice-*.json
 // enrolledFaces: same shape from identity/<name>/face-*.json (ArcFace 512-d)
-let enrolled = null, enrolledFaces = {};
+let enrolled = null, enrolledFaces = {}, enrolledCats = {};
 // In-memory shape of an enrolled sample. source: 'room' (a camera microphone
 // or frame) or 'upload' (a phone recording or photo) - older files carry
 // only `camera`, so it is derived from that.
@@ -1274,19 +1281,23 @@ function sampleItem(file, j) {
     source: j.source || (String(j.camera || '').startsWith('camera.') ? 'room' : 'upload') };
 }
 function loadEnrolled() {
-  enrolled = {}; enrolledFaces = {};
+  enrolled = {}; enrolledFaces = {}; enrolledCats = {};
   try {
     for (const name of fs.readdirSync(cfg.identityDir)) {
       const d = path.join(cfg.identityDir, name);
-      if (name === 'models' || !fs.statSync(d).isDirectory()) continue;
-      const items = [], fitems = [];
+      if (name === 'models' || name === 'pending' || name === 'negatives' || !fs.statSync(d).isDirectory()) continue;
+      const items = [], fitems = [], citems = [];
       for (const f of fs.readdirSync(d)) {
-        const isVoice = /^voice-.*\.json$/.test(f), isFace = /^face-.*\.json$/.test(f);
-        if (!isVoice && !isFace) continue;
-        try { const j = JSON.parse(fs.readFileSync(path.join(d, f), 'utf8')); if (Array.isArray(j.embedding)) (isVoice ? items : fitems).push(sampleItem(f, j)); } catch (e) { /* skip */ }
+        const kind = /^(voice|face|cat)-.*\.json$/.exec(f);
+        if (!kind) continue;
+        try {
+          const j = JSON.parse(fs.readFileSync(path.join(d, f), 'utf8'));
+          if (Array.isArray(j.embedding)) ({ voice: items, face: fitems, cat: citems })[kind[1]].push({ ...sampleItem(f, j), sized: j.sized !== false });
+        } catch (e) { /* skip */ }
       }
       if (items.length) enrolled[name] = items;
       if (fitems.length) enrolledFaces[name] = fitems;
+      if (citems.length) enrolledCats[name] = citems;
     }
   } catch (e) { /* no identity dir yet */ }
   return enrolled;
@@ -1302,6 +1313,93 @@ function matchFace(embedding) {
     out.push({ name, score: Math.round(best * 1000) / 1000 });
   }
   return out.sort((a, b) => b.score - a.score).slice(0, 3);
+}
+// ---- cat identity (#23): the same shape as faces, over catid.js descriptors.
+// Descriptor cosines run high (a colour histogram dominates), so the naming
+// line is 0.9 and "decisive" needs 0.03 clear of the runner-up.
+const CAT_NAME_AT = 0.9, CAT_DECISIVE = 0.92, CAT_GAP = 0.03, CAT_MIN_PX = 60;
+function matchCat(emb, sized = true) {
+  if (!enrolled) loadEnrolled();
+  const out = [];
+  for (const [name, items] of Object.entries(enrolledCats)) {
+    const best = Math.max(...items.map((it) => catid.cosine(emb, it.embedding, sized, it.sized)));
+    out.push({ name, score: Math.round(best * 1000) / 1000 });
+  }
+  return out.sort((a, b) => b.score - a.score).slice(0, 3);
+}
+const catAmbiguous = (m) => !m.length || m[0].score < CAT_DECISIVE || !!(m[1] && m[0].score - m[1].score < CAT_GAP);
+// Cats in a frame: the house detector's boxes, each described and matched.
+// dets may be passed in (the surface pass already ran the detector).
+async function catsInJpeg(jpg, { dets = null, camera = null } = {}) {
+  const sharp = getSharp();
+  if (!sharp) return { ok: false, reason: 'no_sharp', cats: [] };
+  const d = dets || await infer.detectCats(jpg, { conf: 0.5 });
+  if (d === null) return { ok: false, reason: 'no_detector', cats: [] };
+  const out = [];
+  for (const x of d.filter((det) => det.cls === 15 || det.cls === 16)) {
+    try {
+      const desc = await catid.describeInJpeg(sharp, jpg, x.box);
+      const usable = desc.size_px >= CAT_MIN_PX;
+      const matches = usable ? matchCat(desc.vec, desc.sized) : [];
+      const top = matches[0] && matches[0].score >= CAT_NAME_AT ? matches[0] : null;
+      out.push({ box: x.box, conf: x.conf, roi: x.roi || null, quality: { size_px: desc.size_px, det_score: x.conf, reason: usable ? 'ok' : 'cat_too_small' },
+        name: top ? top.name : null, score: matches[0] ? matches[0].score : null, matches, _emb: usable ? desc.vec : null, _sized: desc.sized, _crop: desc.crop });
+    } catch (e) { /* one bad crop */ }
+  }
+  out.sort((a, b) => b.box.w * b.box.h - a.box.w * a.box.h);
+  return { ok: true, cats: out, camera };
+}
+const publicCat = (c) => ({ name: c.name, score: c.score, box: c.box, conf: c.conf, roi: c.roi, quality: c.quality, matches: c.matches });
+// Enrol one cat from a frame's detections or an uploaded photo (found = catsInJpeg result, or {photo: desc}).
+function enrolCat(name, source, found, index) {
+  if (!/^[a-z0-9_-]{1,32}$/i.test(name)) return { ok: false, accepted: false, reason: 'bad_name' };
+  name = name.toLowerCase();
+  let pick;
+  if (found.photo) pick = { _emb: found.photo.vec, _sized: false, quality: { size_px: found.photo.size_px, reason: 'ok' }, box: null };
+  else {
+    if (!found.ok) return { ok: false, accepted: false, reason: found.reason };
+    if (!found.cats.length) return { ok: true, accepted: false, reason: 'no_cat', cats: 0 };
+    const usable = found.cats.filter((c) => c._emb);
+    if (!usable.length) return { ok: true, accepted: false, reason: 'cat_too_small', size_px: Math.max(...found.cats.map((c) => c.quality.size_px)), needed_px: CAT_MIN_PX, cats: found.cats.length };
+    if (Number.isInteger(index)) pick = usable[index] || null;
+    else if (usable.length === 1) pick = usable[0];
+    else return { ok: true, accepted: false, reason: 'multiple_cats', cats: usable.map((c, i) => ({ index: i, box: c.box, size_px: c.quality.size_px, matches: c.matches })) };
+    if (!pick) return { ok: true, accepted: false, reason: 'bad_index', cats: usable.length };
+  }
+  const d = path.join(cfg.identityDir, name);
+  fs.mkdirSync(d, { recursive: true });
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const j = { at: new Date().toISOString(), camera: source, source: String(source).startsWith('camera.') ? 'room' : 'upload', quality: pick.quality, box: pick.box, sized: !!pick._sized, embedding: pick._emb };
+  fs.writeFileSync(path.join(d, `cat-${ts}.json`), JSON.stringify(j));
+  if (cfg.identityKeepSamples && pick._crop) fs.writeFileSync(path.join(d, `cat-${ts}.jpg`), pick._crop);
+  loadEnrolled();
+  console.log(`[nest_headless] IDENTITY enrolled cat ${name} (${(enrolledCats[name] || []).length} samples, ${pick.quality.size_px}px${found.photo ? ', photo' : ''})`);
+  return { ok: true, accepted: true, quality: pick.quality, samples: (enrolledCats[name] || []).length };
+}
+function catSummary(name) {
+  const c = enrolledCats[name] || [];
+  return { name, samples: c.length, room: c.filter((it) => it.source === 'room').length, upload: c.filter((it) => it.source !== 'room').length, last_seen: lastMatched[name] || null, updated_at: c.map((i) => i.at).sort().pop() || null };
+}
+// Match the cats in a surface pass; park the ambiguous ones for a label (kind "cat").
+const lastPendingCatMs = {};
+async function identifyCats(entityId, jpg, dets) {
+  const r = await catsInJpeg(jpg, { dets, camera: entityId });
+  if (!r.ok) return [];
+  const now = Date.now();
+  for (const c of r.cats) {
+    if (!c._emb) continue;
+    if (!catAmbiguous(c.matches)) { lastMatched[c.matches[0].name] = new Date().toISOString(); continue; }
+    if (!Object.keys(enrolledCats).length && !c._crop) continue;
+    if (pending.negativeScore('cat', c._emb, catid.cosine) >= CAT_DECISIVE) continue;
+    if (now - (lastPendingCatMs[entityId] || 0) < 60000 || !c._crop) continue;   // one cat candidate per camera per minute
+    lastPendingCatMs[entityId] = now;
+    try {
+      const meta = pending.add({ kind: 'cat', camera: entityId.replace(/^camera\./, ''), t: new Date().toISOString(), quality: c.quality, matches: c.matches, embedding: c._emb, size_px: c.quality.size_px, media: { buf: c._crop, ext: 'jpg' } });
+      console.log(`[nest_headless] IDENTITY pending cat ${meta.id} (${c.quality.size_px}px, best ${c.matches[0] ? c.matches[0].name + ':' + c.matches[0].score : 'none'})`);
+      notePendingCount({ id: meta.id, kind: 'cat', camera: meta.camera, t: meta.t });
+    } catch (e) { console.warn('[nest_headless] pending cat failed:', e.message); }
+  }
+  return r.cats;
 }
 // Faces in a fresh frame off the held stream: [{name|null, score, box, quality, matches}], largest first.
 // ArcFace cosine: same person on this camera ~0.5-0.8, strangers ~0.1-0.3; `name` is set at >= 0.4,
@@ -1661,7 +1759,8 @@ function identitySummary() {
   return { people: [...names].map((name) => ({
     name, voice_samples: (enrolled[name] || []).length, face_samples: (enrolledFaces[name] || []).length,
     updated_at: [...(enrolled[name] || []), ...(enrolledFaces[name] || [])].map((i) => i.at).sort().pop() || null,
-  })), face_models: faces.hasModels(FACE_MODELS_DIR()), pending: pending.count(), negatives: pending.negativeCount() };
+  })), cats: Object.keys(enrolledCats).sort().map(catSummary),   // cats live beside people (#23)
+  face_models: faces.hasModels(FACE_MODELS_DIR()), pending: pending.count(), negatives: pending.negativeCount() };
 }
 function readJsonBody(req) {
   return new Promise((resolve) => {
@@ -2551,8 +2650,49 @@ const server = http.createServer(async (req, res) => {
       if (req.method === 'GET' && parts[1] === 'who' && parts[2]) {
         // who is in view right now: one frame, faces matched against enrolled people
         const r = await facesForCamera(cameraEntity(parts[2]));
+        // cats in the same frame (#23), when the frame came back
+        let cats = [];
+        if (r.jpg) { try { cats = (await catsInJpeg(r.jpg, { camera: cameraEntity(parts[2]) })).cats.map(publicCat); } catch (e) { /* faces still answer */ } }
         res.writeHead(r.ok ? 200 : 404, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ ok: r.ok, reason: r.reason, camera: parts[2], at: new Date().toISOString(), faces: r.faces.map(publicFace) }));
+        return res.end(JSON.stringify({ ok: r.ok, reason: r.reason, camera: parts[2], at: new Date().toISOString(), faces: r.faces.map(publicFace), cats }));
+      }
+      // ---- cats (#23): the same identity flow for the household's cats
+      if (req.method === 'POST' && parts[1] === 'cat' && parts[2] === 'enrol') {
+        const body = await readJsonBody(req);
+        const cam = body.camera ? cameraEntity(body.camera) : null;
+        let found;
+        if (body.image_b64) {
+          // a labelled crop or a photo from the app: the cat is the picture (no frame, so unsized)
+          let jpg = Buffer.from(String(body.image_b64).replace(/^data:[^,]*,/, ''), 'base64');
+          if (jpg.length < 100) { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, accepted: false, reason: 'bad_image' })); }
+          const sharpM = getSharp();
+          if (!sharpM) { res.writeHead(500, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, accepted: false, reason: 'no_sharp' })); }
+          try {
+            jpg = await sharpM(jpg).rotate().resize({ width: 1600, height: 1600, fit: 'inside', withoutEnlargement: true }).jpeg({ quality: 92 }).toBuffer();
+            // if the house detector finds the cat in the photo, describe that box; else the whole picture
+            const d = await infer.detectCats(jpg, { conf: 0.5 }).catch(() => null);
+            const boxes = (d || []).filter((x) => x.cls === 15 || x.cls === 16).sort((a, b) => b.box.w * b.box.h - a.box.w * a.box.h);
+            found = boxes.length ? { photo: { ...(await catid.describeInJpeg(sharpM, jpg, boxes[0].box, { withCrop: false })), sized: false } } : { photo: await catid.describeImage(sharpM, jpg) };
+          } catch (e) { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, accepted: false, reason: 'bad_image: ' + e.message })); }
+        } else if (cam) {
+          const mgr = watchMgr[cam];
+          if (!mgr || !mgr.ready || !mgr.page) { res.writeHead(404, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, accepted: false, reason: 'camera_not_watched' })); }
+          const shot = await mgr.page.evaluate(fns.grabFrame, { quality: cfg.jpegQuality, crop: null });
+          const jpg = Buffer.from(shot.dataUrl.split(',')[1], 'base64');
+          noteFrame(cam, jpg);
+          found = await catsInJpeg(jpg, { camera: cam });
+        } else { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, accepted: false, reason: 'no_camera_or_image' })); }
+        const r = enrolCat(String(body.name || ''), cam || 'upload', found, Number.isInteger(body.index) ? body.index : undefined);
+        res.writeHead(r.ok ? 200 : 400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(r));
+      }
+      if (req.method === 'DELETE' && parts[1] === 'cat' && parts[2]) {
+        const r = forgetPerson(parts[2]);   // a cat's samples live in the same store, under its name
+        res.writeHead(r.ok ? 200 : 404, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(r));
+      }
+      if (req.method === 'GET' && parts[1] === 'cat' && parts[2]) {
+        if (!enrolled) loadEnrolled();
+        const r = enrolledCats[parts[2].toLowerCase()] ? catSummary(parts[2].toLowerCase()) : null;
+        res.writeHead(r ? 200 : 404, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(r || { ok: false, reason: 'unknown' }));
       }
       if (req.method === 'POST' && parts[1] === 'face' && parts[2] === 'enrol') {
         const body = await readJsonBody(req);

@@ -388,6 +388,14 @@ Endpoints (loopback, or `Authorization: Bearer <API_TOKEN>` from the LAN):
   speaking in an uploaded clip (>= 1 s voiced, up to 15 s); WAV, or m4a/caf
   where the host has `afconvert`/`ffmpeg`. Nothing is kept.
 - `DELETE /identity/<name>` -> forgets voice and face.
+- Cats, the same way: `POST /identity/cat/enrol` {camera, name, index?} or
+  {name, image_b64}; `GET /identity` lists `cats`; `GET /identity/cat/<name>`;
+  `DELETE /identity/cat/<name>`. Cat detections on surface events carry
+  `who` (name at >= 0.9, `matches` always) and ambiguous ones queue in the
+  backlog as `kind: "cat"`. The descriptor is colour, coat, texture and box
+  size on the detection's inner 60 % (crop margin 25 % of the box each
+  side); a photo sample has no frame and matches on colour and texture
+  only, so enrol from the camera (or label backlog crops) for size to count.
 
 Embeddings are JSON under `nest_models/identity/<name>/`; raw audio or the
 aligned 112x112 face crop are kept only with `identity_keep_samples`. The
