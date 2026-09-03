@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.11.7
+
+- Activity zones ignore people (Hearth #12 field note): before a zone goes
+  `running`, a fresh frame is checked for a person box covering >= 25% of
+  the zone; if someone is there the zone stays idle and the window resets -
+  a real drum cycle keeps turning after they walk away. Three 19-84 s
+  "cycles" on 3 Sept were people loading the machine.
+- 1.11.6: with passages configured, any motion in the frame feeds the
+  tracker (persistent tracks between doorways); per-ROI `minPct`.
+
 ## 1.11.5
 
 - Quiet speech (Hearth #15): when the end-pointer would report `no_speech`

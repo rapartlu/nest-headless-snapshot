@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.11.6';
+const ADDON_VERSION = '1.11.7';
 
 const http = require('http');
 const fs = require('fs');
@@ -781,16 +781,49 @@ function onActivity(entityId, pcts) {
     if (a.window.length < 10) continue;
     const above = a.window.filter((p) => p >= cfg.activityPct).length / a.window.length;
     const next = a.state === 'running' ? (above < 0.2 ? 'idle' : 'running') : (above >= 0.6 ? 'running' : 'idle');
-    if (next !== a.state) {
-      const now = Date.now(), prev = a.state, dur = Math.round((now - a.since) / 1000);
-      a.state = next; a.since = now;
-      console.log(`[nest_headless] ACTIVITY ${z.name} on ${entityId}: ${prev} -> ${next} after ${dur}s (mean ${a.lastMean}%)`);
-      postHaEvent('nest_headless_activity', {
-        entity_id: entityId, camera: entityId.replace(/^camera\./, ''), zone: z.name,
-        state: next, previous: prev, previous_duration_s: dur, mean_pct: a.lastMean, t: new Date(now).toISOString(),
-      }).catch(() => {});
+    if (next === a.state) continue;
+    if (next === 'running') {
+      // A person loading the machine moves over the porthole and reads as a
+      // turning drum (three 19-84 s "cycles" on 3 Sept, each with someone at
+      // the appliance). Before going running, check a fresh frame for a
+      // person box covering >= 25% of the zone; if so hold idle and try again
+      // on the next tick - a real cycle keeps turning after they leave.
+      if (a.checking) continue;
+      a.checking = true;
+      occludedBy(entityId, z).then((who) => {
+        a.checking = false;
+        if (who) { a.window.length = 0; if (Date.now() - (a.lastOccludedLogMs || 0) > 60000) { a.lastOccludedLogMs = Date.now(); console.log(`[nest_headless] ACTIVITY ${z.name} on ${entityId}: motion but occluded by a person (${Math.round(who.overlap * 100)}% of the zone) - staying idle`); } return; }
+        activityTransition(entityId, z, a, 'running');
+      }).catch(() => { a.checking = false; });
+      continue;
     }
+    activityTransition(entityId, z, a, next);
   }
+}
+function activityTransition(entityId, z, a, next) {
+  const now = Date.now(), prev = a.state, dur = Math.round((now - a.since) / 1000);
+  a.state = next; a.since = now;
+  console.log(`[nest_headless] ACTIVITY ${z.name} on ${entityId}: ${prev} -> ${next} after ${dur}s (mean ${a.lastMean}%)`);
+  postHaEvent('nest_headless_activity', {
+    entity_id: entityId, camera: entityId.replace(/^camera\./, ''), zone: z.name,
+    state: next, previous: prev, previous_duration_s: dur, mean_pct: a.lastMean, t: new Date(now).toISOString(),
+  }).catch(() => {});
+}
+// Fraction of a zone's bounding rect covered by the largest overlapping person box, on a fresh frame.
+async function occludedBy(entityId, z) {
+  const mgr = watchMgr[entityId];
+  if (!mgr || !mgr.page || !mgr.ready) return null;
+  const shot = await mgr.page.evaluate(fns.grabFrame, { quality: cfg.jpegQuality, crop: null });
+  const jpg = Buffer.from(shot.dataUrl.split(',')[1], 'base64');
+  const d = await infer.detect(jpg, { conf: 0.4, classes: [0] });
+  if (!d || !d.length) return null;
+  let best = 0;
+  for (const p of d) {
+    const ix = Math.max(0, Math.min(z.x + z.w, p.box.x + p.box.w) - Math.max(z.x, p.box.x));
+    const iy = Math.max(0, Math.min(z.y + z.h, p.box.y + p.box.h) - Math.max(z.y, p.box.y));
+    best = Math.max(best, (ix * iy) / (z.w * z.h || 1));
+  }
+  return best >= 0.25 ? { overlap: best } : null;
 }
 
 async function watchHit(entityId, payload) {
