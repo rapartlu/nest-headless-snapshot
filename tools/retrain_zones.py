@@ -31,12 +31,28 @@ def count(d):
     return len(list(d.glob("*.jpg"))) + len(list(d.glob("*.jpeg")))
 
 
+def worse(args, prev, m, out, tmp):
+    """A retrain must never replace a model with a worse one (#22: a batch of
+    mislabelled crops took the fridge model from 0.977 to 0.905 in one night).
+    True when the new model is rejected; the .tmp is removed and the caller
+    records the rejection in the stamp so the same label counts are not
+    retried nightly."""
+    new, old = m.get("loo_acc"), prev.get("loo_acc")
+    if args.allow_worse or new is None or old is None or not out.exists() or new >= old - args.worse_by:
+        return False
+    print(f"  leave-one-out {new:.3f} is below the model in place ({old:.3f}); kept the old one (--allow-worse to override)")
+    tmp.unlink(missing_ok=True)
+    return True
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--labels-root", required=True)
     ap.add_argument("--models-dir", required=True)
     ap.add_argument("--min", type=int, default=5, help="minimum images per class")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--allow-worse", action="store_true", help="install a model even when its leave-one-out accuracy is below the one in place")
+    ap.add_argument("--worse-by", type=float, default=0.02, help="a new model must not be worse than the one in place by more than this (leave-one-out)")
     ap.add_argument("--python", default=sys.executable)
     ap.add_argument("--l2", type=float, default=3e-2, help="ridge strength for the trainer (the cupboard model used 1e-3; zones with few samples do better softer)")
     args = ap.parse_args()
@@ -66,6 +82,9 @@ def main():
             if not args.force and out.exists() and prev.get("counts") == counts:
                 print(f"{d.name}: unchanged {counts}, trained {prev.get('trained')}")
                 continue
+            if not args.force and (prev.get("rejected") or {}).get("counts") == counts:
+                print(f"{d.name}: {counts} was rejected at {prev['rejected'].get('at')} (loo {prev['rejected'].get('loo_acc')}), waiting for labels to change")
+                continue
             print(f"{d.name}: training {len(classes)} states {counts}")
             r = subprocess.run([args.python, str(HERE / "train_zone_model.py"), "--labels", str(d), "--out", str(out) + ".tmp",
                                 "--min", str(args.min), "--loo", "--C", str(1 / max(args.l2, 1e-6) / 100)], capture_output=True, text=True)
@@ -73,11 +92,16 @@ def main():
             if r.returncode != 0:
                 print(r.stderr.strip())
                 continue
-            Path(str(out) + ".tmp").replace(out)
+            tmp = Path(str(out) + ".tmp")
             try:
-                m = json.loads(out.read_text())
+                m = json.loads(tmp.read_text())
             except Exception:  # noqa: BLE001
                 m = {}
+            if worse(args, prev, m, out, tmp):
+                prev["rejected"] = {"counts": counts, "loo_acc": m.get("loo_acc"), "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+                stamp.write_text(json.dumps(prev))
+                continue
+            tmp.replace(out)
             stamp.write_text(json.dumps({"counts": counts, "labels": m.get("labels"), "trained": time.strftime("%Y-%m-%dT%H:%M:%S"),
                                          "holdout_acc": m.get("holdout_acc"), "loo_acc": m.get("loo_acc")}))
             done += 1
@@ -105,6 +129,10 @@ def main():
         if not args.force and out.exists() and prev.get("open") == npos and prev.get("closed") == nneg:
             print(f"{d.name}: unchanged ({npos}/{nneg}), trained {prev.get('trained')}")
             continue
+        rej = prev.get("rejected") or {}
+        if not args.force and rej.get("open") == npos and rej.get("closed") == nneg:
+            print(f"{d.name}: {npos}/{nneg} was rejected at {rej.get('at')} (loo {rej.get('loo_acc')}), waiting for labels to change")
+            continue
         zone = d.name.split("__", 1)[1]
         cmd = [args.python, str(HERE / "train_door_model.py"), "--pos", str(pos), "--neg", str(neg),
                "--out", str(out) + ".tmp", "--label", zone, "--subcrop", "0,0,1,1", "--loo", "--l2", str(args.l2)]
@@ -116,11 +144,16 @@ def main():
         if r.returncode != 0:
             print(r.stderr.strip())
             continue
-        Path(str(out) + ".tmp").replace(out)
+        tmp = Path(str(out) + ".tmp")
         try:
-            m = json.loads(out.read_text())
+            m = json.loads(tmp.read_text())
         except Exception:  # noqa: BLE001
             m = {}
+        if worse(args, prev, m, out, tmp):
+            prev["rejected"] = {"open": npos, "closed": nneg, "loo_acc": m.get("loo_acc"), "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+            stamp.write_text(json.dumps(prev))
+            continue
+        tmp.replace(out)
         stamp.write_text(json.dumps({"open": npos, "closed": nneg, "trained": time.strftime("%Y-%m-%dT%H:%M:%S"),
                                      "holdout_acc": m.get("holdout_acc"), "loo_acc": m.get("loo_acc")}))
         done += 1
