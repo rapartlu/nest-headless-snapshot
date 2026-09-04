@@ -31,6 +31,10 @@ def count(d):
     return len(list(d.glob("*.jpg"))) + len(list(d.glob("*.jpeg")))
 
 
+def jpegs(d):
+    return sorted(list(d.glob("*.jpg")) + list(d.glob("*.jpeg")))
+
+
 def signature(dirs):
     """A short hash of which files sit in which label folder: a crop moved from
     one label to the other leaves the counts unchanged (#22) but must retrain."""
@@ -43,16 +47,53 @@ def signature(dirs):
     return h.hexdigest()[:12]
 
 
-def worse(args, prev, m, out, tmp):
+def metric(m, key="loo_balanced"):
+    """The number a model is judged on. Balanced recall, because with fifteen
+    closed frames per open one plain accuracy flatters a model that always
+    answers "closed" (#22)."""
+    v = m.get(key)
+    return m.get("loo_acc") if v is None else v
+
+
+def worse(args, prev, m, out, tmp, loo_detail=None, files_now=None):
     """A retrain must never replace a model with a worse one (#22: a batch of
     mislabelled crops took the fridge model from 0.977 to 0.905 in one night).
-    True when the new model is rejected; the .tmp is removed and the caller
-    records the rejection in the stamp so the same label counts are not
-    retried nightly."""
-    new, old = m.get("loo_acc"), prev.get("loo_acc")
-    if args.allow_worse or new is None or old is None or not out.exists() or new >= old - args.worse_by:
+
+    Comparing a stored score against a fresh one is only fair when both were
+    measured on the same frames. When the corpus has grown, the honest test is
+    the frames the model in place has never seen: score it on those and compare
+    with the new model's leave-one-out over the same names. (Comparing across
+    corpora once kept a model that scored 0.47 balanced on unseen frames over
+    one that scored 0.85.) True when the new model is rejected.
+    """
+    new = metric(m)
+    if args.allow_worse or new is None or not out.exists():
         return False
-    print(f"  leave-one-out {new:.3f} is below the model in place ({old:.3f}); kept the old one (--allow-worse to override)")
+    old_seen = set((prev.get("files") or []))
+    added = [f for f in (files_now or []) if f.name not in old_seen] if old_seen else []
+    if added and loo_detail:
+        try:
+            import train_door_model as tdm
+            M = tdm.load_model_json(out)
+            names = {f.name: f for f in added}
+            old_pairs = [(1 if f.parent.name in ("open", "pos") else 0, p)
+                         for f, p in zip(added, tdm.score_files(M, added))]
+            new_pairs = [(d["cls"], d["p"]) for d in loo_detail if d["name"] in names]
+            if len(new_pairs) >= 5 and len(old_pairs) >= 5:
+                _, _, ob = tdm.balanced(old_pairs)
+                _, _, nb = tdm.balanced(new_pairs)
+                print(f"  on the {len(added)} frames the model in place has not seen: it scores {ob:.3f} balanced, the new one {nb:.3f}")
+                if nb >= ob - args.worse_by:
+                    return False
+                print(f"  the new model is worse on unseen frames; kept the old one (--allow-worse to override)")
+                tmp.unlink(missing_ok=True)
+                return True
+        except Exception as e:  # noqa: BLE001
+            print(f"  (could not compare on unseen frames: {e})")
+    old = metric(prev)
+    if old is None or new >= old - args.worse_by:
+        return False
+    print(f"  score {new:.3f} is below the model in place ({old:.3f}); kept the old one (--allow-worse to override)")
     tmp.unlink(missing_ok=True)
     return True
 
@@ -148,8 +189,10 @@ def main():
             print(f"{d.name}: {npos}/{nneg} was rejected at {rej.get('at')} (loo {rej.get('loo_acc')}), waiting for labels to change")
             continue
         zone = d.name.split("__", 1)[1]
+        loo_json = Path(str(out) + ".loo.json")
         cmd = [args.python, str(HERE / "train_door_model.py"), "--pos", str(pos), "--neg", str(neg),
-               "--out", str(out) + ".tmp", "--label", zone, "--subcrop", "0,0,1,1", "--loo", "--l2", str(args.l2)]
+               "--out", str(out) + ".tmp", "--label", zone, "--subcrop", "0,0,1,1", "--loo", "--l2", str(args.l2),
+               "--loo-out", str(loo_json)]
         if conflicts:
             cmd += ["--exclude", ",".join(conflicts)]
         print(f"{d.name}: training on {npos} open / {nneg} closed")
@@ -163,13 +206,25 @@ def main():
             m = json.loads(tmp.read_text())
         except Exception:  # noqa: BLE001
             m = {}
-        if worse(args, prev, m, out, tmp):
-            prev["rejected"] = {"open": npos, "closed": nneg, "sig": sig, "loo_acc": m.get("loo_acc"), "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+        detail = None
+        try:
+            detail = json.loads(loo_json.read_text())
+        except Exception:  # noqa: BLE001
+            pass
+        files_now = jpegs(pos) + jpegs(neg)
+        if worse(args, prev, m, out, tmp, detail, files_now):
+            prev["rejected"] = {"open": npos, "closed": nneg, "sig": sig, "loo_acc": m.get("loo_acc"),
+                                "loo_balanced": m.get("loo_balanced"), "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
             stamp.write_text(json.dumps(prev))
+            loo_json.unlink(missing_ok=True)
             continue
         tmp.replace(out)
+        loo_json.unlink(missing_ok=True)
         stamp.write_text(json.dumps({"open": npos, "closed": nneg, "sig": sig, "trained": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                                     "holdout_acc": m.get("holdout_acc"), "loo_acc": m.get("loo_acc")}))
+                                     "holdout_acc": m.get("holdout_acc"), "loo_acc": m.get("loo_acc"),
+                                     "loo_open_recall": m.get("loo_open_recall"), "loo_closed_recall": m.get("loo_closed_recall"),
+                                     "loo_balanced": m.get("loo_balanced"),
+                                     "files": [f.name for f in files_now]}))
         done += 1
     print(f"retrained {done} model(s)")
 

@@ -9,6 +9,13 @@
   fridge model from 0.977 to 0.905 overnight (#22).
 - The trainer detects a changed label set by a signature of the file names,
   not the counts alone: a crop moved from one label to the other retrains.
+- Zone models are judged on balanced recall, not accuracy: with fifteen
+  closed frames per open one, "always closed" scores 0.94 before it has
+  learned anything (#22). The trainer reports each class's recall.
+- The guard compares a new model against the one in place on the frames the
+  latter has never seen, not against a score stored from a smaller corpus.
+  The old comparison kept a model scoring 0.45 balanced on unseen frames
+  over one scoring 0.72.
 
 - `GET /archive/<camera>/<time>.jpg` serves the whole frame (`_f`) of a
   camera that archives a crop, not the crop itself (#30). The hallway's

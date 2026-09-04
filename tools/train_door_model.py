@@ -96,6 +96,40 @@ def jpegs(dirpath):
     return [f for f in sorted(Path(dirpath).glob("*.jpg")) + sorted(Path(dirpath).glob("*.jpeg")) if f.name not in EXCLUDE]
 
 
+def load_model_json(path):
+    """A saved model, ready for score_files()."""
+    m = json.loads(Path(path).read_text())
+    return (m, np.array(m["reference"]).reshape(m["height"], m["width"]),
+            np.array(m["mean"]), np.array(m["std"]), np.array(m["weights"]), float(m["bias"]))
+
+
+def score_files(M, files):
+    """Score frames with a saved model exactly as the add-on does: per-image
+    standardise, subtract the reference, normalise, logistic. Used to compare a
+    model already in place against a fresh one on the same unseen frames (#22)."""
+    m, refz, mean, std, w, b = M
+    global SUBCROP
+    keep, SUBCROP = SUBCROP, tuple(m["subcrop"])
+    try:
+        out = []
+        for f in files:
+            z = standardize(load_gray(f))
+            x = ((z - refz).ravel() - mean) / std
+            out.append(float(1 / (1 + np.exp(-np.clip(x @ w + b, -30, 30)))))
+    finally:
+        SUBCROP = keep
+    return out
+
+
+def balanced(pairs):
+    """(open recall, closed recall, balanced) from [(cls, p), ...]."""
+    po = [p for c, p in pairs if c == 1]
+    pc = [p for c, p in pairs if c == 0]
+    o = sum(1 for p in po if p >= 0.5) / max(1, len(po))
+    c = sum(1 for p in pc if p < 0.5) / max(1, len(pc))
+    return o, c, (o + c) / 2
+
+
 def fit(Xz, y, epochs, l2):
     """Class-balanced logistic regression, full-batch gradient descent."""
     w = np.zeros(Xz.shape[1])
@@ -144,6 +178,7 @@ def main():
     ap.add_argument("--subcrop", default=None,
                     help="x0,y0,x1,y1 view within the crop (default 0,0,1,0.9 for the "
                          "cupboard; use 0,0,1,1 for a whole zone crop)")
+    ap.add_argument("--loo-out", default=None, help="write the per-frame leave-one-out results as JSON")
     ap.add_argument("--loo", action="store_true",
                     help="leave-one-out check over the ORIGINAL images (the holdout split "
                          "above sees augmented copies of the same frames, so it flatters)")
@@ -200,9 +235,20 @@ def main():
                 results.append((cls, float(p), f.name))
         ok = sum(1 for c, p, _ in results if (p >= 0.5) == (c == 1))
         loo_acc = ok / max(1, len(results))
-        print(f"leave-one-out over {len(results)} originals: acc {loo_acc:.3f}")
+        # With one open frame per fifteen closed, plain accuracy flatters a
+        # model that always answers "closed" (#22): report each class's recall
+        # and their mean, which is what the zone's usefulness rests on.
+        po = [p for c, p, _ in results if c == 1]
+        pc = [p for c, p, _ in results if c == 0]
+        loo_open = sum(1 for p in po if p >= 0.5) / max(1, len(po))
+        loo_closed = sum(1 for p in pc if p < 0.5) / max(1, len(pc))
+        loo_bal = (loo_open + loo_closed) / 2
+        print(f"leave-one-out over {len(results)} originals: acc {loo_acc:.3f} "
+              f"(open recall {loo_open:.3f} on {len(po)}, closed recall {loo_closed:.3f} on {len(pc)}, balanced {loo_bal:.3f})")
         for c, p, n in results:
             print(f"  {'open  ' if c else 'closed'} {p:.2f} {n}{'' if (p >= 0.5) == (c == 1) else '   <-- wrong'}")
+        if args.loo_out:
+            Path(args.loo_out).write_text(json.dumps([{"name": n, "cls": c, "p": p} for c, p, n in results]))
 
     def acc(Xs, ys):
         p = 1 / (1 + np.exp(-np.clip(Xs @ w + b, -30, 30)))
@@ -227,6 +273,9 @@ def main():
         "samples": {"pos": npos, "neg": nneg},
         "holdout_acc": round(float(te_acc), 4),
         "loo_acc": None if loo_acc is None else round(float(loo_acc), 4),
+        "loo_open_recall": None if loo_acc is None else round(float(loo_open), 4),
+        "loo_closed_recall": None if loo_acc is None else round(float(loo_closed), 4),
+        "loo_balanced": None if loo_acc is None else round(float(loo_bal), 4),
     }
     Path(args.out).write_text(json.dumps(model))
     print(f"wrote {args.out} ({Path(args.out).stat().st_size // 1024} KB)")
