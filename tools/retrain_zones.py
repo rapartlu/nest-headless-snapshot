@@ -16,10 +16,15 @@ Usage (a nightly launchd/cron job):
     python3 retrain_zones.py --labels-root /path/to/training --models-dir /config/nest_models [--min 5] [--force]
 """
 
-import argparse, json, subprocess, sys, time
+import argparse, functools, json, signal, subprocess, sys, time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+# A scheduled run must never hang: the first nightly run sat three hours in
+# an I/O wait on a network share. SIGALRM ends it; output is unbuffered so a
+# log shows how far it got.
+signal.alarm(int(__import__("os").environ.get("RETRAIN_TIMEOUT_S", "2700")))
+print = functools.partial(print, flush=True)  # noqa: A001
 
 
 def count(d):
