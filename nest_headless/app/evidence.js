@@ -39,7 +39,10 @@ function parseTime(s) {
   const t = Date.parse(s);
   return Number.isFinite(t) ? t : null;
 }
-// nearest stamped name in a sorted list (raw frames only: no _a/_f/_cat suffixes unless allowed)
+// nearest stamped name in a sorted list (raw frames only: no _a/_f/_cat suffixes unless allowed).
+// A camera with a configured crop archives the crop as <stamp>.jpg and the
+// whole frame as <stamp>_f.jpg; the whole frame is the evidence (#30), so
+// when the nearest stamp has an _f sibling that is the name returned.
 function nearestName(names, t, { suffix = '.jpg', raw = true } = {}) {
   let best = null;
   for (const n of names) {
@@ -48,6 +51,10 @@ function nearestName(names, t, { suffix = '.jpg', raw = true } = {}) {
     const ts = parseStamp(n); if (ts === null) continue;
     const d = Math.abs(ts - t);
     if (!best || d < best.dt) best = { name: n, t: ts, dt: d };
+  }
+  if (best && raw) {
+    const full = best.name.replace(/\.jpg$/, '_f.jpg');
+    if (names.includes(full)) { best.crop = best.name; best.name = full; }
   }
   return best;
 }

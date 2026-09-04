@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.18.7
+
+- `GET /archive/<camera>/<time>.jpg` serves the whole frame (`_f`) of a
+  camera that archives a crop, not the crop itself (#30). The hallway's
+  1.5 KB "thumbnail" was its door crop.
+
 ## 1.18.6
 
 - A cat is named on a detection only when the match is decisive (>= 0.92

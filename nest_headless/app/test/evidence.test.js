@@ -33,3 +33,14 @@ test('nearestName skips annotated copies and non-stamped files', () => {
   assert.strictEqual(nearestName(names, t, { raw: false }).name, '2026-09-03T16-24-53-000Z_f.jpg');
   assert.strictEqual(nearestName(['timeline.json'], t), null);
 });
+
+test('nearestName prefers the _f whole frame of a cropped camera over its crop (#30)', () => {
+  const names = ['2026-09-04T11-25-40-724Z.jpg', '2026-09-04T11-25-40-724Z_f.jpg', '2026-09-04T11-26-40-686Z.jpg', '2026-09-04T11-26-40-686Z_f.jpg', '2026-09-04T11-27-40-765Z.jpg'];
+  const t = parseStamp('2026-09-04T11-26-40-686Z.jpg');
+  const n = nearestName(names, t + 5000);
+  assert.equal(n.name, '2026-09-04T11-26-40-686Z_f.jpg');
+  assert.equal(n.crop, '2026-09-04T11-26-40-686Z.jpg');
+  assert.equal(n.dt, 5000);
+  // no sibling: the plain frame stands (cameras without a crop archive the whole frame as <stamp>.jpg)
+  assert.equal(nearestName(names, parseStamp('2026-09-04T11-27-40-765Z.jpg')).name, '2026-09-04T11-27-40-765Z.jpg');
+});
