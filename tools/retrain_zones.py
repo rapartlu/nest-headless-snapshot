@@ -16,7 +16,7 @@ Usage (a nightly launchd/cron job):
     python3 retrain_zones.py --labels-root /path/to/training --models-dir /config/nest_models [--min 5] [--force]
 """
 
-import argparse, functools, json, signal, subprocess, sys, time
+import argparse, functools, hashlib, json, signal, subprocess, sys, time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -29,6 +29,18 @@ print = functools.partial(print, flush=True)  # noqa: A001
 
 def count(d):
     return len(list(d.glob("*.jpg"))) + len(list(d.glob("*.jpeg")))
+
+
+def signature(dirs):
+    """A short hash of which files sit in which label folder: a crop moved from
+    one label to the other leaves the counts unchanged (#22) but must retrain."""
+    h = hashlib.sha1()
+    for d in dirs:
+        h.update(d.name.encode())
+        for f in sorted(p.name for p in list(d.glob("*.jpg")) + list(d.glob("*.jpeg"))):
+            h.update(b"/" + f.encode())
+        h.update(b"\n")
+    return h.hexdigest()[:12]
 
 
 def worse(args, prev, m, out, tmp):
@@ -68,6 +80,7 @@ def main():
         classes = sorted(p for p in d.iterdir() if p.is_dir() and not p.name.startswith("."))
         if len(classes) >= 3:
             counts = {p.name: count(p) for p in classes}
+            sig = signature(classes)
             stamp = models / f".{d.name}.trained.json"
             prev = {}
             try:
@@ -79,10 +92,10 @@ def main():
                 print(f"{d.name}: {counts} - waiting for at least {args.min} in {', '.join(thin)}")
                 continue
             out = models / f"{d.name}.json"
-            if not args.force and out.exists() and prev.get("counts") == counts:
+            if not args.force and out.exists() and prev.get("counts") == counts and prev.get("sig") == sig:
                 print(f"{d.name}: unchanged {counts}, trained {prev.get('trained')}")
                 continue
-            if not args.force and (prev.get("rejected") or {}).get("counts") == counts:
+            if not args.force and (prev.get("rejected") or {}).get("sig") == sig:
                 print(f"{d.name}: {counts} was rejected at {prev['rejected'].get('at')} (loo {prev['rejected'].get('loo_acc')}), waiting for labels to change")
                 continue
             print(f"{d.name}: training {len(classes)} states {counts}")
@@ -98,11 +111,11 @@ def main():
             except Exception:  # noqa: BLE001
                 m = {}
             if worse(args, prev, m, out, tmp):
-                prev["rejected"] = {"counts": counts, "loo_acc": m.get("loo_acc"), "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+                prev["rejected"] = {"counts": counts, "sig": sig, "loo_acc": m.get("loo_acc"), "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
                 stamp.write_text(json.dumps(prev))
                 continue
             tmp.replace(out)
-            stamp.write_text(json.dumps({"counts": counts, "labels": m.get("labels"), "trained": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            stamp.write_text(json.dumps({"counts": counts, "sig": sig, "labels": m.get("labels"), "trained": time.strftime("%Y-%m-%dT%H:%M:%S"),
                                          "holdout_acc": m.get("holdout_acc"), "loo_acc": m.get("loo_acc")}))
             done += 1
             continue
@@ -116,6 +129,7 @@ def main():
         if conflicts:
             print(f"{d.name}: {len(conflicts)} file(s) labelled both open and closed, skipped: {', '.join(conflicts[:6])}")
         npos, nneg = count(pos) - len(conflicts), count(neg) - len(conflicts)
+        sig = signature([pos, neg])
         stamp = models / f".{d.name}.trained.json"
         prev = {}
         try:
@@ -126,11 +140,11 @@ def main():
             print(f"{d.name}: {npos} open / {nneg} closed - waiting for at least {args.min} each")
             continue
         out = models / f"{d.name}.json"
-        if not args.force and out.exists() and prev.get("open") == npos and prev.get("closed") == nneg:
+        if not args.force and out.exists() and prev.get("open") == npos and prev.get("closed") == nneg and prev.get("sig") == sig:
             print(f"{d.name}: unchanged ({npos}/{nneg}), trained {prev.get('trained')}")
             continue
         rej = prev.get("rejected") or {}
-        if not args.force and rej.get("open") == npos and rej.get("closed") == nneg:
+        if not args.force and rej.get("sig") == sig:
             print(f"{d.name}: {npos}/{nneg} was rejected at {rej.get('at')} (loo {rej.get('loo_acc')}), waiting for labels to change")
             continue
         zone = d.name.split("__", 1)[1]
@@ -150,11 +164,11 @@ def main():
         except Exception:  # noqa: BLE001
             m = {}
         if worse(args, prev, m, out, tmp):
-            prev["rejected"] = {"open": npos, "closed": nneg, "loo_acc": m.get("loo_acc"), "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+            prev["rejected"] = {"open": npos, "closed": nneg, "sig": sig, "loo_acc": m.get("loo_acc"), "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
             stamp.write_text(json.dumps(prev))
             continue
         tmp.replace(out)
-        stamp.write_text(json.dumps({"open": npos, "closed": nneg, "trained": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        stamp.write_text(json.dumps({"open": npos, "closed": nneg, "sig": sig, "trained": time.strftime("%Y-%m-%dT%H:%M:%S"),
                                      "holdout_acc": m.get("holdout_acc"), "loo_acc": m.get("loo_acc")}))
         done += 1
     print(f"retrained {done} model(s)")

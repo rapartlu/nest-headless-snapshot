@@ -7,6 +7,8 @@
   rejection is recorded in the stamp and not retried until the labels change
   (`--allow-worse` overrides). A batch of mislabelled crops had taken the
   fridge model from 0.977 to 0.905 overnight (#22).
+- The trainer detects a changed label set by a signature of the file names,
+  not the counts alone: a crop moved from one label to the other retrains.
 
 - `GET /archive/<camera>/<time>.jpg` serves the whole frame (`_f`) of a
   camera that archives a crop, not the crop itself (#30). The hallway's
