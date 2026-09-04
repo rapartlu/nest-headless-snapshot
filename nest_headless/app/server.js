@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.17.5';
+const ADDON_VERSION = '1.18.4';
 
 const http = require('http');
 const fs = require('fs');
@@ -56,6 +56,12 @@ const CONFIG_DIR = process.env.HA_CONFIG_DIR || (fs.existsSync('/homeassistant')
 const ASSETS_DIR = path.join(__dirname, 'assets');
 const cfg = {
   port: intEnv('PORT', 8098),
+  // Blue/green handover (1.18.0): a new instance started with PORT=<spare>,
+  // HANDOVER_FROM=http://127.0.0.1:<old port> and TARGET_PORT=<old port> dials
+  // its own streams, settles, asks the old instance to drain, then takes the
+  // target port. Sensing never stops; only the HTTP port blinks.
+  handoverFrom: (process.env.HANDOVER_FROM || '').replace(/\/+$/, ''),
+  targetPort: intEnv('TARGET_PORT', 0),
   minIntervalSeconds: intEnv('MIN_INTERVAL_SECONDS', 10),
   jpegQuality: intEnv('JPEG_QUALITY', 85) / 100,
   captureTimeoutSeconds: intEnv('CAPTURE_TIMEOUT_SECONDS', 25),
@@ -673,7 +679,12 @@ async function watchGrab(entityId) {
   return persistShot(entityId, shot);
 }
 
+// role: 'active' emits events; 'standby' (a handover instance before the
+// switch) and 'draining' (the old instance after it) sense but stay silent,
+// so the house hears each moment exactly once across a deploy.
+const role = { name: cfg.handoverFrom ? 'standby' : 'active', suppressed: 0, since: Date.now() };
 function postHaEvent(type, data) {
+  if (role.name !== 'active') { role.suppressed++; return Promise.resolve(0); }
   return new Promise((resolve) => {
     try {
       const u = new URL(cfg.haWsUrl.replace(/^ws/, 'http'));
@@ -2585,7 +2596,7 @@ function serveFile(res, entityId, extraHeaders = {}) {
   });
 }
 
-const server = http.createServer(async (req, res) => {
+const handleRequest = async (req, res) => {
   const url = new URL(req.url, 'http://x');
   const parts = url.pathname.split('/').filter(Boolean);
   // Sensitive routes - opening a listening window, identity, raw audio -
@@ -2609,6 +2620,13 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { 'Content-Type': 'text/html' });
       return res.end('<!doctype html><title>nest_headless watch</title>');
     }
+    // POST /admin/handover (loopback only): a new instance is ready - stop emitting, finish open captures, exit
+    if (url.pathname === '/admin/handover' && req.method === 'POST') {
+      if (!loopback) { res.writeHead(403); return res.end('loopback only'); }
+      res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true, role: 'draining', open_captures: Object.keys(speechCap).length }));
+      drainAndExit('handover requested').catch(() => process.exit(0));
+      return;
+    }
     if (url.pathname === '/health') {
       res.writeHead(200); res.end('ok'); return;
     }
@@ -2622,6 +2640,7 @@ const server = http.createServer(async (req, res) => {
         audio: audioStats, capturing: Object.keys(speechCap),
         conversations: Object.fromEntries(Object.entries(convo).filter(([, w]) => w.until > Date.now()).map(([k, w]) => [k.replace(/^camera\./, ''), new Date(w.until).toISOString()])),
         wake_by_transcript: cfg.wakeByTranscript,
+        role: role.name, role_since: new Date(role.since).toISOString(), events_held: role.suppressed, listen_port: cfg.port, pid: process.pid,
         watches: Object.fromEntries(Object.entries(watchMgr).map(([k, m]) => [k, {
           ready: m.ready, hits: m.hits, startedAt: m.startedAt, lastError: m.lastError,
           verdictWindow: (m.verdicts || []).join(''), sustainedOpen: !!m.sustainedOpen,
@@ -3070,10 +3089,74 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(500, { 'Content-Type': 'text/plain' });
     res.end('capture failed: ' + e.message);
   }
-});
+};
+const server = http.createServer(handleRequest);
+
+// ---- blue/green handover (1.18.0)
+const HANDOVER_SETTLE_MS = 45000, HANDOVER_MAX_WAIT_MS = 150000;
+async function drainAndExit(reason) {
+  if (role.name === 'draining') return;
+  role.name = 'draining'; role.since = Date.now();
+  console.log(`[nest_headless] draining (${reason}): events stop now, waiting for open captures, then exiting`);
+  const t0 = Date.now();
+  while (Object.keys(speechCap).length && Date.now() - t0 < 10000) await sleep(250);
+  try { server.close(); } catch (e) { /* ok */ }
+  try { const b = await browserPromise; if (b) await b.close(); } catch (e) { /* ok */ }
+  setTimeout(() => process.exit(0), 300).unref();
+}
+function portFree(port) {
+  return new Promise((resolve) => {
+    const s = require('net').createServer();
+    s.once('error', () => resolve(false));
+    s.listen(port, '0.0.0.0', () => s.close(() => resolve(true)));
+  });
+}
+async function handoverAsNew() {
+  const t0 = Date.now();
+  // wait only for the watches the old instance actually has live: a camera
+  // the vendor app has switched off never comes up and must not hold the deploy
+  let wanted = Object.keys(cfg.watches);
+  try {
+    const st = await new Promise((resolve, reject) => { const u = new URL(cfg.handoverFrom + '/'); http.get({ host: u.hostname, port: u.port || 80, path: '/', timeout: 4000 }, (r) => { let b = ''; r.on('data', (c) => { b += c; }); r.on('end', () => { try { resolve(JSON.parse(b)); } catch (e) { reject(e); } }); }).on('error', reject); });
+    const live = Object.entries(st.watches || {}).filter(([, w]) => w.ready).map(([k]) => k);
+    if (live.length) wanted = wanted.filter((id) => live.includes(id));
+  } catch (e) { /* the old instance may be gone: wait for all */ }
+  // wait until every wanted watch is live and settled (or a cap), so the switch is seamless
+  for (;;) {
+    const ready = wanted.filter((id) => watchMgr[id] && watchMgr[id].ready);
+    const settled = ready.every((id) => Date.now() - (watchMgr[id].readySinceMs || 0) >= HANDOVER_SETTLE_MS);
+    const allUp = ready.length === wanted.length;
+    if ((allUp && settled) || Date.now() - t0 > HANDOVER_MAX_WAIT_MS) {
+      if (!allUp) console.warn(`[nest_headless] handover: proceeding with ${ready.length}/${wanted.length} watches live after ${Math.round((Date.now() - t0) / 1000)}s`);
+      break;
+    }
+    await sleep(1000);
+  }
+  // ask the old instance to drain (it stops emitting at once); ignore if it is already gone
+  await new Promise((resolve) => {
+    const u = new URL(cfg.handoverFrom + '/admin/handover');
+    const req = http.request({ host: u.hostname, port: u.port || 80, path: u.pathname, method: 'POST', timeout: 5000 }, (r) => { r.resume(); resolve(r.statusCode); });
+    req.on('error', () => resolve(0)); req.on('timeout', () => { req.destroy(); resolve(0); }); req.end();
+  });
+  // the target port frees when the old instance closes its server
+  const target = cfg.targetPort;
+  const tp = Date.now();
+  while (!(await portFree(target)) && Date.now() - tp < 20000) await sleep(250);
+  // a second listener on the target with the same handler: the spare one is
+  // not closed first, because close() waits for Chromium's idle keep-alive
+  // sockets to /blank (that cost 3 minutes on the first live run)
+  const main = http.createServer(handleRequest);
+  await new Promise((resolve, reject) => main.listen(target, () => resolve()).once('error', reject));
+  cfg.port = target;
+  role.name = 'active'; role.since = Date.now();
+  try { server.closeAllConnections(); } catch (e) { /* older node */ }
+  server.close(() => {});
+  console.log(`[nest_headless] handover complete: active on :${target} after ${Math.round((Date.now() - t0) / 1000)}s (${role.suppressed} events held back while standby)`);
+}
 
 server.listen(cfg.port, () => {
-  console.log(`[nest_headless] listening on :${cfg.port}`);
+  console.log(`[nest_headless] listening on :${cfg.port}${cfg.handoverFrom ? ' as STANDBY, taking over from ' + cfg.handoverFrom + ' on :' + cfg.targetPort : ''}`);
+  if (cfg.handoverFrom && cfg.targetPort) handoverAsNew().catch((e) => { console.error('[nest_headless] handover failed:', e.message); process.exit(2); });
   infer.warmUp().then((ms) => console.log(`[nest_headless] vision models warm in ${ms} ms`)).catch((e) => console.warn('[nest_headless] warm-up failed:', e.message));
   // read the identity dir (possibly a network share) at boot, not during the first conversation
   setTimeout(() => loadEnrolledAsync().catch(() => {}), 3000).unref();

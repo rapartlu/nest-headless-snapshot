@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.18.0 - 1.18.4
+
+- Blue/green deploys on the Mac (no sensing gap). `host/supervise.sh` is
+  what launchd runs: it keeps one instance on the main port and, on
+  `touch <state dir>/deploy.request`, starts the new code beside it on a
+  spare port (`PORT`, `HANDOVER_FROM`, `TARGET_PORT`). The new instance
+  dials its own streams, waits until the watches the old one has live are
+  up and settled (45 s, capped at 150 s), asks the old one to drain
+  (`POST /admin/handover`, loopback only: events stop there at once, open
+  captures finish, then it exits), and opens a second listener on the main
+  port the moment it frees. Events are held back while standby and start
+  the instant the old stops, so the house hears each moment once. `GET /`
+  shows `role`, `role_since`, `events_held`, `listen_port`, `pid`.
+  Measured: 103 s from request to switch, 0 s without HTTP, both cameras
+  live throughout; the old way cost 20-60 s blind per restart plus a
+  Google command per camera and the occasional minute-long retry.
+  (1.18.1-1.18.3: the standby had targeted itself from a shell expansion
+  order, waited on a camera the vendor app has off, and then took three
+  minutes closing its spare listener behind Chromium's keep-alive sockets -
+  each fixed in turn; the fallback kept the old instance up every time.)
+
 ## 1.17.5
 
 - Backlog removals are restart-safe: the entry's metadata is unlinked

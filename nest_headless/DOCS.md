@@ -312,6 +312,21 @@ windowless Chrome and the audio tap delivers ~40% of real time (measured
 starves speech captures. Load with `launchctl bootstrap gui/$(id -u) <plist>`; the service answers on
 `http://127.0.0.1:8098/` and the consumers (Hearth) should use that address.
 
+### Deploying without a gap (blue/green)
+
+Point the plist at `host/supervise.sh` instead of `run.sh`. It keeps one
+instance on the main port; to deploy new code, put it in place and
+`touch <state dir>/deploy.request` (the state dir is where `options.json`
+lives). The supervisor starts the new code on a spare port
+(`PORT`+1), where it dials its own camera streams, waits until the watches
+the old instance has live are up and settled, asks the old instance to
+drain (`POST /admin/handover`, loopback only) and takes the main port the
+moment it frees. The old instance stops emitting the instant the new one
+starts, so nothing is heard twice or missed; the HTTP port does not blink
+in practice (measured 0 s). A crashed new instance leaves the old one
+running. Restarting the supervisor itself (a plist or environment change)
+is still a full restart.
+
 ### Whisper large-v3-turbo on the Mac (MLX)
 
 The in-process recogniser (`stt_model_dir`, sherpa-onnx Whisper small.en) is
