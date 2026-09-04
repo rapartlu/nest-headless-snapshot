@@ -37,6 +37,8 @@ Options:
 | `training_dir` | (empty) | a brain's labelled training crops (`<dir>/<camera>__<zone>/<label>/*.jpg`), served read-only with delete under `/training` |
 | `archive_days` | `7` | keep heartbeat frames this long (the count cap is sized to the window) |
 | `evidence_days` | `30` | keep frames behind events, hits, cat evidence and zone composites this long |
+| `wake_names` | (built-in list) | names accepted after the wake word, `|`-separated, spaces allowed (`botbeard|bot beard|claude|clawed`) |
+| `wake_canon` | (empty) | `name=alias|alias;...`: the keyword text the brain sees, whatever the spotter or recogniser heard |
 | `watch_passages` | (empty) | doorway polygons with an optional `in=x,y` room-side point → `nest_headless_passage` |
 | `watch_classify_zones` | (empty) | state zones (change detection with crops; optional `<camera>__<zone>.onnx`) |
 | `watch_activity_zones` | (empty) | running/idle from motion inside a crop → `nest_headless_activity` |

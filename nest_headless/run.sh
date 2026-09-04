@@ -72,6 +72,10 @@ if [ -f "$OPTS" ]; then
   [ -n "$TRAINING_DIR_OPT" ] && export TRAINING_DIR="$TRAINING_DIR_OPT"
   export ARCHIVE_DAYS="$(jq -r '.archive_days // 7' "$OPTS")"
   export EVIDENCE_DAYS="$(jq -r '.evidence_days // 30' "$OPTS")"
+  WAKE_NAMES_OPT="$(jq -r '.wake_names // ""' "$OPTS")"
+  [ -n "$WAKE_NAMES_OPT" ] && export WAKE_NAMES="$WAKE_NAMES_OPT"
+  WAKE_CANON_OPT="$(jq -r '.wake_canon // ""' "$OPTS")"
+  [ -n "$WAKE_CANON_OPT" ] && export WAKE_CANON="$WAKE_CANON_OPT"
 fi
 
 exec node "$(cd "$(dirname "$0")" && pwd)/app/server.js"

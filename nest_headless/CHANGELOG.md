@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.18.5
+
+- A house can name its assistant (#29): `wake_names` (the names accepted
+  after the wake word by the transcript path and the wake confirmation, a
+  `|` list that may contain spaces for the way recognisers split an
+  unfamiliar name) and `wake_canon` (`name=alias|alias;name2=...`, mapping
+  what the spotter or recogniser heard to the keyword text the brain
+  expects, e.g. `HEY BOT BEARD` -> `HEY BOTBEARD`). The spotter's own
+  phrases stay in `nest_models/keywords.txt` (BPE token lines; a greedy
+  segmentation over `tokens.txt` plus a few split variants was enough for a
+  new two-syllable name to fire in four synthesised voices and never on the
+  old name). Both wake words can run side by side while a household
+  switches.
+
 ## 1.18.0 - 1.18.4
 
 - Blue/green deploys on the Mac (no sensing gap). `host/supervise.sh` is

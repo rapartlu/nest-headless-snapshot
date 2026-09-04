@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.18.4';
+const ADDON_VERSION = '1.18.5';
 
 const http = require('http');
 const fs = require('fs');
@@ -2128,6 +2128,17 @@ const WAKE_NAMES = (process.env.WAKE_NAMES || 'claude|claud|clawed|claws|clause|
 // Claude" once had everything before it stripped by an unbounded prefix).
 // A quiet "hey" transcribes as "a" or "eh".
 const WAKE_WORDS = 'hey|hi|ok|okay|a|eh|hay';
+// Canonical keyword text (1.18.5): the spotter reports the tokens it matched
+// ("HEY BOT BEARD") and the recognisers split unfamiliar names ("bot bird");
+// WAKE_CANON maps aliases to the name the brain expects, e.g.
+// "botbeard=bot beard|bot bird;claude=clawed|cloud". Applied to both paths.
+const WAKE_CANON = String(process.env.WAKE_CANON || '').split(';').map((e) => e.split('=')).filter((e) => e.length === 2 && e[0].trim())
+  .map(([name, aliases]) => ({ name: name.trim().toUpperCase(), re: new RegExp('\\b(?:' + aliases.split('|').map((a) => a.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).filter(Boolean).join('|') + ')\\b', 'gi') }));
+function canonicalKeyword(text) {
+  let t = String(text || '').toUpperCase().replace(/\s+/g, ' ').trim();
+  for (const c of WAKE_CANON) t = t.replace(c.re, c.name);
+  return t;
+}
 const WAKE_RE = new RegExp(`^[\\s\\S]{0,40}?\\b(?:${WAKE_WORDS})[,.!?]?\\s+(?:${WAKE_NAMES})\\b[,.!?]*\\s*`, 'i');
 // pre-roll cut mid-phrase: transcript starts with the bare name ("clawed, is the...")
 const WAKE_HEAD_RE = new RegExp(`^\\W*(?:${WAKE_NAMES})\\b[,.!?]*\\s*`, 'i');
@@ -2241,7 +2252,7 @@ async function finishSpeechCapture(entityId, c, reason) {
     if (!wakeConfirmed && !c.followUp) { segStat(entityId, 'segments_dropped'); return; }
     if (wakeConfirmed && !c.followUp) {
       const wm = WAKE_RE.exec(text0) || WAKE_HEAD_RE.exec(text0);
-      c.keyword = (wm ? wm[0] : 'wake').replace(/[^A-Za-z ]/g, ' ').replace(/\s+/g, ' ').trim().toUpperCase().split(' ').slice(-2).join(' ');
+      c.keyword = canonicalKeyword((wm ? wm[0] : 'wake').replace(/[^A-Za-z ]/g, ' ')).split(' ').slice(-2).join(' ');
       lastKeywordMs[entityId] = Date.now();
       segStat(entityId, 'segment_wakes');
       console.log(`[nest_headless] KEYWORD "${c.keyword}" on ${entityId} (transcript) at ${new Date().toISOString()}`);
@@ -2419,11 +2430,12 @@ function onAudioChunk(entityId, b64, sampleRate) {
         if (segPending[entityId]) continue;                      // a transcript decision on this audio is in flight
         if (now - (lastKeywordMs[entityId] || 0) < 2500) continue;
         lastKeywordMs[entityId] = now; st0.hits++;
-        console.log(`[nest_headless] KEYWORD "${r.keyword}" on ${entityId} at ${new Date().toISOString()}`);
+        const kw = canonicalKeyword(r.keyword);
+        console.log(`[nest_headless] KEYWORD "${kw}" on ${entityId} at ${new Date().toISOString()}${kw !== r.keyword ? ' (heard as ' + r.keyword + ')' : ''}`);
         postHaEvent('nest_headless_keyword', {
-          entity_id: entityId, camera: entityId.replace(/^camera\./, ''), keyword: r.keyword,
+          entity_id: entityId, camera: entityId.replace(/^camera\./, ''), keyword: kw,
         }).catch(() => {});
-        startSpeechCapture(entityId, r.keyword, st.ring || []);
+        startSpeechCapture(entityId, kw, st.ring || []);
       }
     }
   } catch (e) { st0.lastError = e.message; console.warn('[nest_headless] audio chunk failed:', e.message); }
