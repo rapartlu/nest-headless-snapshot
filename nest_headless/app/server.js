@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.18.5';
+const ADDON_VERSION = '1.18.6';
 
 const http = require('http');
 const fs = require('fs');
@@ -1460,7 +1460,9 @@ async function catsInJpeg(jpg, { dets = null, camera = null } = {}) {
       const desc = await catid.describeInJpeg(sharp, jpg, x.box);
       const usable = desc.size_px >= CAT_MIN_PX;
       const matches = usable ? matchCat(desc.vec, desc.sized) : [];
-      const top = matches[0] && matches[0].score >= CAT_NAME_AT && catGalleryReady() ? matches[0] : null;
+      // a name only when the match is decisive (score and margin), the same rule that keeps a crop out of the backlog:
+      // 0.908 for one ginger over the other named the wrong cat (1.18.6)
+      const top = matches[0] && !catAmbiguous(matches) && catGalleryReady() ? matches[0] : null;
       out.push({ box: x.box, conf: x.conf, roi: x.roi || null, quality: { size_px: desc.size_px, det_score: x.conf, reason: usable ? 'ok' : 'cat_too_small' },
         name: top ? top.name : null, score: matches[0] ? matches[0].score : null, matches, _emb: usable ? desc.vec : null, _sized: desc.sized, _crop: desc.crop });
     } catch (e) { /* one bad crop */ }

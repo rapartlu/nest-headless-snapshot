@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.18.6
+
+- A cat is named on a detection only when the match is decisive (>= 0.92
+  and 0.03 clear of the runner-up), the rule that already decides the
+  backlog; the top score alone had named one ginger cat as the other at
+  0.908.
+
 ## 1.18.5
 
 - A house can name its assistant (#29): `wake_names` (the names accepted
