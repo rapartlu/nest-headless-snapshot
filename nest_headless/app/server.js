@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.18.7';
+const ADDON_VERSION = '1.18.8';
 
 const http = require('http');
 const fs = require('fs');
@@ -46,6 +46,7 @@ const { PendingStore } = require('./pending');
 const diskq = require('./diskq');
 const { SegmentTracker } = require('./segments');
 const evidence = require('./evidence');
+const wakeword = require('./wakeword');
 
 // ------------------------------------------------------------ configuration
 // HA config root: the supervisor mounts it at /homeassistant (or /config on
@@ -2254,7 +2255,7 @@ async function finishSpeechCapture(entityId, c, reason) {
     if (!wakeConfirmed && !c.followUp) { segStat(entityId, 'segments_dropped'); return; }
     if (wakeConfirmed && !c.followUp) {
       const wm = WAKE_RE.exec(text0) || WAKE_HEAD_RE.exec(text0);
-      c.keyword = canonicalKeyword((wm ? wm[0] : 'wake').replace(/[^A-Za-z ]/g, ' ')).split(' ').slice(-2).join(' ');
+      c.keyword = wakeword.keywordFrom(wm ? wm[0] : '', canonicalKeyword) || 'WAKE';
       lastKeywordMs[entityId] = Date.now();
       segStat(entityId, 'segment_wakes');
       console.log(`[nest_headless] KEYWORD "${c.keyword}" on ${entityId} (transcript) at ${new Date().toISOString()}`);

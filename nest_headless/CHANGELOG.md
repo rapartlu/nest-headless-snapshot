@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.18.8
+
+- The keyword sent with a transcript wake is always `HEY <canonical name>`.
+  A quiet "hey" comes back from the recognisers as "a", "eh", "hi" or "hay",
+  and the pre-roll can cut it off entirely; the brain matches the keyword
+  text against the names it knows, so "A CLAUDE" reached it as an unknown
+  keyword and the person got no answer.
+
 ## 1.18.7
 
 - `tools/retrain_zones.py` never replaces a zone model with one whose
