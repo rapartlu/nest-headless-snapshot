@@ -68,6 +68,7 @@ if [ -f "$OPTS" ]; then
   STT_FALLBACK_OPT="$(jq -r '.stt_fallback_url // ""' "$OPTS")"
   [ -n "$STT_FALLBACK_OPT" ] && export STT_FALLBACK_URL="$STT_FALLBACK_OPT"
   export IDENTITY_KEEP_SAMPLES="$(jq -r '.identity_keep_samples // false' "$OPTS")"
+  export FACE_DECISIVE="$(jq -r '.face_decisive // 0.47' "$OPTS")"
   export IDENTITY_AUTO_SAMPLES="$(jq -r '.identity_auto_samples // true' "$OPTS")"
   export WAKE_BY_TRANSCRIPT="$(jq -r '.wake_by_transcript // false' "$OPTS")"
   TRAINING_DIR_OPT="$(jq -r '.training_dir // ""' "$OPTS")"

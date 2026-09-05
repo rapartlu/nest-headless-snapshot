@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.19.1
+
+- A face is named at 0.47, not 0.5 (`face_decisive`). No room crop had ever
+  reached 0.5, so every face went to a person to label: 113 by hand over
+  three days. Measured against the name the family then chose, the top guess
+  is right 88% overall and 100% of the 24 at or above 0.47; the first error
+  is at 0.459. The runner-up gap is unchanged, so the confusions that do
+  happen (all between two of the household) still go to a person.
+
 ## 1.19.0
 
 - A zone state flip needs 8 consecutive agreeing ticks (16 s), not 2 (4 s),

@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.19.0';
+const ADDON_VERSION = '1.19.1';
 
 const http = require('http');
 const fs = require('fs');
@@ -302,6 +302,10 @@ function parseCrops(spec) {
 
 function intEnv(name, dflt) {
   const v = parseInt(process.env[name] || '', 10);
+  return Number.isFinite(v) ? v : dflt;
+}
+function numEnv(name, dflt) {
+  const v = parseFloat(process.env[name] || '');
   return Number.isFinite(v) ? v : dflt;
 }
 function firstExisting(paths, isFile) {
@@ -1601,8 +1605,16 @@ async function sampleFacesForCapture(entityId) {
 // ------------------------------------------------------------ verification backlog (Hearth #16)
 // Good-quality samples whose match is ambiguous or unknown are parked for an
 // admin to label, mark as "not a household member", or drop. Decisive: voice
-// >= 0.6, face >= 0.5, and a clear gap to the runner-up.
-const VOICE_DECISIVE = 0.6, FACE_DECISIVE = 0.5, AMBIGUOUS_GAP = 0.1;
+// >= 0.6, face >= face_decisive, and a clear gap to the runner-up.
+//
+// The face line was 0.5 and no room crop ever reached it, so every face went
+// to a person: 113 labelled by hand over three days. Measured against what
+// the family then chose, the top guess is right 88% overall but 100% of the
+// 24 at or above 0.47 (and it first errs at 0.459). Crop size does not
+// predict correctness - faces under 65 px are the most reliable of all - so
+// the line is on the score alone, with the runner-up gap unchanged.
+const VOICE_DECISIVE = 0.6, AMBIGUOUS_GAP = 0.1;
+const FACE_DECISIVE = numEnv('FACE_DECISIVE', 0.47);
 const lastMatched = {};        // name -> ISO time of the last decisive match
 const lastPendingFaceMs = {};  // camera -> ms; one face candidate per camera per minute
 function ambiguous(matches, decisive) {
