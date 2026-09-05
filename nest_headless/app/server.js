@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.19.2';
+const ADDON_VERSION = '1.20.0';
 
 const http = require('http');
 const fs = require('fs');
@@ -47,6 +47,7 @@ const diskq = require('./diskq');
 const { SegmentTracker } = require('./segments');
 const evidence = require('./evidence');
 const wakeword = require('./wakeword');
+const activity = require('./activity');
 
 // ------------------------------------------------------------ configuration
 // HA config root: the supervisor mounts it at /homeassistant (or /config on
@@ -1033,7 +1034,16 @@ async function zoneClassifyTick(entityId, mgr) {
 // Activity zones: the page reports per-tick change % inside each zone; a
 // rolling window (20 ticks) decides running/idle with hysteresis (>= 60% of
 // ticks above activity_pct to start, < 20% to stop).
-const activityState = {}; // entityId -> zone -> { window, state, since, lastMean }
+//
+// A turning drum only disturbs its porthole intermittently, so one cycle
+// arrives as a scatter of short runs: 13 pieces over 45 minutes on
+// 2026-09-05, ten of the gaps under two minutes and one of them 29 s
+// (#12). Nobody stops and restarts a dryer in 29 seconds. So a quiet spell
+// shorter than activity_bridge_s does not end a run - it is bridged, and
+// the run reports how many pieces were merged and how long was spent in
+// the gaps, so the seams stay visible to whoever reads the event.
+const ACTIVITY_BRIDGE_MS = intEnv('ACTIVITY_BRIDGE_S', 120) * 1000;
+const activityState = {}; // entityId -> zone -> { window, state, since, lastMean, quietSince, fragments, bridgedMs }
 function onActivity(entityId, pcts) {
   const zones = cfg.watchActivityZones[entityId] || [];
   const st = activityState[entityId] || (activityState[entityId] = {});
@@ -1046,6 +1056,13 @@ function onActivity(entityId, pcts) {
     if (a.window.length < 10) continue;
     const above = a.window.filter((p) => p >= cfg.activityPct).length / a.window.length;
     const next = a.state === 'running' ? (above < 0.2 ? 'idle' : 'running') : (above >= 0.6 ? 'running' : 'idle');
+    // --- bridging (#12): a running zone that goes quiet is not idle yet
+    if (a.state === 'running') {
+      const r = activity.step(a, next, Date.now(), ACTIVITY_BRIDGE_MS);
+      if (r.action !== 'ended') continue;
+      activityTransition(entityId, z, a, 'idle', r.endedAt);
+      continue;
+    }
     if (next === a.state) continue;
     if (next === 'running') {
       // A person loading the machine moves over the porthole and reads as a
@@ -1065,13 +1082,19 @@ function onActivity(entityId, pcts) {
     activityTransition(entityId, z, a, next);
   }
 }
-function activityTransition(entityId, z, a, next) {
-  const now = Date.now(), prev = a.state, dur = Math.round((now - a.since) / 1000);
-  a.state = next; a.since = now;
-  console.log(`[nest_headless] ACTIVITY ${z.name} on ${entityId}: ${prev} -> ${next} after ${dur}s (mean ${a.lastMean}%)`);
+function activityTransition(entityId, z, a, next, endedAt = null) {
+  const now = Date.now(), prev = a.state;
+  // a bridged run ended when it last went quiet, not when the bridge expired
+  const dur = Math.round(((endedAt || now) - a.since) / 1000);
+  const fragments = prev === 'running' ? (a.fragments || 1) : 1;
+  const bridgedS = prev === 'running' ? Math.round((a.bridgedMs || 0) / 1000) : 0;
+  a.state = next; a.since = now; a.quietSince = null; a.fragments = 1; a.bridgedMs = 0;
+  const seams = fragments > 1 ? `, ${fragments} fragments merged, ${bridgedS}s bridged` : '';
+  console.log(`[nest_headless] ACTIVITY ${z.name} on ${entityId}: ${prev} -> ${next} after ${dur}s (mean ${a.lastMean}%${seams})`);
   postHaEvent('nest_headless_activity', {
     entity_id: entityId, camera: entityId.replace(/^camera\./, ''), zone: z.name,
     state: next, previous: prev, previous_duration_s: dur, mean_pct: a.lastMean, t: new Date(now).toISOString(),
+    fragments, bridged_s: bridgedS,
   }).catch(() => {});
 }
 // Fraction of a zone's bounding rect covered by the largest overlapping person box, on a fresh frame.

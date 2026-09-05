@@ -47,6 +47,7 @@ if [ -f "$OPTS" ]; then
   WAZ_OPT="$(jq -r '.watch_activity_zones // ""' "$OPTS")"
   [ -n "$WAZ_OPT" ] && export WATCH_ACTIVITY_ZONES="$WAZ_OPT"
   export ACTIVITY_PCT="$(jq -r '.activity_pct // 1.5' "$OPTS")"
+  export ACTIVITY_BRIDGE_S="$(jq -r '.activity_bridge_s // 120' "$OPTS")"
   export ZONE_CHANGE_THRESHOLD="$(jq -r '.zone_change_threshold // 10' "$OPTS")"
   export ZONE_DEBOUNCE_TICKS="$(jq -r '.zone_debounce_ticks // 8' "$OPTS")"
   export ZONE_MIN_DWELL_S="$(jq -r '.zone_min_dwell_s // 60' "$OPTS")"

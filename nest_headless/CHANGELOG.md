@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.20.0
+
+- An activity zone bridges short quiet spells instead of ending the run
+  (`activity_bridge_s`, 120 s). A turning drum only disturbs its porthole
+  intermittently, so one cycle arrived as 13 short runs over 45 minutes,
+  ten of the gaps under two minutes and one of them 29 s - and 148 runs had
+  been recorded without a single one over four minutes (#12). Replaying that
+  trace, 120 s merges it into 4 runs, the longest 18m57s from 7 fragments.
+  The event carries `fragments` and `bridged_s` so the seams stay visible,
+  and a bridged run is dated from when it last fell quiet, not when the
+  bridge expired.
+
 ## 1.19.2
 
 - A cat enrolled from a photo keeps the photo beside its sample (downscaled
