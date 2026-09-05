@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.20.2
+
+- A quietly spoken "hey" (heard as "a" or "eh") only wakes the house before a
+  distinctive name. Several spellings in `wake_names` are ordinary English -
+  "heart" and "hath" cover Hearth, "cloud", "cord" and "god" cover Claude -
+  and paired with a soft wake word they made everyday speech a wake phrase:
+  "she had a heart attack" woke the house and reached the brain as a request
+  to "attack". A clearly spoken wake word is honoured as before.
+
 ## 1.20.1
 
 - A segment wakes on the phrase wherever it falls, not only in the first 40

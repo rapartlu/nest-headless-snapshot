@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.20.1';
+const ADDON_VERSION = '1.20.2';
 
 const http = require('http');
 const fs = require('fs');
@@ -2212,6 +2212,19 @@ const WAKE_RE = new RegExp(`^[\\s\\S]{0,40}?\\b(?:${WAKE_WORDS})[,.!?]?\\s+(?:${
 // "a heart", "a cloud" or "a cord" in the middle of an ordinary sentence.
 const WAKE_SOFT = new Set(['a', 'eh']);   // only a quietly-spoken "hey", never a word in its own right
 const WAKE_WORDS_STRONG = WAKE_WORDS.split('|').filter((w) => !WAKE_SOFT.has(w)).join('|');
+// Some spellings in WAKE_NAMES are ordinary English ("heart" and "hath" for
+// Hearth, "cloud"/"cord"/"god" for Claude). Paired with a soft wake word they
+// make everyday speech a wake phrase: "she had a heart attack" woke the house
+// at 23:42 on 2026-09-05 and reached the brain as a request to "attack".
+// A soft wake word therefore only counts before a distinctive name.
+const WAKE_NAMES_PLAIN = new Set(['heart', 'hart', 'hath', 'cord', 'god', 'cloud', 'cloudy', 'clause', 'claws', 'clod']);
+const WAKE_NAMES_DISTINCT = WAKE_NAMES.split('|').filter((n) => !WAKE_NAMES_PLAIN.has(n)).join('|');
+// the head rule, minus the combinations that are just English
+const WAKE_SOFT_RE = new RegExp(`^[\\s\\S]{0,40}?\\b(?:${[...WAKE_SOFT].join('|')})[,.!?]?\\s+(?:${WAKE_NAMES})\\b`, 'i');
+const WAKE_SOFT_OK_RE = new RegExp(`^[\\s\\S]{0,40}?\\b(?:${[...WAKE_SOFT].join('|')})[,.!?]?\\s+(?:${WAKE_NAMES_DISTINCT})\\b`, 'i');
+function plainEnglishWake(t) {   // a soft word before a plain-English name: not a wake
+  return WAKE_SOFT_RE.test(t) && !WAKE_SOFT_OK_RE.test(t) && !new RegExp(`\\b(?:${WAKE_WORDS_STRONG})[,.!?]?\\s+(?:${WAKE_NAMES})\\b`, 'i').test(t);
+}
 const WAKE_ANYWHERE_RE = new RegExp(`[\\s\\S]*?\\b(?:${WAKE_WORDS_STRONG})[,.!?]?\\s+(?:${WAKE_NAMES})\\b[,.!?]*\\s*`, 'i');
 // pre-roll cut mid-phrase: transcript starts with the bare name ("clawed, is the...")
 const WAKE_HEAD_RE = new RegExp(`^\\W*(?:${WAKE_NAMES})\\b[,.!?]*\\s*`, 'i');
@@ -2310,7 +2323,7 @@ async function finishSpeechCapture(entityId, c, reason) {
   // A segment has its whole start, so it must carry the full wake phrase; the
   // bare-name rule exists only for spotter captures whose pre-roll may have
   // cut the "hey" (a hallway sentence beginning "kitchen speaker" once passed).
-  const wakeConfirmed = !!text && (WAKE_RE.test(text) || (c.fromSegment ? WAKE_ANYWHERE_RE.test(text) : WAKE_HEAD_RE.test(text)));
+  const wakeConfirmed = !!text && !plainEnglishWake(text) && (WAKE_RE.test(text) || (c.fromSegment ? WAKE_ANYWHERE_RE.test(text) : WAKE_HEAD_RE.test(text)));
   text = stripWakePhrase(text, !!c.fromSegment);
   // Whisper's stage directions - "(baby crying)", "[inaudible]", "(background
   // noise drowns out speaker)" - are not something the brain should parse.
