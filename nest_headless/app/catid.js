@@ -123,10 +123,15 @@ async function describeInJpeg(sharp, jpg, box, { margin = MARGIN, withCrop = tru
 
 // A whole image with no frame context (an uploaded photo or crop that IS the
 // cat): no ring to subtract, unsized.
-async function describeImage(sharp, jpg) {
+async function describeImage(sharp, jpg, { withCrop = true } = {}) {
   const { data, info } = await sharp(jpg).rotate().removeAlpha().raw().toBuffer({ resolveWithObject: true });
   const d = descriptor(data, info.width, info.height, null, 0);
-  return { ...d, size_px: Math.max(info.width, info.height), crop: null };
+  // Keep a copy of the photo beside the sample. Without one an uploaded cat
+  // cannot be reviewed, and cannot be re-described when the descriptor
+  // version moves on: all 46 of one cat's samples were photos, so its gallery
+  // was invisible and unrepairable (2026-09-05).
+  const crop = withCrop ? await sharp(jpg).rotate().resize(640, 640, { fit: 'inside', withoutEnlargement: true }).jpeg({ quality: 88 }).toBuffer() : null;
+  return { ...d, size_px: Math.max(info.width, info.height), crop };
 }
 
 module.exports = { descriptor, cosine, describeInJpeg, describeImage, MARGIN, DIMS, HIST, VERSION };

@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.19.2
+
+- A cat enrolled from a photo keeps the photo beside its sample (downscaled
+  to 640 px) when `identity_keep_samples` is on. Only camera enrolments kept
+  an image before, so a cat enrolled entirely from photos had a gallery
+  nobody could review and that could not be re-described when the descriptor
+  version moved on - which is what happened to one of the three cats: all 46
+  of its samples were invisible and unrepairable.
+
 ## 1.19.1
 
 - A face is named at 0.47, not 0.5 (`face_decisive`). No room crop had ever

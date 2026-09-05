@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.19.1';
+const ADDON_VERSION = '1.19.2';
 
 const http = require('http');
 const fs = require('fs');
@@ -1504,7 +1504,7 @@ function enrolCat(name, source, found, index) {
   if (!/^[a-z0-9_-]{1,32}$/i.test(name)) return { ok: false, accepted: false, reason: 'bad_name' };
   name = name.toLowerCase();
   let pick;
-  if (found.photo) pick = { _emb: found.photo.vec, _sized: false, quality: { size_px: found.photo.size_px, reason: 'ok' }, box: null };
+  if (found.photo) pick = { _emb: found.photo.vec, _sized: false, quality: { size_px: found.photo.size_px, reason: 'ok' }, box: null, _crop: found.photo.crop || null };
   else {
     if (!found.ok) return { ok: false, accepted: false, reason: found.reason };
     if (!found.cats.length) return { ok: true, accepted: false, reason: 'no_cat', cats: 0 };
