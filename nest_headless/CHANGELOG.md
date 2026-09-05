@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.19.0
+
+- A zone state flip needs 8 consecutive agreeing ticks (16 s), not 2 (4 s),
+  and the zone says nothing for 60 s after an announcement. The three-state
+  dishwasher model changed its mind 69 times in 70 readings on a door nobody
+  touched, several in the small hours, and it reached the family (#26). A
+  zone that cannot hold a verdict now falls silent instead; a real cycle is
+  still reported, 12 s later. `zone_debounce_ticks` and `zone_min_dwell_s`.
+- Restored `config.yaml`, emptied in 1.18.7 by a bad in-place rewrite (the
+  file was opened for writing before it was read). The Mac install runs from
+  `run.sh` and was unaffected; a supervised install would have had no
+  manifest.
+
 ## 1.18.8
 
 - The keyword sent with a transcript wake is always `HEY <canonical name>`.
