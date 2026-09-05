@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.20.1
+
+- A segment wakes on the phrase wherever it falls, not only in the first 40
+  characters. In a busy room the segmenter cuts a 15 s block out of
+  continuous talk and the phrase lands mid-stream: a child said "hey
+  Botbeard" repeatedly one evening and 810 of 811 segments were discarded.
+  Everything after the phrase is the request. Only the strong wake words
+  qualify for this - "a" and "eh" are in the list as a quietly spoken "hey"
+  and stay pinned to the head, so "a heart attack" or "not a cloud in the
+  sky" cannot wake the house mid-sentence.
+
 ## 1.20.0
 
 - An activity zone bridges short quiet spells instead of ending the run

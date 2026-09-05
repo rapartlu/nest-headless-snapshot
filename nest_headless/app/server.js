@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.20.0';
+const ADDON_VERSION = '1.20.1';
 
 const http = require('http');
 const fs = require('fs');
@@ -2201,12 +2201,24 @@ function canonicalKeyword(text) {
   return t;
 }
 const WAKE_RE = new RegExp(`^[\\s\\S]{0,40}?\\b(?:${WAKE_WORDS})[,.!?]?\\s+(?:${WAKE_NAMES})\\b[,.!?]*\\s*`, 'i');
+// In a busy room the segmenter cuts a 15 s block out of continuous talk and
+// the wake phrase lands mid-stream, past the 40-character head allowance, so
+// the whole segment is dropped: a child said "hey Botbeard" repeatedly one
+// evening with 810 of 811 segments discarded. A segment (not a spotter
+// capture) therefore accepts the phrase anywhere in the text.
+//
+// Only the strong wake words qualify here. "a" and "eh" are in WAKE_WORDS as
+// a quietly spoken "hey", which is safe pinned to the head but would fire on
+// "a heart", "a cloud" or "a cord" in the middle of an ordinary sentence.
+const WAKE_SOFT = new Set(['a', 'eh']);   // only a quietly-spoken "hey", never a word in its own right
+const WAKE_WORDS_STRONG = WAKE_WORDS.split('|').filter((w) => !WAKE_SOFT.has(w)).join('|');
+const WAKE_ANYWHERE_RE = new RegExp(`[\\s\\S]*?\\b(?:${WAKE_WORDS_STRONG})[,.!?]?\\s+(?:${WAKE_NAMES})\\b[,.!?]*\\s*`, 'i');
 // pre-roll cut mid-phrase: transcript starts with the bare name ("clawed, is the...")
 const WAKE_HEAD_RE = new RegExp(`^\\W*(?:${WAKE_NAMES})\\b[,.!?]*\\s*`, 'i');
 // repeats ("hey claude, hey claude, ...") must be right at the head
 const WAKE_REPEAT_RE = new RegExp(`^\\W*(?:${WAKE_WORDS})[,.!?]?\\s+(?:${WAKE_NAMES})\\b[,.!?]*\\s*`, 'i');
-function stripWakePhrase(t) {
-  const m = WAKE_RE.exec(t) || WAKE_HEAD_RE.exec(t);
+function stripWakePhrase(t, anywhere = false) {
+  const m = WAKE_RE.exec(t) || (anywhere ? WAKE_ANYWHERE_RE.exec(t) : null) || WAKE_HEAD_RE.exec(t);
   if (!m) return t;
   t = t.slice(m[0].length).trim();
   for (let i = 0; i < 2; i++) { const r = WAKE_REPEAT_RE.exec(t); if (!r) break; t = t.slice(r[0].length).trim(); }
@@ -2298,8 +2310,8 @@ async function finishSpeechCapture(entityId, c, reason) {
   // A segment has its whole start, so it must carry the full wake phrase; the
   // bare-name rule exists only for spotter captures whose pre-roll may have
   // cut the "hey" (a hallway sentence beginning "kitchen speaker" once passed).
-  const wakeConfirmed = !!text && (WAKE_RE.test(text) || (!c.fromSegment && WAKE_HEAD_RE.test(text)));
-  text = stripWakePhrase(text);
+  const wakeConfirmed = !!text && (WAKE_RE.test(text) || (c.fromSegment ? WAKE_ANYWHERE_RE.test(text) : WAKE_HEAD_RE.test(text)));
+  text = stripWakePhrase(text, !!c.fromSegment);
   // Whisper's stage directions - "(baby crying)", "[inaudible]", "(background
   // noise drowns out speaker)" - are not something the brain should parse.
   if (text && /^[\s(\[][^A-Za-z0-9]*[^()\[\]]*[)\]]\W*$/.test(text) && !/[a-z]{2,}\s+[a-z]{2,}.*[a-z]/i.test(text.replace(/[(\[][^)\]]*[)\]]/g, ''))) { text = ''; reason = 'unclear'; }
@@ -2312,7 +2324,7 @@ async function finishSpeechCapture(entityId, c, reason) {
   if (c.fromSegment) {
     if (!wakeConfirmed && !c.followUp) { segStat(entityId, 'segments_dropped'); return; }
     if (wakeConfirmed && !c.followUp) {
-      const wm = WAKE_RE.exec(text0) || WAKE_HEAD_RE.exec(text0);
+      const wm = WAKE_RE.exec(text0) || (c.fromSegment ? WAKE_ANYWHERE_RE.exec(text0) : null) || WAKE_HEAD_RE.exec(text0);
       c.keyword = wakeword.keywordFrom(wm ? wm[0] : '', canonicalKeyword) || 'WAKE';
       lastKeywordMs[entityId] = Date.now();
       segStat(entityId, 'segment_wakes');
