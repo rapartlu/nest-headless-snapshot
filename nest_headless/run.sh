@@ -68,6 +68,7 @@ if [ -f "$OPTS" ]; then
   [ -n "$STT_SHADOW_OPT" ] && export STT_SHADOW_URL="$STT_SHADOW_OPT"
   STT_FALLBACK_OPT="$(jq -r '.stt_fallback_url // ""' "$OPTS")"
   [ -n "$STT_FALLBACK_OPT" ] && export STT_FALLBACK_URL="$STT_FALLBACK_OPT"
+  export PHOTO_MIN_PX="$(jq -r '.photo_min_px // 256' "$OPTS")"
   export IDENTITY_KEEP_SAMPLES="$(jq -r '.identity_keep_samples // false' "$OPTS")"
   export FACE_DECISIVE="$(jq -r '.face_decisive // 0.47' "$OPTS")"
   export IDENTITY_AUTO_SAMPLES="$(jq -r '.identity_auto_samples // true' "$OPTS")"

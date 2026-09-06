@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.20.4';
+const ADDON_VERSION = '1.20.5';
 
 const http = require('http');
 const fs = require('fs');
@@ -1482,6 +1482,11 @@ function matchFace(embedding) {
 // Descriptor cosines run high (a colour histogram dominates), so the naming
 // line is 0.9 and "decisive" needs 0.03 clear of the runner-up.
 const CAT_NAME_AT = 0.9, CAT_DECISIVE = 0.92, CAT_GAP = 0.03, CAT_MIN_PX = 60;
+// A picture the detector finds no cat in is only described whole when it is
+// big enough to be a real photograph. Three pictures of an empty worktop,
+// each 192x109, were enrolled as a cat that way (#23): they were camera crops
+// posted to the photo route, not photographs.
+const PHOTO_MIN_PX = intEnv('PHOTO_MIN_PX', 256);
 // Only samples made by the current descriptor version count (older ones are
 // listed but never matched; re-enrol them). A name is given only when at
 // least two cats have current samples: with one cat in the gallery "best

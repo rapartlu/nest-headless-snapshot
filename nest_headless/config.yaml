@@ -1,5 +1,5 @@
 name: Nest Headless Snapshot
-version: "1.20.4"
+version: "1.20.5"
 slug: nest_headless
 description: >-
   Server-side Nest camera stills via headless Chromium — the only WebRTC
@@ -49,6 +49,7 @@ options:
   stt_shadow_url: ""
   stt_fallback_url: ""
   identity_keep_samples: false
+  photo_min_px: 256
   face_decisive: 0.47
   identity_auto_samples: true
   wake_by_transcript: false
@@ -89,6 +90,7 @@ schema:
   stt_shadow_url: str?
   stt_fallback_url: str?
   identity_keep_samples: bool?
+  photo_min_px: int(32,4096)?
   face_decisive: float(0.1,1.0)?
   identity_auto_samples: bool?
   wake_by_transcript: bool?
