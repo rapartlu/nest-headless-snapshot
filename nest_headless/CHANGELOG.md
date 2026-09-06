@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.20.3
+
+- A spotter keyword is held until the transcript confirms it
+  (`keyword_needs_transcript`, on by default). The spotter is a guess and
+  across the log it is wrong more often than right - 26 confirmed against 33
+  unconfirmed - and the brain was opening a conversation window on the guess
+  alone. On 2026-09-06 it did that twice at breakfast on a mishearing of
+  "hey cloud" and a child said "stop speaking to me, I don't want to speak
+  to you". The house must not chase anyone. The keyword now reaches the
+  brain only once the words are in hand, carrying `confirmed: true`.
+  A genuine wake is announced later than before, by the length of the
+  utterance; that is the price of not talking to people who did not ask.
+
 ## 1.20.2
 
 - A quietly spoken "hey" (heard as "a" or "eh") only wakes the house before a

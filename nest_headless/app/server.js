@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.20.2';
+const ADDON_VERSION = '1.20.3';
 
 const http = require('http');
 const fs = require('fs');
@@ -2210,6 +2210,10 @@ const WAKE_RE = new RegExp(`^[\\s\\S]{0,40}?\\b(?:${WAKE_WORDS})[,.!?]?\\s+(?:${
 // Only the strong wake words qualify here. "a" and "eh" are in WAKE_WORDS as
 // a quietly spoken "hey", which is safe pinned to the head but would fire on
 // "a heart", "a cloud" or "a cord" in the middle of an ordinary sentence.
+// Hold a spotter keyword until the transcript confirms it (default on): the
+// brain must not act on a mishearing. Set keyword_needs_transcript false to
+// send the spotter's guess immediately, as before 1.20.3.
+const KEYWORD_NEEDS_TRANSCRIPT = String(process.env.KEYWORD_NEEDS_TRANSCRIPT || 'true') !== 'false';
 const WAKE_SOFT = new Set(['a', 'eh']);   // only a quietly-spoken "hey", never a word in its own right
 const WAKE_WORDS_STRONG = WAKE_WORDS.split('|').filter((w) => !WAKE_SOFT.has(w)).join('|');
 // Some spellings in WAKE_NAMES are ordinary English ("heart" and "hath" for
@@ -2346,6 +2350,13 @@ async function finishSpeechCapture(entityId, c, reason) {
     } else if (text) { segStat(entityId, 'segment_follow_ups'); if (convo[entityId] && convo[entityId].openedAt === c.windowOpenedAt) delete convo[entityId]; }
     // faces only now, once the segment is known to be addressed to the house
     if (!c.facesPromise && faces.hasModels(FACE_MODELS_DIR())) c.facesPromise = sampleFacesForCapture(entityId);
+  }
+  // a spotter wake the transcript agreed with: tell the brain now, with the
+  // words already in hand (see KEYWORD_NEEDS_TRANSCRIPT above)
+  if (KEYWORD_NEEDS_TRANSCRIPT && !c.fromSegment && !c.followUp && wakeConfirmed && c.keyword) {
+    postHaEvent('nest_headless_keyword', {
+      entity_id: entityId, camera: entityId.replace(/^camera\./, ''), keyword: c.keyword, confirmed: true,
+    }).catch(() => {});
   }
   if (c.followUp && !text) {   // a follow-up window that caught only noise is the same as nobody replying (Hearth #4)
     console.log(`[nest_headless] follow-up window on ${entityId} closed: nothing intelligible (${reason})`);
@@ -2517,10 +2528,19 @@ function onAudioChunk(entityId, b64, sampleRate) {
         if (now - (lastKeywordMs[entityId] || 0) < 2500) continue;
         lastKeywordMs[entityId] = now; st0.hits++;
         const kw = canonicalKeyword(r.keyword);
-        console.log(`[nest_headless] KEYWORD "${kw}" on ${entityId} at ${new Date().toISOString()}${kw !== r.keyword ? ' (heard as ' + r.keyword + ')' : ''}`);
-        postHaEvent('nest_headless_keyword', {
-          entity_id: entityId, camera: entityId.replace(/^camera\./, ''), keyword: kw,
-        }).catch(() => {});
+        console.log(`[nest_headless] KEYWORD "${kw}" on ${entityId} at ${new Date().toISOString()}${kw !== r.keyword ? ' (heard as ' + r.keyword + ')' : ''}${KEYWORD_NEEDS_TRANSCRIPT ? ' (held for the transcript)' : ''}`);
+        // The spotter is a guess, and across the log it is wrong more often
+        // than right (26 confirmed / 33 unconfirmed). Sending it straight on
+        // let the brain open a conversation window on a mishearing: on
+        // 2026-09-06 it did so twice at breakfast and a child said "stop
+        // speaking to me, I don't want to speak to you". The house must not
+        // chase anyone, least of all a child. The keyword now waits for the
+        // transcript to confirm it; only then does the brain hear about it.
+        if (!KEYWORD_NEEDS_TRANSCRIPT) {
+          postHaEvent('nest_headless_keyword', {
+            entity_id: entityId, camera: entityId.replace(/^camera\./, ''), keyword: kw,
+          }).catch(() => {});
+        }
         startSpeechCapture(entityId, kw, st.ring || []);
       }
     }

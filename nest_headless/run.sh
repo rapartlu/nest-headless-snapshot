@@ -72,6 +72,7 @@ if [ -f "$OPTS" ]; then
   export FACE_DECISIVE="$(jq -r '.face_decisive // 0.47' "$OPTS")"
   export IDENTITY_AUTO_SAMPLES="$(jq -r '.identity_auto_samples // true' "$OPTS")"
   export WAKE_BY_TRANSCRIPT="$(jq -r '.wake_by_transcript // false' "$OPTS")"
+  export KEYWORD_NEEDS_TRANSCRIPT="$(jq -r '.keyword_needs_transcript // true' "$OPTS")"
   TRAINING_DIR_OPT="$(jq -r '.training_dir // ""' "$OPTS")"
   [ -n "$TRAINING_DIR_OPT" ] && export TRAINING_DIR="$TRAINING_DIR_OPT"
   export ARCHIVE_DAYS="$(jq -r '.archive_days // 7' "$OPTS")"

@@ -104,9 +104,16 @@ class H(BaseHTTPRequestHandler):
                 return self._json(400, {'error': 'empty text'})
             if len(text) > MAX_CHARS:
                 return self._json(400, {'error': f'text longer than {MAX_CHARS} characters'})
+            # A voice may be several names separated by commas: Kokoro stores each
+            # voice as a style vector and the pipeline averages them, so a blend
+            # costs nothing at all - same model, same speed, same memory - and
+            # gives a voice the house does not otherwise have.
             voice = str(body.get('voice') or DEFAULT_VOICE)
-            if voice not in VOICES:
-                return self._json(400, {'error': 'unknown voice', 'voices': VOICES})
+            parts = [v.strip() for v in voice.split(',') if v.strip()]
+            if not parts or any(v not in VOICES for v in parts):
+                return self._json(400, {'error': 'unknown voice', 'voices': VOICES,
+                                        'note': 'a blend may be given as "bf_emma,bf_alice"'})
+            voice = ','.join(parts)
             speed = float(body.get('speed') or 1.0)
             speed = max(0.5, min(2.0, speed))
             t0 = time.time()
