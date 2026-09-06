@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.20.5';
+const ADDON_VERSION = '1.21.0';
 
 const http = require('http');
 const fs = require('fs');
@@ -1009,9 +1009,16 @@ async function zoneClassifyTick(entityId, mgr) {
         continue;
       }
       const prev = st.announced;
-      const prevDuration = st.announcedMs ? Math.round((now - st.announcedMs) / 1000) : null;
+      // How long the previous state actually lasted, from when it began to
+      // when this one did - NOT the gap between announcements. 1.19.0's quiet
+      // period made those the same thing, so every fridge visit was reported
+      // as exactly 60 s whether the door was open for five seconds or fifty
+      // (#22). The number is honest to the debounce, which is how long a
+      // verdict must hold before the state moves at all, so it is reported
+      // alongside as duration_resolution_s.
+      const prevDuration = st.announcedSince ? Math.round((st.since - st.announcedSince) / 1000) : null;
       const nextForEvent = st.state;
-      st.announced = nextForEvent; st.announcedMs = now;
+      st.announced = nextForEvent; st.announcedMs = now; st.announcedSince = st.since;
       // A model that scored under ZONE_MODEL_MIN_LOO on its own training frames
       // keeps its view on zone_change (`model`) but does not announce state
       // flips: a coin-flip verdict is noise, not a sense (#22).
@@ -1021,7 +1028,10 @@ async function zoneClassifyTick(entityId, mgr) {
         const people = await peopleNear(entityId, jpg, c.rect);
         postHaEvent('nest_headless_zone_state', {
           entity_id: entityId, camera: entityId.replace(/^camera\./, ''), zone: z.name, label: z.name,
-          state: nextForEvent, previous: prev, score: v.score, previous_duration_s: prevDuration, t: new Date(now).toISOString(), people_nearby: people,
+          state: nextForEvent, previous: prev, score: v.score, previous_duration_s: prevDuration,
+          duration_resolution_s: Math.round(ZONE_DEBOUNCE_TICKS * ZONE_TICK_MS / 1000), measured: prevDuration != null,
+          state_since: new Date(st.since).toISOString(),
+          t: new Date(now).toISOString(), people_nearby: people,
           model: true, engine: st.engine, ...st.modelMeta, scores: st.scores,   // loo_acc: leave-one-out accuracy over the originals it was trained on - trust it from ~0.9 up; scores: per label
           frame_at: new Date(now).toISOString(),
           boxes: [{ label: 'zone:' + z.name, ...boxOf(c.rect) }, ...people.map((p) => ({ label: 'person', name: p.name, score: p.score, ...boxOf(p.box) }))],
