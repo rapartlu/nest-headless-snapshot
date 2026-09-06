@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.20.3';
+const ADDON_VERSION = '1.20.4';
 
 const http = require('http');
 const fs = require('fs');
@@ -3060,10 +3060,15 @@ const handleRequest = async (req, res) => {
           if (!sharpM) { res.writeHead(500, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, accepted: false, reason: 'no_sharp' })); }
           try {
             jpg = await sharpM(jpg).rotate().resize({ width: 1600, height: 1600, fit: 'inside', withoutEnlargement: true }).jpeg({ quality: 92 }).toBuffer();
-            // if the house detector finds the cat in the photo, describe that box; else the whole picture
+            // The detector must find the cat. Describing the whole picture when it
+            // finds nothing enrolled three photographs of an empty kitchen worktop
+            // as one of the cats on 2026-09-06, and that sample - a third of his
+            // gallery - then matched the other two cats on that same worktop.
+            // A picture with no cat in it is not a sample of a cat.
             const d = await infer.detectCats(jpg, { conf: 0.5 }).catch(() => null);
             const boxes = (d || []).filter((x) => x.cls === 15 || x.cls === 16).sort((a, b) => b.box.w * b.box.h - a.box.w * a.box.h);
-            found = boxes.length ? { photo: { ...(await catid.describeInJpeg(sharpM, jpg, boxes[0].box, { withCrop: false })), sized: false } } : { photo: await catid.describeImage(sharpM, jpg) };
+            if (!boxes.length) { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: true, accepted: false, reason: 'no_cat', hint: 'no cat found in the picture - send a photo the cat is actually in' })); }
+            found = { photo: { ...(await catid.describeInJpeg(sharpM, jpg, boxes[0].box, { withCrop: false })), sized: false } };
           } catch (e) { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, accepted: false, reason: 'bad_image: ' + e.message })); }
         } else if (cam) {
           const mgr = watchMgr[cam];

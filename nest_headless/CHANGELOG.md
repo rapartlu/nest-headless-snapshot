@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.20.4
+
+- Enrolling a cat from a picture requires the detector to find a cat in it.
+  When it found none the whole picture was described instead, so three
+  photographs of an empty kitchen worktop were enrolled as one of the cats
+  on 2026-09-06. That sample was a third of his gallery and, being a picture
+  of the worktop, then matched the other two cats sitting on it - he became
+  the top guess on ginger cats. A picture with no cat in it is refused with
+  `no_cat`.
+
 ## 1.20.3
 
 - A spotter keyword is held until the transcript confirms it

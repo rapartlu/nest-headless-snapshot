@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.19.0';
+const ADDON_VERSION = '1.20.4';
 
 const http = require('http');
 const fs = require('fs');
@@ -47,6 +47,7 @@ const diskq = require('./diskq');
 const { SegmentTracker } = require('./segments');
 const evidence = require('./evidence');
 const wakeword = require('./wakeword');
+const activity = require('./activity');
 
 // ------------------------------------------------------------ configuration
 // HA config root: the supervisor mounts it at /homeassistant (or /config on
@@ -302,6 +303,10 @@ function parseCrops(spec) {
 
 function intEnv(name, dflt) {
   const v = parseInt(process.env[name] || '', 10);
+  return Number.isFinite(v) ? v : dflt;
+}
+function numEnv(name, dflt) {
+  const v = parseFloat(process.env[name] || '');
   return Number.isFinite(v) ? v : dflt;
 }
 function firstExisting(paths, isFile) {
@@ -1029,7 +1034,16 @@ async function zoneClassifyTick(entityId, mgr) {
 // Activity zones: the page reports per-tick change % inside each zone; a
 // rolling window (20 ticks) decides running/idle with hysteresis (>= 60% of
 // ticks above activity_pct to start, < 20% to stop).
-const activityState = {}; // entityId -> zone -> { window, state, since, lastMean }
+//
+// A turning drum only disturbs its porthole intermittently, so one cycle
+// arrives as a scatter of short runs: 13 pieces over 45 minutes on
+// 2026-09-05, ten of the gaps under two minutes and one of them 29 s
+// (#12). Nobody stops and restarts a dryer in 29 seconds. So a quiet spell
+// shorter than activity_bridge_s does not end a run - it is bridged, and
+// the run reports how many pieces were merged and how long was spent in
+// the gaps, so the seams stay visible to whoever reads the event.
+const ACTIVITY_BRIDGE_MS = intEnv('ACTIVITY_BRIDGE_S', 120) * 1000;
+const activityState = {}; // entityId -> zone -> { window, state, since, lastMean, quietSince, fragments, bridgedMs }
 function onActivity(entityId, pcts) {
   const zones = cfg.watchActivityZones[entityId] || [];
   const st = activityState[entityId] || (activityState[entityId] = {});
@@ -1042,6 +1056,13 @@ function onActivity(entityId, pcts) {
     if (a.window.length < 10) continue;
     const above = a.window.filter((p) => p >= cfg.activityPct).length / a.window.length;
     const next = a.state === 'running' ? (above < 0.2 ? 'idle' : 'running') : (above >= 0.6 ? 'running' : 'idle');
+    // --- bridging (#12): a running zone that goes quiet is not idle yet
+    if (a.state === 'running') {
+      const r = activity.step(a, next, Date.now(), ACTIVITY_BRIDGE_MS);
+      if (r.action !== 'ended') continue;
+      activityTransition(entityId, z, a, 'idle', r.endedAt);
+      continue;
+    }
     if (next === a.state) continue;
     if (next === 'running') {
       // A person loading the machine moves over the porthole and reads as a
@@ -1061,13 +1082,19 @@ function onActivity(entityId, pcts) {
     activityTransition(entityId, z, a, next);
   }
 }
-function activityTransition(entityId, z, a, next) {
-  const now = Date.now(), prev = a.state, dur = Math.round((now - a.since) / 1000);
-  a.state = next; a.since = now;
-  console.log(`[nest_headless] ACTIVITY ${z.name} on ${entityId}: ${prev} -> ${next} after ${dur}s (mean ${a.lastMean}%)`);
+function activityTransition(entityId, z, a, next, endedAt = null) {
+  const now = Date.now(), prev = a.state;
+  // a bridged run ended when it last went quiet, not when the bridge expired
+  const dur = Math.round(((endedAt || now) - a.since) / 1000);
+  const fragments = prev === 'running' ? (a.fragments || 1) : 1;
+  const bridgedS = prev === 'running' ? Math.round((a.bridgedMs || 0) / 1000) : 0;
+  a.state = next; a.since = now; a.quietSince = null; a.fragments = 1; a.bridgedMs = 0;
+  const seams = fragments > 1 ? `, ${fragments} fragments merged, ${bridgedS}s bridged` : '';
+  console.log(`[nest_headless] ACTIVITY ${z.name} on ${entityId}: ${prev} -> ${next} after ${dur}s (mean ${a.lastMean}%${seams})`);
   postHaEvent('nest_headless_activity', {
     entity_id: entityId, camera: entityId.replace(/^camera\./, ''), zone: z.name,
     state: next, previous: prev, previous_duration_s: dur, mean_pct: a.lastMean, t: new Date(now).toISOString(),
+    fragments, bridged_s: bridgedS,
   }).catch(() => {});
 }
 // Fraction of a zone's bounding rect covered by the largest overlapping person box, on a fresh frame.
@@ -1500,7 +1527,7 @@ function enrolCat(name, source, found, index) {
   if (!/^[a-z0-9_-]{1,32}$/i.test(name)) return { ok: false, accepted: false, reason: 'bad_name' };
   name = name.toLowerCase();
   let pick;
-  if (found.photo) pick = { _emb: found.photo.vec, _sized: false, quality: { size_px: found.photo.size_px, reason: 'ok' }, box: null };
+  if (found.photo) pick = { _emb: found.photo.vec, _sized: false, quality: { size_px: found.photo.size_px, reason: 'ok' }, box: null, _crop: found.photo.crop || null };
   else {
     if (!found.ok) return { ok: false, accepted: false, reason: found.reason };
     if (!found.cats.length) return { ok: true, accepted: false, reason: 'no_cat', cats: 0 };
@@ -1601,8 +1628,16 @@ async function sampleFacesForCapture(entityId) {
 // ------------------------------------------------------------ verification backlog (Hearth #16)
 // Good-quality samples whose match is ambiguous or unknown are parked for an
 // admin to label, mark as "not a household member", or drop. Decisive: voice
-// >= 0.6, face >= 0.5, and a clear gap to the runner-up.
-const VOICE_DECISIVE = 0.6, FACE_DECISIVE = 0.5, AMBIGUOUS_GAP = 0.1;
+// >= 0.6, face >= face_decisive, and a clear gap to the runner-up.
+//
+// The face line was 0.5 and no room crop ever reached it, so every face went
+// to a person: 113 labelled by hand over three days. Measured against what
+// the family then chose, the top guess is right 88% overall but 100% of the
+// 24 at or above 0.47 (and it first errs at 0.459). Crop size does not
+// predict correctness - faces under 65 px are the most reliable of all - so
+// the line is on the score alone, with the runner-up gap unchanged.
+const VOICE_DECISIVE = 0.6, AMBIGUOUS_GAP = 0.1;
+const FACE_DECISIVE = numEnv('FACE_DECISIVE', 0.47);
 const lastMatched = {};        // name -> ISO time of the last decisive match
 const lastPendingFaceMs = {};  // camera -> ms; one face candidate per camera per minute
 function ambiguous(matches, decisive) {
@@ -2166,12 +2201,41 @@ function canonicalKeyword(text) {
   return t;
 }
 const WAKE_RE = new RegExp(`^[\\s\\S]{0,40}?\\b(?:${WAKE_WORDS})[,.!?]?\\s+(?:${WAKE_NAMES})\\b[,.!?]*\\s*`, 'i');
+// In a busy room the segmenter cuts a 15 s block out of continuous talk and
+// the wake phrase lands mid-stream, past the 40-character head allowance, so
+// the whole segment is dropped: a child said "hey Botbeard" repeatedly one
+// evening with 810 of 811 segments discarded. A segment (not a spotter
+// capture) therefore accepts the phrase anywhere in the text.
+//
+// Only the strong wake words qualify here. "a" and "eh" are in WAKE_WORDS as
+// a quietly spoken "hey", which is safe pinned to the head but would fire on
+// "a heart", "a cloud" or "a cord" in the middle of an ordinary sentence.
+// Hold a spotter keyword until the transcript confirms it (default on): the
+// brain must not act on a mishearing. Set keyword_needs_transcript false to
+// send the spotter's guess immediately, as before 1.20.3.
+const KEYWORD_NEEDS_TRANSCRIPT = String(process.env.KEYWORD_NEEDS_TRANSCRIPT || 'true') !== 'false';
+const WAKE_SOFT = new Set(['a', 'eh']);   // only a quietly-spoken "hey", never a word in its own right
+const WAKE_WORDS_STRONG = WAKE_WORDS.split('|').filter((w) => !WAKE_SOFT.has(w)).join('|');
+// Some spellings in WAKE_NAMES are ordinary English ("heart" and "hath" for
+// Hearth, "cloud"/"cord"/"god" for Claude). Paired with a soft wake word they
+// make everyday speech a wake phrase: "she had a heart attack" woke the house
+// at 23:42 on 2026-09-05 and reached the brain as a request to "attack".
+// A soft wake word therefore only counts before a distinctive name.
+const WAKE_NAMES_PLAIN = new Set(['heart', 'hart', 'hath', 'cord', 'god', 'cloud', 'cloudy', 'clause', 'claws', 'clod']);
+const WAKE_NAMES_DISTINCT = WAKE_NAMES.split('|').filter((n) => !WAKE_NAMES_PLAIN.has(n)).join('|');
+// the head rule, minus the combinations that are just English
+const WAKE_SOFT_RE = new RegExp(`^[\\s\\S]{0,40}?\\b(?:${[...WAKE_SOFT].join('|')})[,.!?]?\\s+(?:${WAKE_NAMES})\\b`, 'i');
+const WAKE_SOFT_OK_RE = new RegExp(`^[\\s\\S]{0,40}?\\b(?:${[...WAKE_SOFT].join('|')})[,.!?]?\\s+(?:${WAKE_NAMES_DISTINCT})\\b`, 'i');
+function plainEnglishWake(t) {   // a soft word before a plain-English name: not a wake
+  return WAKE_SOFT_RE.test(t) && !WAKE_SOFT_OK_RE.test(t) && !new RegExp(`\\b(?:${WAKE_WORDS_STRONG})[,.!?]?\\s+(?:${WAKE_NAMES})\\b`, 'i').test(t);
+}
+const WAKE_ANYWHERE_RE = new RegExp(`[\\s\\S]*?\\b(?:${WAKE_WORDS_STRONG})[,.!?]?\\s+(?:${WAKE_NAMES})\\b[,.!?]*\\s*`, 'i');
 // pre-roll cut mid-phrase: transcript starts with the bare name ("clawed, is the...")
 const WAKE_HEAD_RE = new RegExp(`^\\W*(?:${WAKE_NAMES})\\b[,.!?]*\\s*`, 'i');
 // repeats ("hey claude, hey claude, ...") must be right at the head
 const WAKE_REPEAT_RE = new RegExp(`^\\W*(?:${WAKE_WORDS})[,.!?]?\\s+(?:${WAKE_NAMES})\\b[,.!?]*\\s*`, 'i');
-function stripWakePhrase(t) {
-  const m = WAKE_RE.exec(t) || WAKE_HEAD_RE.exec(t);
+function stripWakePhrase(t, anywhere = false) {
+  const m = WAKE_RE.exec(t) || (anywhere ? WAKE_ANYWHERE_RE.exec(t) : null) || WAKE_HEAD_RE.exec(t);
   if (!m) return t;
   t = t.slice(m[0].length).trim();
   for (let i = 0; i < 2; i++) { const r = WAKE_REPEAT_RE.exec(t); if (!r) break; t = t.slice(r[0].length).trim(); }
@@ -2263,8 +2327,8 @@ async function finishSpeechCapture(entityId, c, reason) {
   // A segment has its whole start, so it must carry the full wake phrase; the
   // bare-name rule exists only for spotter captures whose pre-roll may have
   // cut the "hey" (a hallway sentence beginning "kitchen speaker" once passed).
-  const wakeConfirmed = !!text && (WAKE_RE.test(text) || (!c.fromSegment && WAKE_HEAD_RE.test(text)));
-  text = stripWakePhrase(text);
+  const wakeConfirmed = !!text && !plainEnglishWake(text) && (WAKE_RE.test(text) || (c.fromSegment ? WAKE_ANYWHERE_RE.test(text) : WAKE_HEAD_RE.test(text)));
+  text = stripWakePhrase(text, !!c.fromSegment);
   // Whisper's stage directions - "(baby crying)", "[inaudible]", "(background
   // noise drowns out speaker)" - are not something the brain should parse.
   if (text && /^[\s(\[][^A-Za-z0-9]*[^()\[\]]*[)\]]\W*$/.test(text) && !/[a-z]{2,}\s+[a-z]{2,}.*[a-z]/i.test(text.replace(/[(\[][^)\]]*[)\]]/g, ''))) { text = ''; reason = 'unclear'; }
@@ -2277,7 +2341,7 @@ async function finishSpeechCapture(entityId, c, reason) {
   if (c.fromSegment) {
     if (!wakeConfirmed && !c.followUp) { segStat(entityId, 'segments_dropped'); return; }
     if (wakeConfirmed && !c.followUp) {
-      const wm = WAKE_RE.exec(text0) || WAKE_HEAD_RE.exec(text0);
+      const wm = WAKE_RE.exec(text0) || (c.fromSegment ? WAKE_ANYWHERE_RE.exec(text0) : null) || WAKE_HEAD_RE.exec(text0);
       c.keyword = wakeword.keywordFrom(wm ? wm[0] : '', canonicalKeyword) || 'WAKE';
       lastKeywordMs[entityId] = Date.now();
       segStat(entityId, 'segment_wakes');
@@ -2286,6 +2350,13 @@ async function finishSpeechCapture(entityId, c, reason) {
     } else if (text) { segStat(entityId, 'segment_follow_ups'); if (convo[entityId] && convo[entityId].openedAt === c.windowOpenedAt) delete convo[entityId]; }
     // faces only now, once the segment is known to be addressed to the house
     if (!c.facesPromise && faces.hasModels(FACE_MODELS_DIR())) c.facesPromise = sampleFacesForCapture(entityId);
+  }
+  // a spotter wake the transcript agreed with: tell the brain now, with the
+  // words already in hand (see KEYWORD_NEEDS_TRANSCRIPT above)
+  if (KEYWORD_NEEDS_TRANSCRIPT && !c.fromSegment && !c.followUp && wakeConfirmed && c.keyword) {
+    postHaEvent('nest_headless_keyword', {
+      entity_id: entityId, camera: entityId.replace(/^camera\./, ''), keyword: c.keyword, confirmed: true,
+    }).catch(() => {});
   }
   if (c.followUp && !text) {   // a follow-up window that caught only noise is the same as nobody replying (Hearth #4)
     console.log(`[nest_headless] follow-up window on ${entityId} closed: nothing intelligible (${reason})`);
@@ -2457,10 +2528,19 @@ function onAudioChunk(entityId, b64, sampleRate) {
         if (now - (lastKeywordMs[entityId] || 0) < 2500) continue;
         lastKeywordMs[entityId] = now; st0.hits++;
         const kw = canonicalKeyword(r.keyword);
-        console.log(`[nest_headless] KEYWORD "${kw}" on ${entityId} at ${new Date().toISOString()}${kw !== r.keyword ? ' (heard as ' + r.keyword + ')' : ''}`);
-        postHaEvent('nest_headless_keyword', {
-          entity_id: entityId, camera: entityId.replace(/^camera\./, ''), keyword: kw,
-        }).catch(() => {});
+        console.log(`[nest_headless] KEYWORD "${kw}" on ${entityId} at ${new Date().toISOString()}${kw !== r.keyword ? ' (heard as ' + r.keyword + ')' : ''}${KEYWORD_NEEDS_TRANSCRIPT ? ' (held for the transcript)' : ''}`);
+        // The spotter is a guess, and across the log it is wrong more often
+        // than right (26 confirmed / 33 unconfirmed). Sending it straight on
+        // let the brain open a conversation window on a mishearing: on
+        // 2026-09-06 it did so twice at breakfast and a child said "stop
+        // speaking to me, I don't want to speak to you". The house must not
+        // chase anyone, least of all a child. The keyword now waits for the
+        // transcript to confirm it; only then does the brain hear about it.
+        if (!KEYWORD_NEEDS_TRANSCRIPT) {
+          postHaEvent('nest_headless_keyword', {
+            entity_id: entityId, camera: entityId.replace(/^camera\./, ''), keyword: kw,
+          }).catch(() => {});
+        }
         startSpeechCapture(entityId, kw, st.ring || []);
       }
     }
@@ -2980,10 +3060,15 @@ const handleRequest = async (req, res) => {
           if (!sharpM) { res.writeHead(500, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, accepted: false, reason: 'no_sharp' })); }
           try {
             jpg = await sharpM(jpg).rotate().resize({ width: 1600, height: 1600, fit: 'inside', withoutEnlargement: true }).jpeg({ quality: 92 }).toBuffer();
-            // if the house detector finds the cat in the photo, describe that box; else the whole picture
+            // The detector must find the cat. Describing the whole picture when it
+            // finds nothing enrolled three photographs of an empty kitchen worktop
+            // as one of the cats on 2026-09-06, and that sample - a third of his
+            // gallery - then matched the other two cats on that same worktop.
+            // A picture with no cat in it is not a sample of a cat.
             const d = await infer.detectCats(jpg, { conf: 0.5 }).catch(() => null);
             const boxes = (d || []).filter((x) => x.cls === 15 || x.cls === 16).sort((a, b) => b.box.w * b.box.h - a.box.w * a.box.h);
-            found = boxes.length ? { photo: { ...(await catid.describeInJpeg(sharpM, jpg, boxes[0].box, { withCrop: false })), sized: false } } : { photo: await catid.describeImage(sharpM, jpg) };
+            if (!boxes.length) { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: true, accepted: false, reason: 'no_cat', hint: 'no cat found in the picture - send a photo the cat is actually in' })); }
+            found = { photo: { ...(await catid.describeInJpeg(sharpM, jpg, boxes[0].box, { withCrop: false })), sized: false } };
           } catch (e) { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, accepted: false, reason: 'bad_image: ' + e.message })); }
         } else if (cam) {
           const mgr = watchMgr[cam];
