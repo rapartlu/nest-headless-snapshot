@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.21.1';
+const ADDON_VERSION = '1.22.0';
 
 const http = require('http');
 const fs = require('fs');
@@ -824,6 +824,19 @@ const ZONE_TICK_MS = 2000, STEADY_TICKS = 3, CHANGE_TICKS = 2, ZONE_CHANGE_THRES
 // small hours (#26). At 8 ticks a zone that cannot hold a verdict for 16 s
 // simply goes quiet, which is the right answer for a model that is guessing.
 const ZONE_DEBOUNCE_TICKS = intEnv('ZONE_DEBOUNCE_TICKS', 8);
+// ...but a zone whose model has earned it waits less. The long debounce exists
+// because the dishwasher model flapped at 0.86, and a defence sized for the
+// weakest model taxes the strongest: at 16 s every short fridge visit records
+// as roughly 16 s, so the commonest event in the house sits at the floor of
+// what can be seen (#33). Scaled by the model's own measured quality, never
+// below ZONE_DEBOUNCE_MIN_TICKS, and only for a model above the trust floor.
+const ZONE_DEBOUNCE_MIN_TICKS = intEnv('ZONE_DEBOUNCE_MIN_TICKS', 3);
+function debounceTicksFor(meta) {
+  const q = meta && (meta.loo_balanced != null ? meta.loo_balanced : meta.loo_acc);
+  if (q == null || q < ZONE_MODEL_MIN_LOO) return ZONE_DEBOUNCE_TICKS;
+  const ticks = q >= 0.95 ? ZONE_DEBOUNCE_MIN_TICKS : q >= 0.90 ? ZONE_DEBOUNCE_MIN_TICKS + 1 : ZONE_DEBOUNCE_TICKS;
+  return Math.min(ZONE_DEBOUNCE_TICKS, Math.max(ZONE_DEBOUNCE_MIN_TICKS, ticks));
+}
 // ...and after an announcement the zone says nothing for this long. When the
 // quiet ends the current state is announced if it differs from what the brain
 // was last told, so a real change is delayed, never lost.
@@ -991,10 +1004,11 @@ async function zoneClassifyTick(entityId, mgr) {
     st.modelMeta = { trained: v.trained || null, samples: v.samples || null, loo_acc: v.loo_acc == null ? null : v.loo_acc, holdout_acc: v.holdout_acc == null ? null : v.holdout_acc, labels };
     st.model = true; st.score = v.score;
     st.scores = v.scores || { open: Math.round((v.positive ? v.score : 1 - v.score) * 1000) / 1000, closed: Math.round((v.positive ? 1 - v.score : v.score) * 1000) / 1000 };
+    const needTicks = debounceTicksFor(st.modelMeta);
     st.ticks.push(verdict);
-    while (st.ticks.length > ZONE_DEBOUNCE_TICKS) st.ticks.shift();
+    while (st.ticks.length > needTicks) st.ticks.shift();
     let next = st.state;
-    if (st.ticks.length >= ZONE_DEBOUNCE_TICKS && st.ticks.every((t) => t === st.ticks[0])) next = st.ticks[0];
+    if (st.ticks.length >= needTicks && st.ticks.every((t) => t === st.ticks[0])) next = st.ticks[0];
     if (next && next !== st.state) { st.state = next; st.since = now; }
     // Announce only what the brain has not been told, and no more than once
     // per ZONE_MIN_DWELL_MS: a flapping zone falls silent instead of filling
@@ -1032,7 +1046,7 @@ async function zoneClassifyTick(entityId, mgr) {
         postHaEvent('nest_headless_zone_state', {
           entity_id: entityId, camera: entityId.replace(/^camera\./, ''), zone: z.name, label: z.name,
           state: nextForEvent, previous: prev, score: v.score, previous_duration_s: prevDuration,
-          duration_resolution_s: Math.round(ZONE_DEBOUNCE_TICKS * ZONE_TICK_MS / 1000), measured: prevDuration != null,
+          duration_resolution_s: Math.round(needTicks * ZONE_TICK_MS / 1000), measured: prevDuration != null,
           state_since: new Date(st.since).toISOString(),
           t: new Date(now).toISOString(), people_nearby: people,
           model: true, engine: st.engine, ...st.modelMeta, scores: st.scores,   // loo_acc: leave-one-out accuracy over the originals it was trained on - trust it from ~0.9 up; scores: per label

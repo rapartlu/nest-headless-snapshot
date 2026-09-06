@@ -1,5 +1,5 @@
 name: Nest Headless Snapshot
-version: "1.21.1"
+version: "1.22.0"
 slug: nest_headless
 description: >-
   Server-side Nest camera stills via headless Chromium — the only WebRTC
@@ -35,6 +35,7 @@ options:
   activity_bridge_s: 120
   zone_change_threshold: 10
   zone_debounce_ticks: 8
+  zone_debounce_min_ticks: 3
   zone_min_dwell_s: 60
   watch_diff_pct: 4
   watch_cooldown_seconds: 60
@@ -76,6 +77,7 @@ schema:
   activity_bridge_s: int(0,3600)?
   zone_change_threshold: float(1,100)?
   zone_debounce_ticks: int(1,60)?
+  zone_debounce_min_ticks: int(1,60)?
   zone_min_dwell_s: int(0,3600)?
   watch_diff_pct: int(1,50)?
   watch_cooldown_seconds: int(5,3600)?

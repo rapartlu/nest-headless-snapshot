@@ -50,6 +50,7 @@ if [ -f "$OPTS" ]; then
   export ACTIVITY_BRIDGE_S="$(jq -r '.activity_bridge_s // 120' "$OPTS")"
   export ZONE_CHANGE_THRESHOLD="$(jq -r '.zone_change_threshold // 10' "$OPTS")"
   export ZONE_DEBOUNCE_TICKS="$(jq -r '.zone_debounce_ticks // 8' "$OPTS")"
+  export ZONE_DEBOUNCE_MIN_TICKS="$(jq -r '.zone_debounce_min_ticks // 3' "$OPTS")"
   export ZONE_MIN_DWELL_S="$(jq -r '.zone_min_dwell_s // 60' "$OPTS")"
   export WATCH_DIFF_PCT="$(jq -r '.watch_diff_pct // 4' "$OPTS")"
   export WATCH_COOLDOWN_SECONDS="$(jq -r '.watch_cooldown_seconds // 60' "$OPTS")"
