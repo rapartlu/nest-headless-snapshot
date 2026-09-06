@@ -28,7 +28,7 @@
 
 // Keep in lockstep with config.yaml `version` - consumers (Hearth) read it
 // from GET / to detect that a deploy has landed.
-const ADDON_VERSION = '1.21.0';
+const ADDON_VERSION = '1.21.1';
 
 const http = require('http');
 const fs = require('fs');
@@ -1023,7 +1023,10 @@ async function zoneClassifyTick(entityId, mgr) {
       // keeps its view on zone_change (`model`) but does not announce state
       // flips: a coin-flip verdict is noise, not a sense (#22).
       const trusted = !(st.modelMeta && st.modelMeta.loo_acc != null && st.modelMeta.loo_acc < ZONE_MODEL_MIN_LOO);
-      console.log(`[nest_headless] ZONE ${z.name} on ${entityId}: ${prev || 'unknown'} -> ${nextForEvent} (score ${v.score}${trusted ? '' : ', model below trust floor - not announced'})`);
+      // the duration goes in the log too: it is the number the brain acts on and
+      // it was wrong for a day without being visible from this side (#22)
+      const durTxt = prevDuration == null ? '' : `, ${prev} for ${prevDuration}s`;
+      console.log(`[nest_headless] ZONE ${z.name} on ${entityId}: ${prev || 'unknown'} -> ${nextForEvent} (score ${v.score}${durTxt}${trusted ? '' : ', model below trust floor - not announced'})`);
       if (prev && trusted) {
         const people = await peopleNear(entityId, jpg, c.rect);
         postHaEvent('nest_headless_zone_state', {
