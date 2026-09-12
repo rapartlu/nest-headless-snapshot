@@ -1,0 +1,36 @@
+#!/bin/sh
+# Refuse a post that names a household member when the repo is public.
+#
+# This exists because knowing the rule did not stop me breaking it. The rule was
+# written down, and the grep I actually ran listed the children but not the
+# it never included the account owner's own name, which was sitting in my
+# SIGNATURE line on 21 issues. A signature does not feel like content, which is
+# exactly why it needs a machine to look at it.
+#
+#   usage: bin/check-public-post <file-with-body> [owner/repo]
+set -e
+BODY="$1"
+REPO="${2:-$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null)}"
+[ -f "$BODY" ] || { echo "no such file: $BODY" >&2; exit 2; }
+
+PRIVATE=$(gh repo view "$REPO" --json isPrivate --jq .isPrivate 2>/dev/null || echo unknown)
+if [ "$PRIVATE" = "true" ]; then
+  echo "ok: $REPO is private"
+  exit 0
+fi
+
+# household first names. Kept here rather than in the repo's own tree so the
+# list itself never lands in a public checkout.
+NAMES_FILE="$HOME/.config/nest_headless/household_names"
+if [ ! -f "$NAMES_FILE" ]; then
+  echo "REFUSING: no name list at $NAMES_FILE - cannot verify" >&2
+  exit 1
+fi
+
+HITS=$(grep -ioEf "$NAMES_FILE" "$BODY" 2>/dev/null | sort -u | tr '\n' ' ' || true)
+if [ -n "$HITS" ]; then
+  echo "REFUSED: $REPO is PUBLIC and the body names: $HITS" >&2
+  echo "  use a role instead - \"the account owner\", \"one child\", \"the other adult\"" >&2
+  exit 1
+fi
+echo "ok: no household names, safe for a public repo"

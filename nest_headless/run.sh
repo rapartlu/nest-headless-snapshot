@@ -1,0 +1,98 @@
+#!/usr/bin/env sh
+# Server log goes to a file reachable over the config share: this supervised
+# install has no journal gateway, so `Log` in the add-on UI shows nothing.
+# Outside the supervisor (e.g. a Mac on the LAN) set HA_CONFIG_DIR to the
+# mounted HA config share and OPTIONS_FILE to a copy of the add-on options.
+CFG="${HA_CONFIG_DIR:-/homeassistant}"
+LOG="${LOG_FILE:-$CFG/nest_headless_boot.log}"
+touch "$LOG" 2>/dev/null || LOG=/config/nest_headless_boot.log
+touch "$LOG" 2>/dev/null || LOG=/tmp/boot.log
+exec >> "$LOG" 2>&1   # append: the audit trail (LISTEN, DENIED, IDENTITY) must survive restarts
+echo "[nest_headless] ---- start $(date -u +%Y-%m-%dT%H:%M:%SZ) ----"
+set -e
+
+# This Supervisor (flagged "Docker misconfigured") injects NO env vars into
+# new containers — no SUPERVISOR_TOKEN. Until that repair lands, fall back to
+# a long-lived HA token read from the mapped config dir, talking to HA core
+# directly on the internal network instead of the supervisor proxy (which
+# only accepts SUPERVISOR_TOKEN).
+TOKEN_FILE="${TOKEN_FILE:-$CFG/.nest_headless_token}"
+# API_TOKEN / API_TOKEN_FILE (bearer for the sensitive routes off-loopback) pass straight through to node
+if [ -z "$SUPERVISOR_TOKEN" ] && [ -z "$HA_TOKEN" ] && [ -f "$TOKEN_FILE" ]; then
+  export HA_TOKEN="$(cat "$TOKEN_FILE")"
+  export HA_WS_URL="${HA_WS_URL:-ws://homeassistant:8123/api/websocket}"
+fi
+
+OPTS="${OPTIONS_FILE:-/data/options.json}"
+if [ -f "$OPTS" ]; then
+  export MIN_INTERVAL_SECONDS="$(jq -r '.min_interval_seconds // 10' "$OPTS")"
+  export JPEG_QUALITY="$(jq -r '.jpeg_quality // 85' "$OPTS")"
+  export CAPTURE_TIMEOUT_SECONDS="$(jq -r '.capture_timeout_seconds // 25' "$OPTS")"
+  export WARMUP_FRAMES="$(jq -r '.warmup_frames // 3' "$OPTS")"
+  OUT_DIR_OPT="$(jq -r '.out_dir // ""' "$OPTS")"
+  [ -n "$OUT_DIR_OPT" ] && export OUT_DIR="$OUT_DIR_OPT"
+  CROPS_OPT="$(jq -r '.crops // ""' "$OPTS")"
+  [ -n "$CROPS_OPT" ] && export CROPS="$CROPS_OPT"
+  SAMPLES_OPT="$(jq -r '.samples_dir // ""' "$OPTS")"
+  [ -n "$SAMPLES_OPT" ] && export SAMPLES_DIR="$SAMPLES_OPT"
+  # Persistent watch mode (see DOCS): cameras, surface regions, sensitivity
+  WATCHES_OPT="$(jq -r '.watch_cameras // ""' "$OPTS")"
+  [ -n "$WATCHES_OPT" ] && export WATCHES="$WATCHES_OPT"
+  WATCH_ROIS_OPT="$(jq -r '.watch_rois // ""' "$OPTS")"
+  [ -n "$WATCH_ROIS_OPT" ] && export WATCH_ROIS="$WATCH_ROIS_OPT"
+  WATCH_PASSAGES_OPT="$(jq -r '.watch_passages // ""' "$OPTS")"
+  [ -n "$WATCH_PASSAGES_OPT" ] && export WATCH_PASSAGES="$WATCH_PASSAGES_OPT"
+  WCZ_OPT="$(jq -r '.watch_classify_zones // ""' "$OPTS")"
+  [ -n "$WCZ_OPT" ] && export WATCH_CLASSIFY_ZONES="$WCZ_OPT"
+  WAZ_OPT="$(jq -r '.watch_activity_zones // ""' "$OPTS")"
+  [ -n "$WAZ_OPT" ] && export WATCH_ACTIVITY_ZONES="$WAZ_OPT"
+  export ACTIVITY_PCT="$(jq -r '.activity_pct // 1.5' "$OPTS")"
+  export ACTIVITY_BRIDGE_S="$(jq -r '.activity_bridge_s // 120' "$OPTS")"
+  export ZONE_CHANGE_THRESHOLD="$(jq -r '.zone_change_threshold // 10' "$OPTS")"
+  export ZONE_DEBOUNCE_TICKS="$(jq -r '.zone_debounce_ticks // 8' "$OPTS")"
+  export ZONE_DEBOUNCE_MIN_TICKS="$(jq -r '.zone_debounce_min_ticks // 3' "$OPTS")"
+  export ZONE_MIN_DWELL_S="$(jq -r '.zone_min_dwell_s // 60' "$OPTS")"
+  export WATCH_DIFF_PCT="$(jq -r '.watch_diff_pct // 4' "$OPTS")"
+  export WATCH_COOLDOWN_SECONDS="$(jq -r '.watch_cooldown_seconds // 60' "$OPTS")"
+  export TRACK_FACE_MS="$(jq -r '.track_face_ms // 1500' "$OPTS")"
+  export WATCH_CLASSIFY_SECONDS="$(jq -r '.watch_classify_seconds // 15' "$OPTS")"
+  export WATCH_CLASSIFY_PERSIST_TICKS="$(jq -r '.watch_classify_persist_ticks // 16' "$OPTS")"
+  export SAMPLE_ARCHIVE_SECONDS="$(jq -r '.sample_archive_seconds // 120' "$OPTS")"
+  AUDIO_OPT="$(jq -r '.audio_cameras // ""' "$OPTS")"
+  [ -n "$AUDIO_OPT" ] && export AUDIO_CAMERAS="$AUDIO_OPT"
+  export SEG_RATE_MAX="$(jq -r '.seg_rate_max // 24' "$OPTS")"
+  export SEG_RACE_MS="$(jq -r '.seg_race_ms // 1200' "$OPTS")"
+  export CLIP_RATE_MAX="$(jq -r '.clip_rate_max // 6' "$OPTS")"
+  export CAPTURE_TIMEOUT_S="$(jq -r '.capture_timeout_s // 25' "$OPTS")"
+  export VISIT_FACES_S="$(jq -r '.visit_faces_s // 90' "$OPTS")"
+  export PEOPLE_REGION="$(jq -r '.people_region // false' "$OPTS")"
+  export SPEECH_SILENCE_MS="$(jq -r '.speech_silence_ms // 800' "$OPTS")"
+  export SPEECH_MAX_SECONDS="$(jq -r '.speech_max_seconds // 15' "$OPTS")"
+  STT_OPT="$(jq -r '.stt_model_dir // ""' "$OPTS")"
+  [ -n "$STT_OPT" ] && export STT_MODEL_DIR="$STT_OPT"
+  STT_URL_OPT="$(jq -r '.stt_url // ""' "$OPTS")"
+  [ -n "$STT_URL_OPT" ] && export STT_URL="$STT_URL_OPT"
+  STT_SHADOW_OPT="$(jq -r '.stt_shadow_url // ""' "$OPTS")"
+  [ -n "$STT_SHADOW_OPT" ] && export STT_SHADOW_URL="$STT_SHADOW_OPT"
+  STT_FALLBACK_OPT="$(jq -r '.stt_fallback_url // ""' "$OPTS")"
+  [ -n "$STT_FALLBACK_OPT" ] && export STT_FALLBACK_URL="$STT_FALLBACK_OPT"
+  export PHOTO_MIN_PX="$(jq -r '.photo_min_px // 256' "$OPTS")"
+  EXCLUDED_OPT="$(jq -r '.identity_excluded // ""' "$OPTS")"
+  [ -n "$EXCLUDED_OPT" ] && export IDENTITY_EXCLUDED="$EXCLUDED_OPT"
+  export EXCLUDE_SUPPRESS_AT="$(jq -r '.exclude_suppress_at // 0.3' "$OPTS")"
+  export IDENTITY_KEEP_SAMPLES="$(jq -r '.identity_keep_samples // false' "$OPTS")"
+  export FACE_DECISIVE="$(jq -r '.face_decisive // 0.47' "$OPTS")"
+  export IDENTITY_AUTO_SAMPLES="$(jq -r '.identity_auto_samples // true' "$OPTS")"
+  export WAKE_BY_TRANSCRIPT="$(jq -r '.wake_by_transcript // false' "$OPTS")"
+  export KEYWORD_NEEDS_TRANSCRIPT="$(jq -r '.keyword_needs_transcript // true' "$OPTS")"
+  TRAINING_DIR_OPT="$(jq -r '.training_dir // ""' "$OPTS")"
+  [ -n "$TRAINING_DIR_OPT" ] && export TRAINING_DIR="$TRAINING_DIR_OPT"
+  export ARCHIVE_DAYS="$(jq -r '.archive_days // 7' "$OPTS")"
+  export EVIDENCE_DAYS="$(jq -r '.evidence_days // 30' "$OPTS")"
+  WAKE_NAMES_OPT="$(jq -r '.wake_names // ""' "$OPTS")"
+  [ -n "$WAKE_NAMES_OPT" ] && export WAKE_NAMES="$WAKE_NAMES_OPT"
+  WAKE_CANON_OPT="$(jq -r '.wake_canon // ""' "$OPTS")"
+  [ -n "$WAKE_CANON_OPT" ] && export WAKE_CANON="$WAKE_CANON_OPT"
+fi
+
+exec node "$(cd "$(dirname "$0")" && pwd)/app/server.js"

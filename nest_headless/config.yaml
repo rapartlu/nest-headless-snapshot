@@ -1,0 +1,122 @@
+name: Nest Headless Snapshot
+version: "1.33.3"
+slug: nest_headless
+description: >-
+  Server-side Nest camera stills via headless Chromium — the only WebRTC
+  client proven to receive video from these cameras (implements the
+  transport-cc congestion feedback Google's sender requires).
+url: "http://homeassistant.local:8098"
+arch:
+  - amd64
+  - aarch64
+init: false
+startup: services
+homeassistant_api: true
+ports:
+  8098/tcp: 8098
+ports_description:
+  8098/tcp: Snapshot HTTP API (/snapshot/<camera>, /latest/<camera>.jpg)
+map:
+  - homeassistant_config:rw
+options:
+  min_interval_seconds: 10
+  jpeg_quality: 85
+  capture_timeout_seconds: 25
+  warmup_frames: 3
+  out_dir: ""
+  crops: ""
+  samples_dir: ""
+  watch_cameras: ""
+  watch_rois: ""
+  watch_passages: ""
+  watch_classify_zones: ""
+  watch_activity_zones: ""
+  activity_pct: 1.5
+  activity_bridge_s: 120
+  zone_change_threshold: 10
+  zone_debounce_ticks: 8
+  zone_debounce_min_ticks: 3
+  zone_min_dwell_s: 60
+  watch_diff_pct: 4
+  watch_cooldown_seconds: 60
+  watch_classify_seconds: 15
+  track_face_ms: 1500
+  watch_classify_persist_ticks: 16
+  sample_archive_seconds: 120
+  audio_cameras: ""
+  speech_silence_ms: 800
+  seg_rate_max: 24
+  seg_race_ms: 1200
+  clip_rate_max: 6
+  capture_timeout_s: 25
+  visit_faces_s: 90
+  people_region: false
+  speech_max_seconds: 15
+  stt_model_dir: ""
+  stt_url: ""
+  stt_shadow_url: ""
+  stt_fallback_url: ""
+  identity_keep_samples: false
+  identity_excluded: ""
+  exclude_suppress_at: 0.3
+  photo_min_px: 256
+  face_decisive: 0.47
+  identity_auto_samples: true
+  wake_by_transcript: false
+  keyword_needs_transcript: true
+  training_dir: ""
+  archive_days: 7
+  evidence_days: 30
+  wake_names: ""
+  wake_canon: ""
+schema:
+  min_interval_seconds: int(1,3600)
+  jpeg_quality: int(30,100)
+  capture_timeout_seconds: int(5,120)
+  warmup_frames: int(1,30)
+  out_dir: str?
+  crops: str?
+  samples_dir: str?
+  watch_cameras: str?
+  watch_rois: str?
+  watch_passages: str?
+  watch_classify_zones: str?
+  watch_activity_zones: str?
+  activity_pct: float(0.1,50)?
+  activity_bridge_s: int(0,3600)?
+  zone_change_threshold: float(1,100)?
+  zone_debounce_ticks: int(1,60)?
+  zone_debounce_min_ticks: int(1,60)?
+  zone_min_dwell_s: int(0,3600)?
+  watch_diff_pct: int(1,50)?
+  watch_cooldown_seconds: int(5,3600)?
+  watch_classify_seconds: int(0,3600)?
+  track_face_ms: int(0,60000)?
+  watch_classify_persist_ticks: int(0,240)?
+  sample_archive_seconds: int(10,3600)?
+  audio_cameras: str?
+  speech_silence_ms: int(100,5000)?
+  seg_rate_max: int(1,600)?
+  seg_race_ms: int(0,10000)?
+  clip_rate_max: int(1,600)?
+  capture_timeout_s: int(5,120)?
+  visit_faces_s: int(0,600)?
+  people_region: bool?
+  speech_max_seconds: int(2,30)?
+  stt_model_dir: str?
+  stt_url: str?
+  stt_shadow_url: str?
+  stt_fallback_url: str?
+  identity_keep_samples: bool?
+  identity_excluded: str?
+  exclude_suppress_at: float(0.0,1.0)?
+  photo_min_px: int(32,4096)?
+  face_decisive: float(0.1,1.0)?
+  identity_auto_samples: bool?
+  wake_by_transcript: bool?
+  keyword_needs_transcript: bool?
+  training_dir: str?
+  archive_days: int?
+  evidence_days: int?
+  wake_names: str?
+  wake_canon: str?

@@ -1,0 +1,15 @@
+{
+  "name": "nest-headless",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Server-side Nest camera stills via headless Chromium WebRTC",
+  "main": "server.js",
+  "dependencies": {
+    "jpeg-js": "^0.4.4",
+    "puppeteer-core": "^24.0.0",
+    "ws": "^8.18.0",
+    "onnxruntime-node": "^1.19.2",
+    "sherpa-onnx-node": "^1.10.30",
+    "sharp": "^0.34.5"
+  }
+}

@@ -1,0 +1,9 @@
+node_modules/
+*.log
+.DS_Store
+nest-twcc-probe
+# Ultralytics model weights are AGPL-licensed - build them locally (see DOCS)
+nest_headless/app/assets/models/*.onnx
+
+# node --test scratch dirs (see the note in diskq.test.js)
+nest_headless/app/test/.tmp/
